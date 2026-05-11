@@ -8,10 +8,11 @@ exports.startTracking = async (req, res) => {
     const { lat, lng } = req.body;
     const today = new Date().toISOString().slice(0, 10);
 
+    const address = await reverseGeocode(lat, lng);
     const session = await LiveLocation.create({
       employee: req.user._id,
       sessionId: uuidv4(),
-      coordinates: [{ lat, lng, timestamp: new Date() }],
+      coordinates: [{ lat, lng, timestamp: new Date(), address }],
       isActive: true,
       date: today,
     });
@@ -165,6 +166,18 @@ exports.getLiveEmployees = async (req, res) => {
       isActive: true, date: new Date().toISOString().slice(0, 10)
     }).populate('employee', 'name employeeId avatar department');
     res.json({ success: true, employees, locations });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// @desc Geocode proxy (frontend calls this instead of Nominatim directly)
+exports.geocode = async (req, res) => {
+  try {
+    const { lat, lng } = req.query;
+    if (!lat || !lng) return res.status(400).json({ success: false, message: 'lat and lng required' });
+    const address = await reverseGeocode(parseFloat(lat), parseFloat(lng));
+    res.json({ success: true, address });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

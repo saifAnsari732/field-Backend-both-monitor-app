@@ -9,4 +9,5 @@ router.post('/stop', protect, tc.stopTracking);
 router.get('/today', protect, tc.getTodaySessions);
 router.get('/live', protect, authorize('admin', 'hr'), tc.getLiveEmployees);
 router.get('/session/:id', protect, tc.getSessionRoute);
+router.get('/geocode', protect, tc.geocode);
 module.exports = router;

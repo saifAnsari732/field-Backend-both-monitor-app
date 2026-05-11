@@ -14,8 +14,8 @@ const server = http.createServer(app);
 // Socket.IO setup
 const io = new Server(server, {
   cors: {
-    // origin: process.env.CLIENT_URL,
-    origin: "*",
+
+    origin: ["http://localhost:3000", process.env.CLIENT_URL].filter(Boolean),
     methods: ['GET', 'POST'],
     credentials: true,
   },
