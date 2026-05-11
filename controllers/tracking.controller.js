@@ -47,14 +47,22 @@ exports.startTracking = async (req, res) => {
   }
 };
 
+const { reverseGeocode } = require('../services/geocode.service');
+
 // @desc Update location (bulk coordinates)
 exports.updateLocation = async (req, res) => {
   try {
-    const { sessionId, coordinates } = req.body; // coordinates = [{lat,lng,speed,accuracy,timestamp}]
+    const { sessionId, coordinates } = req.body; 
     const session = await LiveLocation.findOne({ sessionId, employee: req.user._id, isActive: true });
     if (!session) return res.status(404).json({ success: false, message: 'Session not found' });
 
-    session.coordinates.push(...coordinates);
+    // Geocode the latest coordinate
+    const lastCoord = coordinates[coordinates.length - 1];
+    const address = await reverseGeocode(lastCoord.lat, lastCoord.lng);
+    
+    // Add address to coordinates
+    const updatedCoords = coordinates.map(c => ({ ...c, address }));
+    session.coordinates.push(...updatedCoords);
 
     // Calculate distance
     const coords = session.coordinates;
@@ -67,13 +75,15 @@ exports.updateLocation = async (req, res) => {
 
     // Emit to admin in real-time
     const io = req.app.get('io');
-    const lastCoord = coordinates[coordinates.length - 1];
-    io.to('admins').emit('location_update', {
+    io.to('admins').emit('employee_location', {
       employeeId: req.user._id,
       name: req.user.name,
+      avatar: req.user.avatar,
+      department: req.user.department,
       lat: lastCoord.lat,
       lng: lastCoord.lng,
       speed: lastCoord.speed,
+      address,
       totalDistance: totalDist,
       sessionId,
     });

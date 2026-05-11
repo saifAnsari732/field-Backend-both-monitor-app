@@ -9,6 +9,7 @@ const liveLocationSchema = new mongoose.Schema({
     lng: Number,
     speed: Number,
     accuracy: Number,
+    address: String,
     timestamp: { type: Date, default: Date.now },
   }],
   startTime: { type: Date, default: Date.now },

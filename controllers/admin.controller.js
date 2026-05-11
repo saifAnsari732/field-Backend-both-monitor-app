@@ -182,3 +182,29 @@ exports.getAttendanceReport = async (req, res) => {
     res.json({ success: true, records });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
+
+exports.getTrackingHistory = async (req, res) => {
+  try {
+    const { employeeId, date, page = 1, limit = 10 } = req.query;
+    const filter = {};
+    if (employeeId) filter.employee = employeeId;
+    if (date) filter.date = date;
+
+    const history = await LiveLocation.find(filter)
+      .populate('employee', 'name employeeId department avatar')
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(+limit);
+
+    const total = await LiveLocation.countDocuments(filter);
+
+    res.json({
+      success: true,
+      history,
+      total,
+      pages: Math.ceil(total / limit)
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};

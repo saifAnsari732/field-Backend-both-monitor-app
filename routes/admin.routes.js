@@ -8,4 +8,5 @@ router.get('/employees', protect, authorize('admin', 'hr'), ac.getAllEmployees);
 router.put('/employees/:id/approve', protect, authorize('admin', 'hr'), ac.approveEmployee);
 router.put('/employees/:id/block', protect, authorize('admin', 'hr'), ac.toggleBlock);
 router.get('/attendance', protect, authorize('admin', 'hr'), ac.getAttendanceReport);
+router.get('/tracking-history', protect, authorize('admin', 'hr'), ac.getTrackingHistory);
 module.exports = router;
