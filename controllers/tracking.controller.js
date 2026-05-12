@@ -15,6 +15,7 @@ exports.startTracking = async (req, res) => {
       coordinates: [{ lat, lng, timestamp: new Date(), address }],
       isActive: true,
       date: today,
+      startAddress: address,
     });
 
     await User.findByIdAndUpdate(req.user._id, { isTracking: true });
@@ -104,6 +105,12 @@ exports.stopTracking = async (req, res) => {
 
     session.isActive = false;
     session.endTime = new Date();
+    
+    // Get end address from last coordinate
+    if (session.coordinates.length > 0) {
+      session.endAddress = session.coordinates[session.coordinates.length - 1].address;
+    }
+    
     await session.save();
 
     await User.findByIdAndUpdate(req.user._id, { isTracking: false });
@@ -193,3 +200,134 @@ function haversineDistance(p1, p2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 function toRad(deg) { return deg * (Math.PI / 180); }
+
+// @desc Get live locations (optimized for polling)
+exports.getLiveLocations = async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    
+    // Get all active tracking sessions
+    const activeSessions = await LiveLocation.find({
+      isActive: true,
+      date: today,
+    }).populate('employee', 'name employeeId avatar department');
+
+    // Format for frontend
+    const locations = activeSessions.map(session => {
+      const latestCoord = session.coordinates[session.coordinates.length - 1] || {};
+      return {
+        employeeId: session.employee._id,
+        name: session.employee.name,
+        employeeIdCode: session.employee.employeeId,
+        avatar: session.employee.avatar,
+        department: session.employee.department,
+        lat: latestCoord.lat,
+        lng: latestCoord.lng,
+        speed: latestCoord.speed || 0,
+        address: latestCoord.address,
+        totalDistance: session.totalDistance || 0,
+        sessionId: session.sessionId,
+        startTime: session.startTime,
+        updatedAt: latestCoord.timestamp || session.updatedAt,
+      };
+    });
+
+    res.json({ success: true, locations, count: locations.length });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// @desc Get employee report (with date range)
+exports.getEmployeeReport = async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    const { startDate, endDate } = req.query;
+
+    // Validate authorization: user can only see their own report, admins can see anyone's
+    if (req.user.role === 'employee' && req.user._id.toString() !== employeeId) {
+      return res.status(403).json({ success: false, message: 'Unauthorized' });
+    }
+
+    const employee = await User.findById(employeeId).select('name employeeId department');
+    if (!employee) {
+      return res.status(404).json({ success: false, message: 'Employee not found' });
+    }
+
+    // Build date filter
+    const query = { employee: employeeId };
+    if (startDate || endDate) {
+      query.date = {};
+      if (startDate) query.date.$gte = startDate;
+      if (endDate) query.date.$lte = endDate;
+    }
+
+    // Get attendance records
+    const attendanceRecords = await Attendance.find(query)
+      .populate('trackingSessions')
+      .sort({ date: -1 });
+
+    // Get tracking sessions for the period
+    const sessions = await LiveLocation.find(query).sort({ date: -1 });
+
+    // Calculate statistics
+    const stats = {
+      totalDays: attendanceRecords.length,
+      presentDays: attendanceRecords.filter(a => a.status === 'present').length,
+      totalDistance: sessions.reduce((sum, s) => sum + (s.totalDistance || 0), 0),
+      totalSessions: sessions.length,
+      averageDistance: 0,
+      totalHours: 0,
+    };
+
+    // Calculate average distance and hours
+    if (sessions.length > 0) {
+      stats.averageDistance = stats.totalDistance / sessions.length;
+    }
+
+    sessions.forEach(session => {
+      if (session.endTime && session.startTime) {
+        const hours = (session.endTime - session.startTime) / (1000 * 60 * 60);
+        stats.totalHours += hours;
+      }
+    });
+
+    // Format attendance data
+    const attendanceData = attendanceRecords.map(record => ({
+      date: record.date,
+      checkIn: record.checkIn,
+      checkOut: record.checkOut,
+      status: record.status,
+      totalDistance: record.totalDistanceTraveled || 0,
+      sessionCount: record.trackingSessions?.length || 0,
+    }));
+
+    // Format session data
+    const sessionData = sessions.map(session => ({
+      date: session.date,
+      sessionId: session.sessionId,
+      startTime: session.startTime,
+      endTime: session.endTime,
+      distance: session.totalDistance || 0,
+      coordinateCount: session.coordinates?.length || 0,
+      startAddress: session.coordinates?.[0]?.address || 'N/A',
+      endAddress: session.coordinates?.[session.coordinates.length - 1]?.address || 'N/A',
+    }));
+
+    res.json({
+      success: true,
+      employee: {
+        id: employee._id,
+        name: employee.name,
+        employeeId: employee.employeeId,
+        department: employee.department,
+      },
+      stats,
+      attendance: attendanceData,
+      sessions: sessionData,
+      generatedAt: new Date(),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};

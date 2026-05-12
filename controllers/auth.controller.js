@@ -50,6 +50,24 @@ exports.login = async (req, res) => {
   }
 };
 
+// @desc Refresh Token
+exports.refreshToken = async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(401).json({ success: false, message: 'User not found' });
+    }
+    if (user.isBlocked) {
+      return res.status(403).json({ success: false, message: 'Account blocked' });
+    }
+
+    const token = generateToken(user._id);
+    res.json({ success: true, token, user });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // @desc Logout
 exports.logout = async (req, res) => {
   try {

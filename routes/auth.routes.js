@@ -6,6 +6,7 @@ module.exports = (() => {
   const { protect } = require('../middleware/auth.middleware');
   r.post('/register', c.register);
   r.post('/login', c.login);
+  r.post('/refresh-token', protect, c.refreshToken);
   r.post('/logout', protect, c.logout);
   r.get('/me', protect, c.getMe);
   r.put('/profile', protect, c.updateProfile);

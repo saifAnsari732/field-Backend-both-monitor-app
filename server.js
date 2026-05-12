@@ -42,6 +42,8 @@ app.use('/api/attendance', require('./routes/attendance.routes'));
 app.use('/api/admin', require('./routes/admin.routes'));
 app.use('/api/upload', require('./routes/upload.routes'));
 app.use('/api/notifications', require('./routes/notification.routes'));
+app.use('/api/leaves', require('./routes/leave.routes'));
+app.use('/api/tasks', require('./routes/task.routes'));
 
 // Health check
 app.get('/api/health', (req, res) => res.json({ status: 'OK', timestamp: new Date() }));

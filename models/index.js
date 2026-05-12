@@ -14,6 +14,8 @@ const liveLocationSchema = new mongoose.Schema({
   }],
   startTime: { type: Date, default: Date.now },
   endTime: Date,
+  startAddress: String,
+  endAddress: String,
   totalDistance: { type: Number, default: 0 }, // in km
   isActive: { type: Boolean, default: true },
   date: { type: String }, // YYYY-MM-DD
@@ -74,11 +76,38 @@ const activityLogSchema = new mongoose.Schema({
 const notificationSchema = new mongoose.Schema({
   recipient: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   sender: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  type: { type: String, enum: ['expense', 'meeting', 'tracking', 'alert', 'system', 'attendance'] },
+  type: { type: String, enum: ['expense', 'meeting', 'tracking', 'alert', 'system', 'attendance', 'leave', 'task'] },
   title: String,
   message: String,
   isRead: { type: Boolean, default: false },
   data: mongoose.Schema.Types.Mixed,
+}, { timestamps: true });
+
+// ─── Leave ────────────────────────────────────────────────────────────────────
+const leaveSchema = new mongoose.Schema({
+  employee: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  type: { type: String, enum: ['sick', 'casual', 'annual', 'other'], default: 'casual' },
+  startDate: { type: Date, required: true },
+  endDate: { type: Date, required: true },
+  reason: String,
+  status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
+  approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  approvedAt: Date,
+  rejectionReason: String,
+  duration: Number, // in days
+}, { timestamps: true });
+
+// ─── Task ─────────────────────────────────────────────────────────────────────
+const taskSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  description: String,
+  employee: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  assignedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  dueDate: Date,
+  status: { type: String, enum: ['pending', 'in-progress', 'completed', 'overdue'], default: 'pending' },
+  priority: { type: String, enum: ['low', 'medium', 'high'], default: 'medium' },
+  completedAt: Date,
+  location: { lat: Number, lng: Number, address: String },
 }, { timestamps: true });
 
 module.exports = {
@@ -88,4 +117,6 @@ module.exports = {
   Attendance: mongoose.model('Attendance', attendanceSchema),
   ActivityLog: mongoose.model('ActivityLog', activityLogSchema),
   Notification: mongoose.model('Notification', notificationSchema),
+  Leave: mongoose.model('Leave', leaveSchema),
+  Task: mongoose.model('Task', taskSchema),
 };
