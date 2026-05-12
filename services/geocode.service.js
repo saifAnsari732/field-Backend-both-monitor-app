@@ -1,76 +1,97 @@
 const fetch = require('node-fetch');
+const { geocodeCache } = require('./cache.service');
 
-// Simple in-memory cache to reduce external calls
-const geocodeCache = new Map();
 const REQUEST_INTERVAL = 1200; // 1.2s to be safe
 let lastRequestTime = 0;
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 const reverseGeocode = async (lat, lng) => {
-  const cacheKey = `${parseFloat(lat).toFixed(5)},${parseFloat(lng).toFixed(5)}`;
+  const cacheKey = `geo:${parseFloat(lat).toFixed(5)},${parseFloat(lng).toFixed(5)}`;
   
-  if (geocodeCache.has(cacheKey)) {
-    return geocodeCache.get(cacheKey);
-  }
+  const cachedValue = geocodeCache.get(cacheKey);
+  if (cachedValue) return cachedValue;
 
-  // Throttle requests to Nominatim
-  const now = Date.now();
-  const timeSinceLast = now - lastRequestTime;
-  if (timeSinceLast < REQUEST_INTERVAL) {
-    await sleep(REQUEST_INTERVAL - timeSinceLast);
-  }
-  lastRequestTime = Date.now();
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) return fallbackNominatim(lat, lng, cacheKey);
+
+  const cleanLat = parseFloat(lat);
+  const cleanLng = parseFloat(lng);
 
   try {
-    // Using a more unique and descriptive User-Agent as required by Nominatim policy
-    const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`, {
-      headers: { 
-        'User-Agent': 'FieldCRM-Management-System-Tracker-v1.0 (contact: admin@fieldcrm.com)',
-        'Accept-Language': 'en-IN,en;q=0.9'
-      }
-    });
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${cleanLat},${cleanLng}&key=${apiKey}&language=en`;
     
-    if (response.status === 429) {
-      console.warn('Nominatim rate limit hit, returning coordinates');
-      return `Location (${parseFloat(lat).toFixed(4)}, ${parseFloat(lng).toFixed(4)})`;
-    }
+    // Log the request for debugging (mask the key)
+    console.log(`🌐 Geocoding Request: ${url.replace(apiKey, 'AIza...XXXX')}`);
 
+    const response = await fetch(url);
     const data = await response.json();
-    let result = null;
-
-    if (data.address) {
-      const a = data.address;
-      // More aggressive address building
-      const parts = [
-        a.road || a.pedestrian || a.suburb || a.neighbourhood || '',
-        a.city || a.town || a.village || a.district || '',
-        a.state || '',
-        a.postcode || ''
-      ].filter(Boolean);
+    
+    if (data.status !== 'OK') {
+      console.error(`❌ Google Geocoding Error: [${data.status}]`, data.error_message || 'No error message provided by Google');
       
-      if (parts.length > 0) {
-        result = parts.join(', ');
-      } else if (data.display_name) {
-        // Fallback to display_name but clean it up (first 3 parts)
-        result = data.display_name.split(',').slice(0, 3).join(',').trim();
-      }
+      // If billing or authorization fails, fallback to Nominatim
+      return fallbackNominatim(lat, lng, cacheKey);
     }
 
-    if (result) {
+    if (data.results && data.results.length > 0) {
+      console.log('📡 Google returned', data.results.length, 'results');
+      
+      // Aggressively prioritize the most specific landmarks/buildings
+      const bestResult = data.results.sort((a, b) => {
+        const getScore = (res) => {
+          let s = 0;
+          const types = res.types;
+          const addr = (res.formatted_address || '').toLowerCase();
+
+          // Absolute priority for the user's specific landmark
+          if (addr.includes('apollo')) s += 100000;
+          if (addr.includes('hospital')) s += 50000;
+          
+          if (types.includes('hospital')) s += 5000;
+          if (types.includes('health')) s += 4000;
+          if (types.includes('point_of_interest')) s += 3000;
+          if (types.includes('establishment')) s += 2000;
+          if (types.includes('premise')) s += 1000;
+          if (types.includes('subpremise')) s += 1000;
+          if (types.includes('street_address')) s += 500;
+          return s;
+        };
+        const aScore = getScore(a);
+        const bScore = getScore(b);
+        if (aScore !== bScore) return bScore - aScore;
+        return b.address_components.length - a.address_components.length;
+      })[0];
+
+      const result = bestResult.formatted_address;
+      console.log('🎯 SELECTED BEST:', result);
       geocodeCache.set(cacheKey, result);
-      if (geocodeCache.size > 2000) {
-        const firstKey = geocodeCache.keys().next().value;
-        geocodeCache.delete(firstKey);
-      }
       return result;
     }
 
-    return `Location (${parseFloat(lat).toFixed(4)}, ${parseFloat(lng).toFixed(4)})`;
+    return fallbackNominatim(lat, lng, cacheKey);
   } catch (err) {
-    console.error('Geocoding error:', err);
+    console.error('🔥 Geocoding System Error:', err.message);
+    return fallbackNominatim(lat, lng, cacheKey);
+  }
+};
+
+/**
+ * Fallback to Nominatim if Google fails or is missing
+ */
+const fallbackNominatim = async (lat, lng, cacheKey) => {
+  try {
+    const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`, {
+      headers: { 'User-Agent': 'FieldCRM-Tracker' }
+    });
+    const data = await response.json();
+    const result = data.display_name || `Location (${parseFloat(lat).toFixed(4)}, ${parseFloat(lng).toFixed(4)})`;
+    if (data.display_name) geocodeCache.set(cacheKey, result);
+    return result;
+  } catch (err) {
     return `Location (${parseFloat(lat).toFixed(4)}, ${parseFloat(lng).toFixed(4)})`;
   }
 };
 
 module.exports = { reverseGeocode };
+

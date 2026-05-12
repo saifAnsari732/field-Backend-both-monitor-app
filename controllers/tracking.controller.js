@@ -1,6 +1,7 @@
 const { LiveLocation, Attendance, ActivityLog, Notification } = require('../models/index');
 const User = require('../models/User.model');
 const { v4: uuidv4 } = require('uuid');
+const { liveCache } = require('../services/cache.service');
 
 // @desc Start tracking session
 exports.startTracking = async (req, res) => {
@@ -8,7 +9,16 @@ exports.startTracking = async (req, res) => {
     const { lat, lng } = req.body;
     const today = new Date().toISOString().slice(0, 10);
 
-    const address = await reverseGeocode(lat, lng);
+    // Start geocoding in background to avoid blocking the response
+    const addressPromise = reverseGeocode(lat, lng);
+    
+    // Create session with temporary address if needed, or wait briefly
+    // To keep it simple and responsive, we'll wait max 500ms for geocode
+    const address = await Promise.race([
+      addressPromise,
+      new Promise(resolve => setTimeout(() => resolve(`Location (${lat.toFixed(4)}, ${lng.toFixed(4)})`), 800))
+    ]);
+
     const session = await LiveLocation.create({
       employee: req.user._id,
       sessionId: uuidv4(),
@@ -16,7 +26,18 @@ exports.startTracking = async (req, res) => {
       isActive: true,
       date: today,
       startAddress: address,
+      startTime: new Date(),
     });
+
+    // If geocode finishes later, update the session
+    addressPromise.then(async (realAddr) => {
+      if (realAddr !== address) {
+        await LiveLocation.findByIdAndUpdate(session._id, { 
+          startAddress: realAddr,
+          'coordinates.0.address': realAddr 
+        });
+      }
+    }).catch(() => {});
 
     await User.findByIdAndUpdate(req.user._id, { isTracking: true });
 
@@ -141,12 +162,14 @@ exports.stopTracking = async (req, res) => {
   }
 };
 
-// @desc Get today's tracking sessions
+// @desc Get today's tracking sessions (optimized: no coordinates)
 exports.getTodaySessions = async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
-    const sessions = await LiveLocation.find({ employee: req.user._id, date: today })
-      .sort({ createdAt: -1 });
+    const sessions = await LiveLocation.find(
+      { employee: req.user._id, date: today },
+      { coordinates: 0 } // Exclude coordinates for list view performance
+    ).sort({ createdAt: -1 });
     res.json({ success: true, sessions });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -201,10 +224,17 @@ function haversineDistance(p1, p2) {
 }
 function toRad(deg) { return deg * (Math.PI / 180); }
 
-// @desc Get live locations (optimized for polling)
+// @desc Get live locations (optimized with server-side caching)
 exports.getLiveLocations = async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
+    const cacheKey = 'live_locations_all';
+    
+    // Check cache
+    const cachedData = liveCache.get(cacheKey);
+    if (cachedData) {
+      return res.json({ success: true, ...cachedData, fromCache: true });
+    }
     
     // Get all active tracking sessions
     const activeSessions = await LiveLocation.find({
@@ -232,7 +262,12 @@ exports.getLiveLocations = async (req, res) => {
       };
     });
 
-    res.json({ success: true, locations, count: locations.length });
+    const responseData = { locations, count: locations.length };
+    
+    // Store in cache for 10 seconds (very short but helps with burst requests)
+    liveCache.set(cacheKey, responseData, 10);
+
+    res.json({ success: true, ...responseData });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -326,6 +361,30 @@ exports.getEmployeeReport = async (req, res) => {
       attendance: attendanceData,
       sessions: sessionData,
       generatedAt: new Date(),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+// @desc Delete all tracking history for an employee
+exports.deleteEmployeeHistory = async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    
+    // Optional: Filter by date if needed, but the request says "All history"
+    const result = await LiveLocation.deleteMany({ employee: employeeId });
+    
+    // Log activity
+    await ActivityLog.create({
+      employee: req.user._id,
+      action: 'HISTORY_DELETED',
+      description: `Deleted ${result.deletedCount} tracking records for employee ${employeeId}`
+    });
+
+    res.json({ 
+      success: true, 
+      message: `Successfully deleted ${result.deletedCount} history records for this employee.`,
+      deletedCount: result.deletedCount
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

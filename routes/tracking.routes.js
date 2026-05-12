@@ -19,4 +19,8 @@ router.get('/geocode', protect, tc.geocode);
 // Reports
 router.get('/report/employee/:employeeId', protect, tc.getEmployeeReport);
 
+// Delete history
+router.delete('/history/employee/:employeeId', protect, authorize('admin'), tc.deleteEmployeeHistory);
+
 module.exports = router;
+

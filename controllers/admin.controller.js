@@ -190,7 +190,7 @@ exports.getTrackingHistory = async (req, res) => {
     if (employeeId) filter.employee = employeeId;
     if (date) filter.date = date;
 
-    const history = await LiveLocation.find(filter)
+    const history = await LiveLocation.find(filter, { coordinates: 0 }) // Optimized: Exclude coords for list view
       .populate('employee', 'name employeeId department avatar')
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
