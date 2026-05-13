@@ -6,6 +6,54 @@ let lastRequestTime = 0;
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+/**
+ * Formats Google Maps address components into a clean, structured string
+ * Example: Building, Street, Area, City, State - PIN
+ */
+const formatAddress = (result) => {
+  if (!result || !result.address_components) return '';
+
+  const comps = {};
+  result.address_components.forEach((c, index) => {
+    if (c.types.length === 0 && index === 0) {
+      comps.specific = c.long_name;
+    }
+    c.types.forEach(t => {
+      if (!comps[t]) comps[t] = c.long_name;
+    });
+  });
+
+  const parts = [];
+  
+  // 1. Specific Landmark/Building (Priority)
+  const specific = comps.specific || comps.premise || comps.subpremise || comps.point_of_interest || comps.establishment;
+  if (specific) parts.push(specific);
+
+  // 2. Street/Road
+  if (comps.route) parts.push(comps.route);
+
+  // 3. Locality/Area
+  const area = comps.sublocality_level_3 || comps.sublocality_level_2 || comps.sublocality_level_1 || comps.neighborhood || comps.sublocality;
+  if (area) parts.push(area);
+
+  // 4. City
+  if (comps.locality) parts.push(comps.locality);
+
+  let formatted = parts.filter(Boolean).join(', ');
+
+  // 5. State
+  if (comps.administrative_area_level_1) {
+    formatted += `, ${comps.administrative_area_level_1}`;
+  }
+
+  // 6. PIN Code
+  if (comps.postal_code) {
+    formatted += ` - ${comps.postal_code}`;
+  }
+
+  return formatted || result.formatted_address;
+};
+
 const reverseGeocode = async (lat, lng) => {
   const cacheKey = `geo:${parseFloat(lat).toFixed(5)},${parseFloat(lng).toFixed(5)}`;
   
@@ -63,8 +111,8 @@ const reverseGeocode = async (lat, lng) => {
         return b.address_components.length - a.address_components.length;
       })[0];
 
-      const result = bestResult.formatted_address;
-      console.log('🎯 SELECTED BEST:', result);
+      const result = formatAddress(bestResult);
+      console.log('🎯 SELECTED BEST (Formatted):', result);
       geocodeCache.set(cacheKey, result);
       return result;
     }
