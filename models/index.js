@@ -21,6 +21,10 @@ const liveLocationSchema = new mongoose.Schema({
   date: { type: String }, // YYYY-MM-DD
 }, { timestamps: true });
 
+liveLocationSchema.index({ employee: 1, date: -1 });
+liveLocationSchema.index({ sessionId: 1 });
+liveLocationSchema.index({ isActive: 1 });
+
 // ─── Meeting ──────────────────────────────────────────────────────────────────
 const meetingSchema = new mongoose.Schema({
   employee: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -37,6 +41,9 @@ const meetingSchema = new mongoose.Schema({
   date: { type: Date, default: Date.now },
 }, { timestamps: true });
 
+meetingSchema.index({ employee: 1, date: -1 });
+meetingSchema.index({ status: 1 });
+
 // ─── Expense ──────────────────────────────────────────────────────────────────
 const expenseSchema = new mongoose.Schema({
   employee: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -51,6 +58,9 @@ const expenseSchema = new mongoose.Schema({
   rejectionReason: String,
 }, { timestamps: true });
 
+expenseSchema.index({ employee: 1, date: -1 });
+expenseSchema.index({ status: 1 });
+
 // ─── Attendance ───────────────────────────────────────────────────────────────
 const attendanceSchema = new mongoose.Schema({
   employee: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -62,6 +72,8 @@ const attendanceSchema = new mongoose.Schema({
   trackingSessions: [{ type: mongoose.Schema.Types.ObjectId, ref: 'LiveLocation' }],
   totalDistanceTraveled: { type: Number, default: 0 },
 }, { timestamps: true });
+
+attendanceSchema.index({ employee: 1, date: -1 }, { unique: true });
 
 // ─── Activity Log ─────────────────────────────────────────────────────────────
 const activityLogSchema = new mongoose.Schema({
@@ -83,6 +95,9 @@ const notificationSchema = new mongoose.Schema({
   data: mongoose.Schema.Types.Mixed,
 }, { timestamps: true });
 
+notificationSchema.index({ recipient: 1, createdAt: -1 });
+notificationSchema.index({ isRead: 1 });
+
 // ─── Leave ────────────────────────────────────────────────────────────────────
 const leaveSchema = new mongoose.Schema({
   employee: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -97,6 +112,8 @@ const leaveSchema = new mongoose.Schema({
   duration: Number, // in days
 }, { timestamps: true });
 
+leaveSchema.index({ employee: 1, status: 1 });
+
 // ─── Task ─────────────────────────────────────────────────────────────────────
 const taskSchema = new mongoose.Schema({
   title: { type: String, required: true },
@@ -109,6 +126,9 @@ const taskSchema = new mongoose.Schema({
   completedAt: Date,
   location: { lat: Number, lng: Number, address: String },
 }, { timestamps: true });
+
+taskSchema.index({ employee: 1, status: 1 });
+taskSchema.index({ assignedBy: 1 });
 
 module.exports = {
   LiveLocation: mongoose.model('LiveLocation', liveLocationSchema),

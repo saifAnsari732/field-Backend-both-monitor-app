@@ -5,6 +5,9 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const path = require('path');
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
 
 dotenv.config();
 
@@ -22,12 +25,26 @@ const io = new Server(server, {
 });
 
 // Middleware
+app.use(helmet({
+  crossOriginResourcePolicy: false, // Required for cross-origin images/resources
+}));
+app.use(compression());
 app.use(cors({
   origin: ["http://localhost:3000", process.env.CLIENT_URL].filter(Boolean),
   credentials: true,
 }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 500, // limit each IP to 500 requests per windowMs
+  message: { success: false, message: 'Too many requests from this IP, please try again after 15 minutes' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api/', limiter);
 
 // Make io accessible to routes
 app.set('io', io);

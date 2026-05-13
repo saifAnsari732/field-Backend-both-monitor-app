@@ -1,6 +1,7 @@
 // ─── Meeting Controller ───────────────────────────────────────────────────────
 const { Meeting, Expense, Attendance, ActivityLog, Notification, LiveLocation } = require('../models/index');
 const User = require('../models/User.model');
+const { liveCache } = require('../services/cache.service');
 
 // Meeting CRUD
 exports.createMeeting = async (req, res) => {
@@ -61,11 +62,17 @@ exports.getMyExpenses = async (req, res) => {
 // ─── Admin Controller ─────────────────────────────────────────────────────────
 exports.getDashboardStats = async (req, res) => {
   try {
+    const cacheKey = 'admin_dashboard_stats';
+    const cachedStats = liveCache.get(cacheKey);
+    if (cachedStats) {
+      return res.json({ success: true, stats: cachedStats, fromCache: true });
+    }
+
     const today = new Date().toISOString().slice(0, 10);
     const [
       totalEmployees, activeEmployees, trackingNow,
       totalMeetings, todayMeetings, pendingExpenses,
-      totalExpenses, todayAttendance,
+      totalExpenses, todayAttendance, totalKmData
     ] = await Promise.all([
       User.countDocuments({ role: 'employee', isApproved: true }),
       User.countDocuments({ role: 'employee', isOnline: true }),
@@ -75,6 +82,10 @@ exports.getDashboardStats = async (req, res) => {
       Expense.countDocuments({ status: 'pending' }),
       Expense.aggregate([{ $group: { _id: null, total: { $sum: '$amount' } } }]),
       Attendance.countDocuments({ date: today, status: 'present' }),
+      LiveLocation.aggregate([
+        { $match: { date: today } },
+        { $group: { _id: null, total: { $sum: '$totalDistance' } } }
+      ]),
     ]);
 
     const monthlyMeetings = await Meeting.aggregate([
@@ -87,15 +98,20 @@ exports.getDashboardStats = async (req, res) => {
       { $group: { _id: '$category', total: { $sum: '$amount' } } }
     ]);
 
+    const stats = {
+      totalEmployees, activeEmployees, trackingNow,
+      totalMeetings, todayMeetings, pendingExpenses,
+      totalExpenses: totalExpenses[0]?.total || 0,
+      todayAttendance,
+      totalKm: totalKmData[0]?.total || 0,
+      monthlyMeetings, expenseByCategory,
+    };
+
+    liveCache.set(cacheKey, stats, 60); // Cache for 1 minute
+
     res.json({
       success: true,
-      stats: {
-        totalEmployees, activeEmployees, trackingNow,
-        totalMeetings, todayMeetings, pendingExpenses,
-        totalExpenses: totalExpenses[0]?.total || 0,
-        todayAttendance,
-        monthlyMeetings, expenseByCategory,
-      }
+      stats
     });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
@@ -185,12 +201,14 @@ exports.getAttendanceReport = async (req, res) => {
 
 exports.getTrackingHistory = async (req, res) => {
   try {
-    const { employeeId, date, page = 1, limit = 10 } = req.query;
+    const { employeeId, date, page = 1, limit = 100 } = req.query;
     const filter = {};
     if (employeeId) filter.employee = employeeId;
     if (date) filter.date = date;
 
-    const history = await LiveLocation.find(filter, { coordinates: 0 }) // Optimized: Exclude coords for list view
+    const history = await LiveLocation.find(filter, { 
+      coordinates: { $slice: -1 } // Only get the last coordinate for the marker
+    })
       .populate('employee', 'name employeeId department avatar')
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
