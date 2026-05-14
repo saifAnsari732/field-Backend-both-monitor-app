@@ -52,6 +52,11 @@ const expenseSchema = new mongoose.Schema({
   description: String,
   date: { type: Date, default: Date.now },
   receipts: [String],
+  travelDetails: {
+    mode: { type: String, enum: ['bike', 'train', 'bus', 'taxi'] },
+    source: String,
+    destination: String
+  },
   status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
   approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   approvedAt: Date,
@@ -124,11 +129,38 @@ const taskSchema = new mongoose.Schema({
   status: { type: String, enum: ['pending', 'in-progress', 'completed', 'overdue'], default: 'pending' },
   priority: { type: String, enum: ['low', 'medium', 'high'], default: 'medium' },
   completedAt: Date,
+  duration: String, // e.g. "2 hrs"
   location: { lat: Number, lng: Number, address: String },
 }, { timestamps: true });
 
 taskSchema.index({ employee: 1, status: 1 });
 taskSchema.index({ assignedBy: 1 });
+
+// ─── Lead ─────────────────────────────────────────────────────────────────────
+const leadSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  contactNo: { type: String, required: true },
+  address: String,
+  assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  status: { type: String, enum: ['pending', 'completed', 'follow-up'], default: 'pending' },
+  feedback: String,
+  lastContacted: Date,
+}, { timestamps: true });
+
+leadSchema.index({ assignedTo: 1, status: 1 });
+
+// ─── Travel Log ───────────────────────────────────────────────────────────────
+const travelLogSchema = new mongoose.Schema({
+  employee: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  mode: { type: String, enum: ['bus', 'train', 'other'], required: true },
+  source: { type: String, required: true },
+  destination: { type: String, required: true },
+  ticketPhoto: String,
+  date: { type: Date, default: Date.now },
+  amount: Number,
+}, { timestamps: true });
+
+travelLogSchema.index({ employee: 1, date: -1 });
 
 module.exports = {
   LiveLocation: mongoose.model('LiveLocation', liveLocationSchema),
@@ -139,4 +171,6 @@ module.exports = {
   Notification: mongoose.model('Notification', notificationSchema),
   Leave: mongoose.model('Leave', leaveSchema),
   Task: mongoose.model('Task', taskSchema),
+  Lead: mongoose.model('Lead', leadSchema),
+  TravelLog: mongoose.model('TravelLog', travelLogSchema),
 };

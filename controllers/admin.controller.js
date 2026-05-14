@@ -147,6 +147,13 @@ exports.toggleBlock = async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
+exports.updateEmployee = async (req, res) => {
+  try {
+    const employee = await User.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    res.json({ success: true, employee });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
+
 exports.approveExpense = async (req, res) => {
   try {
     const { status, rejectionReason } = req.body;

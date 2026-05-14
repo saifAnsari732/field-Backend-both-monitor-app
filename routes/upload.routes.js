@@ -17,11 +17,21 @@ router.get('/auth', protect, (req, res) => {
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 
-// Server-side upload
-router.post('/image', protect, async (req, res) => {
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Server-side upload using multer
+router.post('/image', protect, upload.single('image'), async (req, res) => {
   try {
-    const { file, fileName, folder = '/crm-tracker' } = req.body;
-    const response = await imagekit.upload({ file, fileName, folder, useUniqueFileName: true });
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+    
+    const response = await imagekit.upload({
+      file: req.file.buffer,
+      fileName: req.file.originalname,
+      folder: '/crm-tracker',
+      useUniqueFileName: true
+    });
+
     res.json({ success: true, url: response.url, fileId: response.fileId, thumbnailUrl: response.thumbnailUrl });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });

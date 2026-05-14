@@ -61,6 +61,8 @@ app.use('/api/upload', require('./routes/upload.routes'));
 app.use('/api/notifications', require('./routes/notification.routes'));
 app.use('/api/leaves', require('./routes/leave.routes'));
 app.use('/api/tasks', require('./routes/task.routes'));
+app.use('/api/leads', require('./routes/lead.routes'));
+app.use('/api/travel', require('./routes/travel.routes'));
 
 // Health check
 app.get('/api/health', (req, res) => res.json({ status: 'OK', timestamp: new Date() }));

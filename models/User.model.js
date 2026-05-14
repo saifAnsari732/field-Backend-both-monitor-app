@@ -31,6 +31,11 @@ const userSchema = new mongoose.Schema(
     lastSeen: { type: Date },
     socketId: { type: String },
     fcmToken: { type: String },
+    // Management Fields
+    salary: { type: Number, default: 0 },
+    TA: { type: Number, default: 0 }, // Travel Allowance
+    DA: { type: Number, default: 0 }, // Daily Allowance
+    allocatedArea: { type: String, default: "" },
   },
   { timestamps: true },
 );

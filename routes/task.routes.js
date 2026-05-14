@@ -5,7 +5,7 @@ const { protect, authorize } = require('../middleware/auth.middleware');
 
 router.use(protect);
 
-router.post('/', authorize('admin'), taskController.createTask);
+router.post('/', authorize('admin', 'hr', 'employee'), taskController.createTask);
 router.get('/all', authorize('admin'), taskController.getAllTasks);
 
 router.get('/my', authorize('employee'), taskController.getMyTasks);

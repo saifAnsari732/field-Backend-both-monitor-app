@@ -4,19 +4,23 @@ const User = require('../models/User.model');
 // @desc Create a new task (admin)
 exports.createTask = async (req, res) => {
   try {
-    const { title, description, employeeId, dueDate, priority, location } = req.body;
+    const { title, description, employeeId, dueDate, priority, location, duration } = req.body;
+
+    const targetEmployeeId = employeeId || (req.user.role === 'employee' ? req.user._id : null);
+    if (!targetEmployeeId) return res.status(400).json({ success: false, message: 'Employee ID required' });
 
     const task = await Task.create({
       title,
       description,
-      employee: employeeId,
+      employee: targetEmployeeId,
       assignedBy: req.user._id,
       dueDate,
       priority,
-      location
+      location,
+      duration
     });
 
-    const employee = await User.findById(employeeId);
+    const employee = await User.findById(targetEmployeeId);
     if (employee) {
       // Notify employee
       const io = req.app.get('io');
@@ -25,7 +29,7 @@ exports.createTask = async (req, res) => {
       }
 
       await Notification.create({
-        recipient: employeeId,
+        recipient: targetEmployeeId,
         sender: req.user._id,
         type: 'task',
         title: 'New Task Assigned',
