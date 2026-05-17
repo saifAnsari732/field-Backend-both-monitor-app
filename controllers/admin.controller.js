@@ -1,5 +1,5 @@
 // ─── Meeting Controller ───────────────────────────────────────────────────────
-const { Meeting, Expense, Attendance, ActivityLog, Notification, LiveLocation } = require('../models/index');
+const { Meeting, Expense, Attendance, ActivityLog, Notification, LiveLocation, Lead, Leave, Task } = require('../models/index');
 const User = require('../models/User.model');
 const { liveCache } = require('../services/cache.service');
 
@@ -72,7 +72,8 @@ exports.getDashboardStats = async (req, res) => {
     const [
       totalEmployees, activeEmployees, trackingNow,
       totalMeetings, todayMeetings, pendingExpenses,
-      totalExpenses, todayAttendance, totalKmData
+      totalExpenses, todayAttendance, totalKmData,
+      totalLeads, totalLeaves, totalTasks
     ] = await Promise.all([
       User.countDocuments({ role: 'employee', isApproved: true }),
       User.countDocuments({ role: 'employee', isOnline: true }),
@@ -86,6 +87,9 @@ exports.getDashboardStats = async (req, res) => {
         { $match: { date: today } },
         { $group: { _id: null, total: { $sum: '$totalDistance' } } }
       ]),
+      Lead.countDocuments(),
+      Leave.countDocuments({}),
+      Task.countDocuments({}),
     ]);
 
     const monthlyMeetings = await Meeting.aggregate([
@@ -104,6 +108,9 @@ exports.getDashboardStats = async (req, res) => {
       totalExpenses: totalExpenses[0]?.total || 0,
       todayAttendance,
       totalKm: totalKmData[0]?.total || 0,
+      totalLeads: totalLeads || 0,
+      totalLeaves: totalLeaves || 0,
+      totalTasks: totalTasks || 0,
       monthlyMeetings, expenseByCategory,
     };
 

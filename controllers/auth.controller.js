@@ -88,15 +88,53 @@ exports.getMe = async (req, res) => {
 };
 
 // @desc Update profile
-exports.updateProfile = async (req, res) => {
+exports. updateProfile = async (req, res) => {
   try {
-    const allowed = ['name', 'phone', 'avatar', 'emergencyContact', 'fcmToken'];
+    const allowed = ['name', 'phone', 'avatar', 'emergencyContact', 'fcmToken', 'daReceipt', 'DA'];
+
+    // DA mode: har upload par DA add hona chahiye (replace nahi)
+    // payload.DA ko increment samjha jayega
     const updates = {};
     allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
-    const user = await User.findByIdAndUpdate(req.user._id, updates, { new: true });
-    res.json({ success: true, user });
+
+    const updateDoc = {};
+
+    // DEBUG: DA payload aur updateDoc kya banta hai
+    // console.log('updateProfile req.body:', req.body);
+
+    // DA increment (total)
+    if (updates.DA !== undefined) {
+      const inc = Number(updates.DA);
+      updateDoc.$inc = { DA: Number.isNaN(inc) ? 0 : inc };
+      delete updates.DA;
+    }
+
+    // DA history: har upload ke saath daReceipt aata hai
+    // (frontend payload me DA increment aur daReceipt url dono bhejta hai)
+    if (req.body.DA !== undefined || req.body.daReceipt !== undefined) {
+      const amt = Number(req.body.DA);
+      const safeAmt = Number.isNaN(amt) ? 0 : amt;
+
+      if (safeAmt > 0 || req.body.daReceipt) {
+        updateDoc.$push = {
+          daHistory: {
+            amount: safeAmt,
+            receipt: req.body.daReceipt || '',
+            date: new Date(),
+          },
+        };
+      }
+    }
+
+    Object.assign(updateDoc, updates);
+
+    console.log('updateProfile req.body:', req.body);
+    console.log('updateProfile updateDoc:', updateDoc);
+
+    const user = await User.findByIdAndUpdate(req.user._id, updateDoc, { new: true, runValidators: true });
+    return res.json({ success: true, user });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    return res.status(500).json({ success: false, message: err.message });
   }
 };
 

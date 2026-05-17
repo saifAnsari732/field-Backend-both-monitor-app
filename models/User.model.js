@@ -19,9 +19,9 @@ const userSchema = new mongoose.Schema(
     joiningDate: { type: Date },
     manager: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     emergencyContact: {
-      name: String,
-      phone: String,
-      relation: String,
+      name: { type: String, default: 'kuchh bhi' },
+      phone: { type: String, default: '123456789' },
+      relation: { type: String, default: 'friend' },
     },
     isActive: { type: Boolean, default: true },
     isBlocked: { type: Boolean, default: false },
@@ -32,10 +32,19 @@ const userSchema = new mongoose.Schema(
     socketId: { type: String },
     fcmToken: { type: String },
     // Management Fields
-    salary: { type: Number, default: 0 },
-    TA: { type: Number, default: 0 }, // Travel Allowance
-    DA: { type: Number, default: 0 }, // Daily Allowance
-    allocatedArea: { type: String, default: "" },
+    salary: { type: Number, default: 12000 },
+    TA: { type: Number, default: 2.50 }, // Travel Allowance
+    DA: { type: Number, default: 0 }, // Daily Allowance (total)
+    daReceipt: { type: String, default: '' },
+    // har baar DA claim ka history
+    daHistory: [
+      {
+        amount: { type: Number, default: 0 },
+        receipt: { type: String, default: '' },
+        date: { type: Date, default: Date.now },
+      },
+    ],
+    allocatedArea: { type: String, default: "kushinagar" },
   },
   { timestamps: true },
 );

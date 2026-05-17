@@ -7,16 +7,15 @@ exports.getConsolidatedReport = async (req, res) => {
     if (!employeeId) return res.status(400).json({ success: false, message: 'Employee ID required' });
 
     const filter = { employee: employeeId };
-    const dateFilter = {};
-    if (startDate) dateFilter.$gte = new Date(startDate);
-    if (endDate) dateFilter.$lte = new Date(endDate);
-    
+    // Normalize date inputs. Meetings/expenses use Date objects; LiveLocation stores date as YYYY-MM-DD string
     const start = startDate ? new Date(startDate) : null;
     const end = endDate ? new Date(endDate) : new Date();
     if (end) end.setHours(23, 59, 59, 999); // Make end date inclusive
+    const startStr = start ? start.toISOString().slice(0, 10) : null;
+    const endStr = end ? end.toISOString().slice(0, 10) : null;
 
     const [employee, meetings, expenses, tasks, leads, locations] = await Promise.all([
-      User.findById(employeeId).select('name employeeId department'),
+      User.findById(employeeId).select('name employeeId department designation phone salary TA DA allocatedArea daHistory'),
       Meeting.find({ 
         employee: employeeId, 
         ...(start && { date: { $gte: start, $lte: end } }) 
@@ -35,9 +34,12 @@ exports.getConsolidatedReport = async (req, res) => {
       }).sort({ createdAt: -1 }),
       LiveLocation.find({ 
         employee: employeeId, 
-        ...(startDate && { date: { $gte: startDate, $lte: endDate || startDate } }) 
+        ...(startStr && { date: { $gte: startStr, $lte: endStr || startStr } }) 
       }).sort({ date: -1 })
     ]);
+
+    const totalKm = locations.reduce((a, b) => a + (b.totalDistance || 0), 0);
+    const travelPay = +(totalKm * 2.5).toFixed(2);
 
     res.json({
       success: true,
@@ -48,7 +50,8 @@ exports.getConsolidatedReport = async (req, res) => {
           totalExpenses: expenses.reduce((a, b) => a + b.amount, 0),
           totalTasks: tasks.length,
           totalLeads: leads.length,
-          totalKm: locations.reduce((a, b) => a + (b.totalDistance || 0), 0)
+          totalKm,
+          travelPay
         },
         meetings,
         expenses,
