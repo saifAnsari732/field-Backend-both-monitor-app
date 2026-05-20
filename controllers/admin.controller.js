@@ -165,7 +165,7 @@ exports.updateEmployee = async (req, res) => {
 
 exports.getManagers = async (req, res) => {
   try {
-    const managers = await User.find({ role: 'manager' }).select('name email designation employeeId department').sort({ name: 1 });
+    const managers = await User.find({ role: 'manager' }).select('name email designation employeeId department role allocatedArea address isActive isOnline isTracking isApproved isBlocked salary TA').sort({ name: 1 });
     res.json({ success: true, managers });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
