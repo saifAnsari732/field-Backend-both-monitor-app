@@ -8,7 +8,7 @@ const userSchema = new mongoose.Schema(
     password: { type: String, required: true, minlength: 6 },
     role: {
       type: String,
-      enum: ["employee", "admin", "hr"],
+      enum: ["employee", "admin", "hr", "manager"],
       default: "employee",
     },
     employeeId: { type: String, unique: true },
@@ -22,6 +22,12 @@ const userSchema = new mongoose.Schema(
       name: { type: String, default: 'kuchh bhi' },
       phone: { type: String, default: '123456789' },
       relation: { type: String, default: 'friend' },
+    },
+    address: {
+      street: { type: String, default: '' },
+      city: { type: String, default: '' },
+      state: { type: String, default: '' },
+      pincode: { type: String, default: '' }
     },
     isActive: { type: Boolean, default: true },
     isBlocked: { type: Boolean, default: false },

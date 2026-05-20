@@ -125,8 +125,10 @@ exports.getDashboardStats = async (req, res) => {
 
 exports.getAllEmployees = async (req, res) => {
   try {
-    const { page = 1, limit = 20, search, department, isActive } = req.query;
-    const filter = { role: 'employee' };
+    const { page = 1, limit = 20, search, department, isActive, role } = req.query;
+    const filter = {};
+    if (role) filter.role = role;
+    else filter.role = 'employee';
     if (search) filter.$or = [{ name: { $regex: search, $options: 'i' } }, { email: { $regex: search, $options: 'i' } }, { employeeId: { $regex: search, $options: 'i' } }];
     if (department) filter.department = department;
     if (isActive !== undefined) filter.isActive = isActive === 'true';
@@ -158,6 +160,13 @@ exports.updateEmployee = async (req, res) => {
   try {
     const employee = await User.findByIdAndUpdate(req.params.id, req.body, { new: true });
     res.json({ success: true, employee });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
+
+exports.getManagers = async (req, res) => {
+  try {
+    const managers = await User.find({ role: 'manager' }).select('name email designation employeeId department').sort({ name: 1 });
+    res.json({ success: true, managers });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
@@ -236,6 +245,18 @@ exports.getTrackingHistory = async (req, res) => {
       total,
       pages: Math.ceil(total / limit)
     });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─── Get All Managers (for dropdown) ─────────────────────────────────────────
+exports.getManagers = async (req, res) => {
+  try {
+    const managers = await User.find({ role: 'manager' })
+      .select('_id name email employeeId department designation')
+      .sort({ name: 1 });
+    res.json({ success: true, managers });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

@@ -57,6 +57,7 @@ app.use('/api/meetings', require('./routes/meeting.routes'));
 app.use('/api/expenses', require('./routes/expense.routes'));
 app.use('/api/attendance', require('./routes/attendance.routes'));
 app.use('/api/admin', require('./routes/admin.routes'));
+app.use('/api/manager', require('./routes/manager.routes'));
 app.use('/api/upload', require('./routes/upload.routes'));
 app.use('/api/notifications', require('./routes/notification.routes'));
 app.use('/api/leaves', require('./routes/leave.routes'));
