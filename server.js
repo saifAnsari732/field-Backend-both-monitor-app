@@ -1,4 +1,14 @@
 const express = require('express');
+
+// 🛡️ Global Crash Protection to prevent server from shutting down on MilesWeb
+process.on('uncaughtException', (err) => {
+  console.error('🔥 CRITICAL: Uncaught Exception caught to prevent crash:', err.message);
+  console.error(err.stack);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('🔥 CRITICAL: Unhandled Rejection caught to prevent crash. Reason:', reason);
+});
+
 const http = require('http');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
@@ -14,11 +24,24 @@ dotenv.config();
 const app = express();
 const server = http.createServer(app);
 
+// Allowed origins list for CORS
+const allowedOrigins = [
+  'https://tm24news.com',
+  'https://www.tm24news.com',
+  'https://kisanteamweb.it.com'
+];
+
 // Socket.IO setup
 const io = new Server(server, {
   cors: {
-
-    origin: ["http://localhost:3000", process.env.CLIENT_URL].filter(Boolean),
+    origin: (origin, callback) => {
+      // Allow requests with no origin (like mobile apps, curl, or postman)
+      if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
     methods: ['GET', 'POST'],
     credentials: true,
   },
@@ -30,7 +53,13 @@ app.use(helmet({
 }));
 app.use(compression());
 app.use(cors({
-  origin: ["http://localhost:3000", process.env.CLIENT_URL].filter(Boolean),
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
 }));
 app.use(express.json({ limit: '50mb' }));
@@ -42,7 +71,7 @@ const limiter = rateLimit({
   max: 500, // limit each IP to 500 requests per windowMs
   message: { success: false, message: 'Too many requests from this IP, please try again after 15 minutes' },
   standardHeaders: true,
-  legacyHeaders: false,
+  legacyHeaders: false, 
 });
 app.use('/api/', limiter);
 
@@ -57,13 +86,14 @@ app.use('/api/meetings', require('./routes/meeting.routes'));
 app.use('/api/expenses', require('./routes/expense.routes'));
 app.use('/api/attendance', require('./routes/attendance.routes'));
 app.use('/api/admin', require('./routes/admin.routes'));
-app.use('/api/manager', require('./routes/manager.routes'));
-app.use('/api/upload', require('./routes/upload.routes'));
+  app.use('/api/upload', require('./routes/upload.routes'));
 app.use('/api/notifications', require('./routes/notification.routes'));
 app.use('/api/leaves', require('./routes/leave.routes'));
 app.use('/api/tasks', require('./routes/task.routes'));
+app.use('/api/dashboard', require('./routes/dashboard.routes'));
 app.use('/api/leads', require('./routes/lead.routes'));
-app.use('/api/travel', require('./routes/travel.routes'));
+//  news api
+app.use('/api', require('./routes/newsRouts'));
 
 // Health check
 app.get('/api/health', (req, res) => res.json({ status: 'OK', timestamp: new Date() }));
@@ -73,7 +103,7 @@ const socketHandler = require('./socket/socket.handler');
 socketHandler(io);
 
 // MongoDB Connection
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/crm_tracker')
+mongoose.connect(process.env.MONGODB_URI || 'mongodb+srv://ansarisaifuddin732_db_user:M2oWIFAFysw7DpGi@cluster0.gbipgw2.mongodb.net/')
   .then(() => console.log('✅ MongoDB connected'))
   .catch(err => console.error('❌ MongoDB error:', err));
 
@@ -87,6 +117,6 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
 
 module.exports = { app, server, io };
