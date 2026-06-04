@@ -1,6 +1,6 @@
 const API_KEY = "AIzaSyByIWhGIn1AkGroPcxJF7n5kLlufcp8t3U";
 const userMessage = "hello";
-
+// nsdvsklvnsonhv
 async function test() {
   try {
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${API_KEY}`);
