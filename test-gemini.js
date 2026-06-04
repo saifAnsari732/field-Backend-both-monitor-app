@@ -1,5 +1,5 @@
-const API_KEY = "AQ.Ab8RN6I1BHBsJg-DVEA2Ss3ewPH6Cl_SuEAQlL6UCIBUIh6efQ";
-
+const API_KEY = "YOUR_API_KEY_HERE";
+// fdgdttndtn
 async function test() {
   try {
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${API_KEY}`, {
