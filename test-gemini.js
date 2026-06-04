@@ -1,4 +1,4 @@
-const API_KEY = "YOUR_API_KEY_HERE";
+const API_KEY = "AQ.Ab8RN6I1BHBsJg-DVEA2Ss3ewPH6Cl_SuEAQlL6UCIBUIh6efQ";
 // fdgdttndtn
 async function test() {
   try {
