@@ -1,4 +1,4 @@
-const API_KEY = "AQ.Ab8RN6I1BHBsJg-DVEA2Ss3ewPH6Cl_SuEAQlL6UCIBUIh6efQ";
+const API_KEY = "AQ.Ab8RN6Iych1FQlpsdPw3UTN3VmrzxvJ0eSG-OySXvDo3aKvLKQ";
 // fdgdttndtn
 async function test() {
   try {
