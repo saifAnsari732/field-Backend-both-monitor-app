@@ -29,7 +29,9 @@ const allowedOrigins = [
   'https://tm24news.com',
   "http://localhost:5173",
   'https://www.tm24news.com',
-  'https://kisanteamweb.it.com'
+  'https://kisanteamweb.it.com',
+  'https://tm-24news.vercel.app',
+  'https://tm24news.vercel.app'
 ];
 
 // Socket.IO setup
