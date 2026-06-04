@@ -46,6 +46,22 @@ const newsSchema = new mongoose.Schema({
   breaking: {
     type: Boolean,
     default: true
+  },
+  location: {
+    type: String,
+    default: ''
+  },
+  tags: {
+    type: [String],
+    default: []
+  },
+  keywords: {
+    type: String,
+    default: ''
+  },
+  link: {
+    type: String,
+    default: 'https://saif-me.com'
   }
 }, {
   timestamps: true // createAt, updatedAt आटोमेटिक जोड़ेगा

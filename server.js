@@ -27,6 +27,7 @@ const server = http.createServer(app);
 // Allowed origins list for CORS
 const allowedOrigins = [
   'https://tm24news.com',
+  "http://localhost:5173",
   'https://www.tm24news.com',
   'https://kisanteamweb.it.com'
 ];
@@ -77,7 +78,7 @@ app.use('/api/', limiter);
 
 // Make io accessible to routes
 app.set('io', io);
-
+ 
 // Routes
 app.use('/api/auth', require('./routes/auth.routes'));
 app.use('/api/employees', require('./routes/employee.routes'));
@@ -90,7 +91,7 @@ app.use('/api/admin', require('./routes/admin.routes'));
 app.use('/api/notifications', require('./routes/notification.routes'));
 app.use('/api/leaves', require('./routes/leave.routes'));
 app.use('/api/tasks', require('./routes/task.routes'));
-app.use('/api/dashboard', require('./routes/dashboard.routes'));
+// app.use('/api/dashboard', require('./routes/dashboard.routes'));
 app.use('/api/leads', require('./routes/lead.routes'));
 //  news api
 app.use('/api', require('./routes/newsRouts'));
