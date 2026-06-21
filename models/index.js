@@ -19,6 +19,7 @@ const liveLocationSchema = new mongoose.Schema({
   totalDistance: { type: Number, default: 0 }, // in km
   isActive: { type: Boolean, default: true },
   date: { type: String }, // YYYY-MM-DD
+  selfieUrl: { type: String }, // Added for punching image
 }, { timestamps: true });
 
 liveLocationSchema.index({ employee: 1, date: -1 });
@@ -76,6 +77,7 @@ const attendanceSchema = new mongoose.Schema({
   totalWorkHours: Number,
   trackingSessions: [{ type: mongoose.Schema.Types.ObjectId, ref: 'LiveLocation' }],
   totalDistanceTraveled: { type: Number, default: 0 },
+  checkInImage: String,
 }, { timestamps: true });
 
 attendanceSchema.index({ employee: 1, date: -1 }, { unique: true });

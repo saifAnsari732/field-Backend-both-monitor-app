@@ -6,7 +6,7 @@ const { liveCache } = require('../services/cache.service');
 // @desc Start tracking session
 exports.startTracking = async (req, res) => {
   try {
-    const { lat, lng } = req.body;
+    const { lat, lng, selfieUrl } = req.body;
     const today = new Date().toISOString().slice(0, 10);
 
     // Start geocoding in background to avoid blocking the response
@@ -27,6 +27,7 @@ exports.startTracking = async (req, res) => {
       date: today,
       startAddress: address,
       startTime: new Date(),
+      selfieUrl: selfieUrl,
     });
 
     // If geocode finishes later, update the session
@@ -48,9 +49,13 @@ exports.startTracking = async (req, res) => {
         employee: req.user._id, date: today,
         checkIn: new Date(), status: 'present',
         trackingSessions: [session._id],
+        checkInImage: selfieUrl,
       });
     } else {
       attendance.trackingSessions.push(session._id);
+      if (selfieUrl && !attendance.checkInImage) {
+        attendance.checkInImage = selfieUrl;
+      }
       await attendance.save();
     }
 
@@ -87,12 +92,25 @@ exports.updateLocation = async (req, res) => {
     const updatedCoords = coordinates.map(c => ({ ...c, address }));
     session.coordinates.push(...updatedCoords);
 
-    // Calculate distance
+    // Calculate distance with threshold to prevent GPS drift accumulation
     const coords = session.coordinates;
     let totalDist = 0;
+    let lastValidCoord = coords[0];
+    
     for (let i = 1; i < coords.length; i++) {
-      totalDist += haversineDistance(coords[i - 1], coords[i]);
+      if (!lastValidCoord) {
+        lastValidCoord = coords[i];
+        continue;
+      }
+      
+      const dist = haversineDistance(lastValidCoord, coords[i]);
+      // Only accumulate if they moved at least 25 meters (0.025 km) to filter out desk drift
+      if (dist >= 0.025) {
+        totalDist += dist;
+        lastValidCoord = coords[i]; // Update anchor point
+      }
     }
+    
     session.totalDistance = totalDist;
     await session.save();
 

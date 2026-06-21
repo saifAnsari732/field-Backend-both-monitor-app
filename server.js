@@ -27,7 +27,7 @@ const server = http.createServer(app);
 // Allowed origins list for CORS
 const allowedOrigins = [
   'https://tm24news.com',
-  "http://localhost:5173",
+  "http://localhost:8002",
   'https://www.tm24news.com',
   'https://kisanteamweb.it.com',
   'https://tm-24news.vercel.app',
@@ -95,7 +95,19 @@ app.use('/api/admin', require('./routes/admin.routes'));
 app.use('/api/notifications', require('./routes/notification.routes'));
 app.use('/api/leaves', require('./routes/leave.routes'));
 app.use('/api/tasks', require('./routes/task.routes'));
-// app.use('/api/dashboard', require('./routes/dashboard.routes'));
+// Mock dashboard route since local backend is missing dashboard.routes.js
+
+app.get('/api/dashboard/stats', (req, res) => {
+  res.json({
+    success: true,
+    stats: {
+      todayAttendance: { status: 'present' },
+      monthlyAttendance: { present: 20, absent: 2, leave: 1 },
+      totalExpenses: 500,
+      completedMeetings: 10
+    }
+  });
+});
 app.use('/api/leads', require('./routes/lead.routes'));
 //  news api
 app.use('/api', require('./routes/newsRouts'));
