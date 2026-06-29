@@ -13,7 +13,11 @@ const imagekit = new ImageKit({
 router.get('/auth', protect, (req, res) => {
   try {
     const result = imagekit.getAuthenticationParameters();
-    res.json({ success: true, ...result });
+    res.json({ 
+      success: true, 
+      publicKey: process.env.IMAGEKIT_PUBLIC_KEY,
+      ...result 
+    });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 });
 

@@ -6,10 +6,18 @@ exports.createLead = async (req, res) => {
     const lead = await Lead.create(req.body);
     
     if (lead.assignedTo) {
+      const io = req.app.get('io');
+      io.to(`user_${lead.assignedTo}`).emit('notification', {
+        title: 'New Lead Assigned',
+        message: `You have been assigned a new lead: ${lead.name}`,
+        type: 'lead',
+        data: { leadId: lead._id }
+      });
+
       await Notification.create({
         recipient: lead.assignedTo,
         sender: req.user._id,
-        type: 'task',
+        type: 'lead', // changed from 'task' to 'lead' for proper routing
         title: 'New Lead Assigned',
         message: `You have been assigned a new lead: ${lead.name}`,
         data: { leadId: lead._id }

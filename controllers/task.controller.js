@@ -22,11 +22,9 @@ exports.createTask = async (req, res) => {
 
     const employee = await User.findById(targetEmployeeId);
     if (employee) {
-      // Notify employee
+      // Notify employee using reliable user room
       const io = req.app.get('io');
-      if (employee.socketId) {
-        io.to(employee.socketId).emit('new_task', { task });
-      }
+      io.to(`user_${targetEmployeeId}`).emit('new_task', { task });
 
       await Notification.create({
         recipient: targetEmployeeId,

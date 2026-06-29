@@ -249,7 +249,7 @@ exports.getLiveLocations = async (req, res) => {
     const cacheKey = 'live_locations_all';
     
     // Check cache
-    const cachedData = liveCache.get(cacheKey);
+    const cachedData = await liveCache.get(cacheKey);
     if (cachedData) {
       return res.json({ success: true, ...cachedData, fromCache: true });
     }
@@ -283,7 +283,7 @@ exports.getLiveLocations = async (req, res) => {
     const responseData = { locations, count: locations.length };
     
     // Store in cache for 10 seconds (very short but helps with burst requests)
-    liveCache.set(cacheKey, responseData, 10);
+    await liveCache.set(cacheKey, responseData, 10);
 
     res.json({ success: true, ...responseData });
   } catch (err) {

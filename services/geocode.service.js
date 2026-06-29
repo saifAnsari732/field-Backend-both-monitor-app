@@ -57,7 +57,7 @@ const formatAddress = (result) => {
 const reverseGeocode = async (lat, lng) => {
   const cacheKey = `geo:${parseFloat(lat).toFixed(5)},${parseFloat(lng).toFixed(5)}`;
   
-  const cachedValue = geocodeCache.get(cacheKey);
+  const cachedValue = await geocodeCache.get(cacheKey);
   if (cachedValue) return cachedValue;
 
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
@@ -113,7 +113,7 @@ const reverseGeocode = async (lat, lng) => {
 
       const result = formatAddress(bestResult);
       console.log('🎯 SELECTED BEST (Formatted):', result);
-      geocodeCache.set(cacheKey, result);
+      await geocodeCache.set(cacheKey, result);
       return result;
     }
 
@@ -134,7 +134,7 @@ const fallbackNominatim = async (lat, lng, cacheKey) => {
     });
     const data = await response.json();
     const result = data.display_name || `Location (${parseFloat(lat).toFixed(4)}, ${parseFloat(lng).toFixed(4)})`;
-    if (data.display_name) geocodeCache.set(cacheKey, result);
+    if (data.display_name) await geocodeCache.set(cacheKey, result);
     return result;
   } catch (err) {
     return `Location (${parseFloat(lat).toFixed(4)}, ${parseFloat(lng).toFixed(4)})`;

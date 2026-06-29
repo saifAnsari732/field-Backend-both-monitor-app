@@ -27,7 +27,7 @@ const server = http.createServer(app);
 // Allowed origins list for CORS
 const allowedOrigins = [
   'https://tm24news.com',
-  "http://localhost:8002",
+  "http://localhost:8081",
   'https://www.tm24news.com',
   'https://kisanteamweb.it.com',
   'https://tm-24news.vercel.app',
@@ -115,9 +115,38 @@ app.use('/api', require('./routes/newsRouts'));
 // Health check
 app.get('/api/health', (req, res) => res.json({ status: 'OK', timestamp: new Date() }));
 
+// Gemini Integration (Moved from test-gemini.js)
+app.post('/api/gemini/generate', async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    if (!prompt) return res.status(400).json({ success: false, message: 'Prompt is required' });
+
+    // Using the key from the test script. Ideally, move this to .env (GEMINI_API_KEY) in the future.
+    const API_KEY = process.env.GEMINI_API_KEY || "AQ.Ab8RN6Iych1FQlpsdPw3UTN3VmrzxvJ0eSG-OySXvDo3aKvLKQ";
+    
+    // NOTE: Using native fetch from Node 18+ (since we use node-fetch or native fetch)
+    const fetch = require('node-fetch'); // Ensure fetch is available if older node
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+    });
+    
+    const data = await response.json();
+    res.json({ success: true, status: response.status, data });
+  } catch (error) {
+    console.error("Gemini API Error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // Socket.IO Logic
 const socketHandler = require('./socket/socket.handler');
 socketHandler(io);
+
+// Initialize Background Cron Jobs
+const { initCronJobs } = require('./services/cron.service');
+initCronJobs(io);
 
 // MongoDB Connection
 mongoose.connect(process.env.MONGODB_URI || 'mongodb+srv://ansarisaifuddin732_db_user:M2oWIFAFysw7DpGi@cluster0.gbipgw2.mongodb.net/')

@@ -63,7 +63,7 @@ exports.getMyExpenses = async (req, res) => {
 exports.getDashboardStats = async (req, res) => {
   try {
     const cacheKey = 'admin_dashboard_stats';
-    const cachedStats = liveCache.get(cacheKey);
+    const cachedStats = await liveCache.get(cacheKey);
     if (cachedStats) {
       return res.json({ success: true, stats: cachedStats, fromCache: true });
     }
@@ -114,7 +114,7 @@ exports.getDashboardStats = async (req, res) => {
       monthlyMeetings, expenseByCategory,
     };
 
-    liveCache.set(cacheKey, stats, 60); // Cache for 1 minute
+    await liveCache.set(cacheKey, stats, 60); // Cache for 1 minute
 
     res.json({
       success: true,
