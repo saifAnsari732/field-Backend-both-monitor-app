@@ -1,59 +1,123 @@
 const Redis = require('ioredis');
+const NodeCache = require('node-cache');
 
-// Initialize Redis connection
-const redisClient = process.env.REDIS_URL 
-  ? new Redis(process.env.REDIS_URL) 
-  : null;
+// ─── In-memory fallback cache (when Redis is not available) ──────────────────
+const memCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
 
-if (redisClient) {
-  redisClient.on('connect', () => console.log('🟢 Redis Connected to Upstash'));
-  redisClient.on('error', (err) => console.error('🔴 Redis Error:', err));
+// ─── Redis Connection ──────────────────────────────────────────────────────────
+let redisClient = null;
+let redisAvailable = false;
+
+if (process.env.REDIS_URL) {
+  try {
+    redisClient = new Redis(process.env.REDIS_URL, {
+      lazyConnect: true,
+      retryStrategy: (times) => {
+        if (times > 5) {
+          console.warn('⚠️  Redis: Max retries reached. Falling back to in-memory cache.');
+          redisAvailable = false;
+          return null; // Stop retrying
+        }
+        return Math.min(times * 200, 2000); // Exponential backoff
+      },
+      maxRetriesPerRequest: 2,
+    });
+
+    redisClient.on('connect', () => {
+      redisAvailable = true;
+      console.log('🟢 Redis Connected to Upstash');
+    });
+
+    redisClient.on('error', (err) => {
+      redisAvailable = false;
+      // Swallow: fallback to in-memory
+    });
+
+    redisClient.connect().catch(() => {
+      console.warn('⚠️  Redis: Initial connection failed. Using in-memory fallback cache.');
+    });
+  } catch (e) {
+    console.warn('⚠️  Redis: Initialization error. Using in-memory fallback cache.');
+  }
 } else {
-  console.warn('⚠️ REDIS_URL not provided. Caching will be disabled.');
+  console.warn('⚠️  REDIS_URL not set. Using in-memory fallback cache (not persistent across restarts).');
 }
 
-/**
- * Get value from Redis cache
- * @param {string} key Cache key
- * @returns {Promise<any>} Parsed JSON value or null
- */
+// ─── Generic Cache Helpers ────────────────────────────────────────────────────
 const getCache = async (key) => {
-  if (!redisClient) return null;
-  try {
-    const data = await redisClient.get(key);
-    return data ? JSON.parse(data) : null;
-  } catch (err) {
-    console.error(`Redis Get Error [${key}]:`, err);
-    return null;
+  if (redisAvailable && redisClient) {
+    try {
+      const data = await redisClient.get(key);
+      return data ? JSON.parse(data) : null;
+    } catch { /* fall through */ }
   }
+  const val = memCache.get(key);
+  return val !== undefined ? val : null;
+};
+
+const setCache = async (key, value, ttl = 60) => {
+  if (redisAvailable && redisClient) {
+    try {
+      await redisClient.set(key, JSON.stringify(value), 'EX', ttl);
+      return;
+    } catch { /* fall through */ }
+  }
+  memCache.set(key, value, ttl);
+};
+
+const deleteCache = async (key) => {
+  if (redisAvailable && redisClient) {
+    try { await redisClient.del(key); } catch { /* ignore */ }
+  }
+  memCache.del(key);
+};
+
+// ─── Distance Tracking Helpers (Redis-native atomic increment) ────────────────
+/**
+ * Get current distance for a session from Redis / mem-cache.
+ * Returns { totalDistance, lastLat, lastLng, lastTs }
+ */
+const getSessionState = async (sessionId) => {
+  const key = `session:${sessionId}`;
+  const raw = await getCache(key);
+  return raw || null;
 };
 
 /**
- * Set value in Redis cache
- * @param {string} key Cache key
- * @param {any} value Value to store (will be JSON stringified)
- * @param {number} ttl Time to live in seconds
- * @returns {Promise<void>}
+ * Save session state (last coord + total distance) so distance can be calculated
+ * incrementally without touching MongoDB on every GPS tick.
+ *
+ * TTL = 24 hours (covers a full shift day even if the server restarts)
  */
-const setCache = async (key, value, ttl = 60) => {
-  if (!redisClient) return;
-  try {
-    await redisClient.set(key, JSON.stringify(value), 'EX', ttl);
-  } catch (err) {
-    console.error(`Redis Set Error [${key}]:`, err);
-  }
+const saveSessionState = async (sessionId, state) => {
+  const key = `session:${sessionId}`;
+  await setCache(key, state, 60 * 60 * 24);
 };
 
-// Exporting legacy names as wrappers to minimize controller changes where possible, 
-// though they MUST be awaited now.
+/**
+ * Atomically increment the session's total distance by delta.
+ * Returns the new total.
+ */
+const incrementSessionDistance = async (sessionId, deltaKm) => {
+  const state = (await getSessionState(sessionId)) || { totalDistance: 0 };
+  state.totalDistance = parseFloat((state.totalDistance + deltaKm).toFixed(3));
+  await saveSessionState(sessionId, state);
+  return state.totalDistance;
+};
+
+const clearSessionState = async (sessionId) => {
+  await deleteCache(`session:${sessionId}`);
+};
+
+// ─── Exports ───────────────────────────────────────────────────────────────────
 const liveCache = {
   get: getCache,
-  set: (key, val, ttl = 60) => setCache(key, val, ttl)
+  set: (key, val, ttl = 60) => setCache(key, val, ttl),
 };
 
 const geocodeCache = {
   get: getCache,
-  set: (key, val, ttl = 86400) => setCache(key, val, ttl)
+  set: (key, val, ttl = 86400) => setCache(key, val, ttl),
 };
 
 module.exports = {
@@ -61,5 +125,10 @@ module.exports = {
   liveCache,
   geocodeCache,
   getCache,
-  setCache
+  setCache,
+  deleteCache,
+  getSessionState,
+  saveSessionState,
+  incrementSessionDistance,
+  clearSessionState,
 };

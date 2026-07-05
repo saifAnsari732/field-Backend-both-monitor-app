@@ -95,18 +95,49 @@ app.use('/api/admin', require('./routes/admin.routes'));
 app.use('/api/notifications', require('./routes/notification.routes'));
 app.use('/api/leaves', require('./routes/leave.routes'));
 app.use('/api/tasks', require('./routes/task.routes'));
-// Mock dashboard route since local backend is missing dashboard.routes.js
+const { protect } = require('./middleware/auth.middleware');
+const { LiveLocation, Meeting } = require('./models');
 
-app.get('/api/dashboard/stats', (req, res) => {
-  res.json({
-    success: true,
-    stats: {
-      todayAttendance: { status: 'present' },
-      monthlyAttendance: { present: 20, absent: 2, leave: 1 },
-      totalExpenses: 500,
-      completedMeetings: 10
-    }
-  });
+// Dashboard stats route for employee
+app.get('/api/dashboard/stats', protect, async (req, res) => {
+  try {
+    const todayDateObj = new Date();
+    todayDateObj.setHours(0, 0, 0, 0);
+    
+    const year = todayDateObj.getFullYear();
+    const month = String(todayDateObj.getMonth() + 1).padStart(2, '0');
+    const day = String(todayDateObj.getDate()).padStart(2, '0');
+    const dateStr = `${year}-${month}-${day}`;
+
+    // Get all tracking sessions
+    const allSessions = await LiveLocation.find({ employee: req.user._id });
+    const totalDistanceAllDates = allSessions.reduce((acc, s) => acc + (s.totalDistance || 0), 0);
+    
+    // Today's sessions
+    const todaySessions = allSessions.filter(s => s.date === dateStr);
+    const distanceToday = todaySessions.reduce((acc, s) => acc + (s.totalDistance || 0), 0);
+
+    // Today's meetings
+    const meetingCount = await Meeting.countDocuments({ 
+      employee: req.user._id, 
+      date: { $gte: todayDateObj } 
+    });
+
+    res.json({
+      success: true,
+      stats: {
+        distanceToday: distanceToday.toFixed(2),
+        totalDistanceAllDates: totalDistanceAllDates.toFixed(2),
+        meetingCount,
+        travelRate: req.user.travelRate || 0,
+        todayAttendance: { status: 'present' },
+        monthlyAttendance: { present: 20, absent: 2, leave: 1 },
+        totalExpenses: 0
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
 });
 app.use('/api/leads', require('./routes/lead.routes'));
 //  news api

@@ -1,7 +1,7 @@
 const { LiveLocation, Attendance, ActivityLog, Notification } = require('../models/index');
 const User = require('../models/User.model');
 const { v4: uuidv4 } = require('uuid');
-const { liveCache } = require('../services/cache.service');
+const { liveCache, saveSessionState, getSessionState, incrementSessionDistance, clearSessionState } = require('../services/cache.service');
 
 // @desc Start tracking session
 exports.startTracking = async (req, res) => {
@@ -80,56 +80,103 @@ const { reverseGeocode } = require('../services/geocode.service');
 // @desc Update location (bulk coordinates)
 exports.updateLocation = async (req, res) => {
   try {
-    const { sessionId, coordinates } = req.body; 
-    const session = await LiveLocation.findOne({ sessionId, employee: req.user._id, isActive: true });
-    if (!session) return res.status(404).json({ success: false, message: 'Session not found' });
+    const { sessionId, coordinates } = req.body;
 
-    // Geocode the latest coordinate
-    const lastCoord = coordinates[coordinates.length - 1];
-    const address = await reverseGeocode(lastCoord.lat, lastCoord.lng);
-    
-    // Add address to coordinates
-    const updatedCoords = coordinates.map(c => ({ ...c, address }));
-    session.coordinates.push(...updatedCoords);
+    // ── Step 1: Get cached session state from Redis (O(1), no DB hit) ──────────
+    let sessionState = await getSessionState(sessionId);
 
-    // Calculate distance with threshold to prevent GPS drift accumulation
-    const coords = session.coordinates;
-    let totalDist = 0;
-    let lastValidCoord = coords[0];
-    
-    for (let i = 1; i < coords.length; i++) {
-      if (!lastValidCoord) {
-        lastValidCoord = coords[i];
-        continue;
-      }
-      
-      const dist = haversineDistance(lastValidCoord, coords[i]);
-      // Only accumulate if they moved at least 25 meters (0.025 km) to filter out desk drift
-      if (dist >= 0.025) {
-        totalDist += dist;
-        lastValidCoord = coords[i]; // Update anchor point
-      }
+    // If no Redis state (e.g. server restarted), recover from DB
+    if (!sessionState) {
+      const dbSession = await LiveLocation.findOne({ sessionId, employee: req.user._id, isActive: true });
+      if (!dbSession) return res.status(404).json({ success: false, message: 'Session not found' });
+      const lastCoordDb = dbSession.coordinates[dbSession.coordinates.length - 1] || {};
+      sessionState = {
+        totalDistance: dbSession.totalDistance || 0,
+        lastLat: lastCoordDb.lat || 0,
+        lastLng: lastCoordDb.lng || 0,
+        lastTs: lastCoordDb.timestamp || new Date().toISOString(),
+      };
+      // Re-seed Redis so next tick is fast again
+      await saveSessionState(sessionId, sessionState);
     }
-    
-    session.totalDistance = totalDist;
-    await session.save();
 
-    // Emit to admin in real-time
+    // ── Step 2: Filter + calculate incremental distance ─────────────────────────
+    const MIN_MOVE_KM   = 0.030; // 30 meters
+    const MAX_SPEED_KMH = 200;   // teleport guard
+    const MAX_ACCURACY  = 40;    // meters
+
+    let incrementalDist = 0;
+    let newLastLat = sessionState.lastLat;
+    let newLastLng = sessionState.lastLng;
+    let newLastTs  = sessionState.lastTs;
+    const validCoords = [];
+
+    for (const coord of coordinates) {
+      if (coord.accuracy && coord.accuracy > MAX_ACCURACY) continue; // poor accuracy
+
+      const dist = haversineDistance({ lat: newLastLat, lng: newLastLng }, coord); // km
+      const timeDiff = newLastTs
+        ? (new Date(coord.timestamp) - new Date(newLastTs)) / 1000
+        : 0;
+      const speed = timeDiff > 0 ? dist / (timeDiff / 3600) : 0;
+
+      if (dist < MIN_MOVE_KM) continue;          // tiny jitter
+      if (speed > MAX_SPEED_KMH) continue;        // GPS teleport
+
+      incrementalDist += dist;
+      newLastLat = coord.lat;
+      newLastLng = coord.lng;
+      newLastTs  = coord.timestamp;
+      validCoords.push(coord);
+    }
+
+    // ── Step 3: Update Redis total atomically ─────────────────────────────────
+    const newTotal = parseFloat((sessionState.totalDistance + incrementalDist).toFixed(3));
+    await saveSessionState(sessionId, {
+      totalDistance: newTotal,
+      lastLat: newLastLat,
+      lastLng: newLastLng,
+      lastTs: newLastTs,
+    });
+
+    // ── Step 4: Persist to MongoDB async (non-blocking) ───────────────────────
+    if (validCoords.length > 0) {
+      const lastCoord = validCoords[validCoords.length - 1];
+      // Geocode in background — don't block the response
+      reverseGeocode(lastCoord.lat, lastCoord.lng)
+        .then(address => {
+          const tagged = validCoords.map(c => ({ ...c, address }));
+          return LiveLocation.findOneAndUpdate(
+            { sessionId, employee: req.user._id, isActive: true },
+            {
+              $push: { coordinates: { $each: tagged } },
+              $set:  { totalDistance: newTotal },
+            }
+          );
+        })
+        .catch(() => {});
+    } else {
+      // No new valid coords, but update totalDistance in DB non-blocking
+      LiveLocation.findOneAndUpdate(
+        { sessionId, employee: req.user._id, isActive: true },
+        { $set: { totalDistance: newTotal } }
+      ).catch(() => {});
+    }
+
+    // ── Step 5: Emit real-time to admin ───────────────────────────────────────
     const io = req.app.get('io');
     io.to('admins').emit('employee_location', {
       employeeId: req.user._id,
       name: req.user.name,
       avatar: req.user.avatar,
       department: req.user.department,
-      lat: lastCoord.lat,
-      lng: lastCoord.lng,
-      speed: lastCoord.speed,
-      address,
-      totalDistance: totalDist,
+      lat: newLastLat,
+      lng: newLastLng,
+      totalDistance: newTotal,
       sessionId,
     });
 
-    res.json({ success: true, totalDistance: totalDist });
+    res.json({ success: true, totalDistance: newTotal });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -139,18 +186,31 @@ exports.updateLocation = async (req, res) => {
 exports.stopTracking = async (req, res) => {
   try {
     const { sessionId } = req.body;
+
+    // Get final authoritative distance from Redis before clearing
+    const cachedState = await getSessionState(sessionId);
+    const redisTotalDist = cachedState ? cachedState.totalDistance : null;
+
     const session = await LiveLocation.findOne({ sessionId, employee: req.user._id });
     if (!session) return res.status(404).json({ success: false, message: 'Session not found' });
 
     session.isActive = false;
     session.endTime = new Date();
-    
+
+    // Use Redis distance if available (more accurate than DB, which might lag)
+    if (redisTotalDist !== null) {
+      session.totalDistance = redisTotalDist;
+    }
+
     // Get end address from last coordinate
     if (session.coordinates.length > 0) {
       session.endAddress = session.coordinates[session.coordinates.length - 1].address;
     }
-    
+
     await session.save();
+
+    // Clear Redis session state — shift is over
+    await clearSessionState(sessionId);
 
     await User.findByIdAndUpdate(req.user._id, { isTracking: false });
 
