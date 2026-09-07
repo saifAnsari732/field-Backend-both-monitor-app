@@ -13,7 +13,7 @@ exports.register = async (req, res) => {
     const employeeId = 'EMP-' + uuidv4().slice(0, 8).toUpperCase();
     const user = await User.create({
       name, email, password, phone, department, designation,
-      employeeId, role: 'employee', isApproved: false,
+      employeeId, role: 'employee', isApproved: true,
     });
 
     await ActivityLog.create({ employee: user._id, action: 'REGISTER', description: 'New employee registered' });
@@ -37,8 +37,7 @@ exports.login = async (req, res) => {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     if (user.isBlocked)
       return res.status(403).json({ success: false, message: 'Account blocked. Contact HR.' });
-    if (!user.isApproved && user.role === 'employee')
-      return res.status(403).json({ success: false, message: 'Account pending approval.' });
+
 
     await User.findByIdAndUpdate(user._id, { isOnline: true, lastSeen: new Date() });
     await ActivityLog.create({ employee: user._id, action: 'LOGIN', description: 'User logged in', ip: req.ip });

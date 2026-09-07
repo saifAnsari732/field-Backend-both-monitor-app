@@ -147,8 +147,8 @@ app.use('/api', require('./routes/newsRouts'));
 app.get('/api/health', (req, res) => res.json({ status: 'OK', timestamp: new Date() }));
 
 // Gemini Integration (Moved from test-gemini.js)
-app.post('/api/gemini/generate', async (req, res) => {
-  try {
+app.post('/api/gemini/generate', async (req, res) => {   
+  try { 
     const { prompt } = req.body;
     if (!prompt) return res.status(400).json({ success: false, message: 'Prompt is required' });
 

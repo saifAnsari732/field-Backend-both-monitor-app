@@ -29,7 +29,7 @@ const initCronJobs = (io) => {
         const unreadCount = stat.count;
 
         // Emit a reminder notification over Socket.io to the specific employee
-        io.to(employeeId).emit('new_notification', {
+        io.to(employeeId).emit('notification', {
           _id: `reminder_${Date.now()}_${Math.random()}`,
           title: 'Unread Notifications Reminder',
           message: `You have ${unreadCount} pending notification(s). Please review them.`,

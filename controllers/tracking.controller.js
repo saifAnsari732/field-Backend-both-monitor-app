@@ -30,6 +30,15 @@ exports.startTracking = async (req, res) => {
       selfieUrl: selfieUrl,
     });
 
+    // Seed the authoritative distance state before the first GPS update arrives.
+    // This keeps live admin responses in sync even while Mongo persistence runs asynchronously.
+    await saveSessionState(session.sessionId, {
+      totalDistance: 0,
+      lastLat: Number(lat),
+      lastLng: Number(lng),
+      lastTs: new Date().toISOString(),
+    });
+
     // If geocode finishes later, update the session
     addressPromise.then(async (realAddr) => {
       if (realAddr !== address) {
@@ -81,6 +90,9 @@ const { reverseGeocode } = require('../services/geocode.service');
 exports.updateLocation = async (req, res) => {
   try {
     const { sessionId, coordinates } = req.body;
+    if (!sessionId || !Array.isArray(coordinates) || coordinates.length === 0) {
+      return res.status(400).json({ success: false, message: 'sessionId and coordinates are required' });
+    }
 
     // ── Step 1: Get cached session state from Redis (O(1), no DB hit) ──────────
     let sessionState = await getSessionState(sessionId);
@@ -101,9 +113,9 @@ exports.updateLocation = async (req, res) => {
     }
 
     // ── Step 2: Filter + calculate incremental distance ─────────────────────────
-    const MIN_MOVE_KM   = 0.030; // 30 meters
+    const MIN_MOVE_KM   = 0.010; // 10 meters (matches frontend, captures road curves)
     const MAX_SPEED_KMH = 200;   // teleport guard
-    const MAX_ACCURACY  = 40;    // meters
+    const MAX_ACCURACY  = 500;   // meters (matches frontend — pocket/display-off GPS can be 200-400m)
 
     let incrementalDist = 0;
     let newLastLat = sessionState.lastLat;
@@ -112,11 +124,17 @@ exports.updateLocation = async (req, res) => {
     const validCoords = [];
 
     for (const coord of coordinates) {
+      const lat = Number(coord?.lat);
+      const lng = Number(coord?.lng);
+      const timestamp = new Date(coord?.timestamp);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || Number.isNaN(timestamp.getTime())) continue;
+
+      const normalizedCoord = { ...coord, lat, lng, timestamp: timestamp.toISOString() };
       if (coord.accuracy && coord.accuracy > MAX_ACCURACY) continue; // poor accuracy
 
-      const dist = haversineDistance({ lat: newLastLat, lng: newLastLng }, coord); // km
+      const dist = haversineDistance({ lat: newLastLat, lng: newLastLng }, normalizedCoord); // km
       const timeDiff = newLastTs
-        ? (new Date(coord.timestamp) - new Date(newLastTs)) / 1000
+        ? (timestamp - new Date(newLastTs)) / 1000
         : 0;
       const speed = timeDiff > 0 ? dist / (timeDiff / 3600) : 0;
 
@@ -124,10 +142,10 @@ exports.updateLocation = async (req, res) => {
       if (speed > MAX_SPEED_KMH) continue;        // GPS teleport
 
       incrementalDist += dist;
-      newLastLat = coord.lat;
-      newLastLng = coord.lng;
-      newLastTs  = coord.timestamp;
-      validCoords.push(coord);
+      newLastLat = lat;
+      newLastLng = lng;
+      newLastTs  = timestamp.toISOString();
+      validCoords.push(normalizedCoord);
     }
 
     // ── Step 3: Update Redis total atomically ─────────────────────────────────
@@ -257,10 +275,22 @@ exports.getTodaySessions = async (req, res) => {
 // @desc Get session route (admin)
 exports.getSessionRoute = async (req, res) => {
   try {
-    const session = await LiveLocation.findById(req.params.id).populate('employee', 'name employeeId');
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ success: false, message: 'Session id is required' });
+
+    let session = null;
+    // UUID session IDs must never be sent through findById; only a strict
+    // 24-character Mongo ObjectId may use the _id lookup path.
+    if (/^[0-9a-fA-F]{24}$/.test(id)) {
+      session = await LiveLocation.findById(id).populate('employee', 'name employeeId avatar');
+    }
+    if (!session) {
+      session = await LiveLocation.findOne({ sessionId: id }).populate('employee', 'name employeeId avatar');
+    }
     if (!session) return res.status(404).json({ success: false, message: 'Session not found' });
     res.json({ success: true, session });
   } catch (err) {
+    console.error('Get session route error:', err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 };
@@ -321,8 +351,9 @@ exports.getLiveLocations = async (req, res) => {
     }).populate('employee', 'name employeeId avatar department');
 
     // Format for frontend
-    const locations = activeSessions.map(session => {
+    const locations = await Promise.all(activeSessions.map(async (session) => {
       const latestCoord = session.coordinates[session.coordinates.length - 1] || {};
+      const sessionState = await getSessionState(session.sessionId);
       return {
         employeeId: session.employee._id,
         name: session.employee.name,
@@ -333,12 +364,12 @@ exports.getLiveLocations = async (req, res) => {
         lng: latestCoord.lng,
         speed: latestCoord.speed || 0,
         address: latestCoord.address,
-        totalDistance: session.totalDistance || 0,
+        totalDistance: sessionState?.totalDistance ?? session.totalDistance ?? 0,
         sessionId: session.sessionId,
         startTime: session.startTime,
         updatedAt: latestCoord.timestamp || session.updatedAt,
       };
-    });
+    }));
 
     const responseData = { locations, count: locations.length };
     
