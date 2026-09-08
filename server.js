@@ -22,24 +22,33 @@ const rateLimit = require('express-rate-limit');
 dotenv.config();
 
 const app = express();
+
+// Trust the reverse proxy (like Nginx/MilesWeb) to properly pass client IPs for rate-limiting
+app.set('trust proxy', 1);
+
 const server = http.createServer(app);
 
-// Allowed origins list for CORS
-const allowedOrigins = [
+// Keep REST and Socket.IO on the same allow-list so browser preflight behaves consistently.
+const allowedOrigins = new Set([
   'https://tm24news.com',
-  "http://localhost:8081",
   'https://www.tm24news.com',
   'https://kisanteamweb.it.com',
   'https://tm-24news.vercel.app',
-  'https://tm24news.vercel.app'
-];
+  'https://tm24news.vercel.app',
+  'http://localhost:3000',
+  'http://localhost:8081',
+  'http://localhost:19006',
+  ...(process.env.CORS_ORIGINS || '').split(',').map((origin) => origin.trim()).filter(Boolean),
+]);
+
+const isAllowedOrigin = (origin) => !origin || allowedOrigins.has(origin);
 
 // Socket.IO setup
 const io = new Server(server, {
   cors: {
     origin: (origin, callback) => {
       // Allow requests with no origin (like mobile apps, curl, or postman)
-      if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      if (isAllowedOrigin(origin)) {
         callback(null, true);
       } else {
         callback(new Error('Not allowed by CORS'));
@@ -57,7 +66,7 @@ app.use(helmet({
 app.use(compression());
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+    if (isAllowedOrigin(origin)) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));

@@ -5,6 +5,7 @@ const liveLocationSchema = new mongoose.Schema({
   employee: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   sessionId: { type: String, required: true },
   coordinates: [{
+    eventId: { type: String },
     lat: Number,
     lng: Number,
     speed: Number,
@@ -25,6 +26,7 @@ const liveLocationSchema = new mongoose.Schema({
 liveLocationSchema.index({ employee: 1, date: -1 });
 liveLocationSchema.index({ sessionId: 1 });
 liveLocationSchema.index({ isActive: 1 });
+liveLocationSchema.index({ sessionId: 1, 'coordinates.eventId': 1 });
 
 // ─── Meeting ──────────────────────────────────────────────────────────────────
 const meetingSchema = new mongoose.Schema({
@@ -38,6 +40,7 @@ const meetingSchema = new mongoose.Schema({
   dealAmount: { type: Number, default: 0 },
   followUpDate: Date,
   images: [String],
+  selfieUrl: String,
   location: { lat: Number, lng: Number },
   date: { type: Date, default: Date.now },
 }, { timestamps: true });

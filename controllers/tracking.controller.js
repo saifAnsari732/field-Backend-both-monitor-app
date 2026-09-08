@@ -3,6 +3,20 @@ const User = require('../models/User.model');
 const { v4: uuidv4 } = require('uuid');
 const { liveCache, saveSessionState, getSessionState, incrementSessionDistance, clearSessionState } = require('../services/cache.service');
 
+const sessionLocks = new Map();
+const acquireSessionLock = async (sessionId) => {
+  const previous = sessionLocks.get(sessionId) || Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const queued = previous.then(() => gate);
+  sessionLocks.set(sessionId, queued);
+  await previous;
+  return () => {
+    release();
+    if (sessionLocks.get(sessionId) === queued) sessionLocks.delete(sessionId);
+  };
+};
+
 // @desc Start tracking session
 exports.startTracking = async (req, res) => {
   try {
@@ -88,11 +102,13 @@ const { reverseGeocode } = require('../services/geocode.service');
 
 // @desc Update location (bulk coordinates)
 exports.updateLocation = async (req, res) => {
+  let releaseSessionLock;
   try {
     const { sessionId, coordinates } = req.body;
     if (!sessionId || !Array.isArray(coordinates) || coordinates.length === 0) {
       return res.status(400).json({ success: false, message: 'sessionId and coordinates are required' });
     }
+    releaseSessionLock = await acquireSessionLock(sessionId);
 
     // ── Step 1: Get cached session state from Redis (O(1), no DB hit) ──────────
     let sessionState = await getSessionState(sessionId);
@@ -114,8 +130,10 @@ exports.updateLocation = async (req, res) => {
 
     // ── Step 2: Filter + calculate incremental distance ─────────────────────────
     const MIN_MOVE_KM   = 0.010; // 10 meters (matches frontend, captures road curves)
+    const STATIONARY_SPEED_MPS = 0.5;
+    const STATIONARY_DRIFT_KM = 0.120; // 120m GPS drift while phone is stationary
     const MAX_SPEED_KMH = 200;   // teleport guard
-    const MAX_ACCURACY  = 500;   // meters (matches frontend — pocket/display-off GPS can be 200-400m)
+    const MAX_ACCURACY  = 120;
 
     let incrementalDist = 0;
     let newLastLat = sessionState.lastLat;
@@ -123,13 +141,26 @@ exports.updateLocation = async (req, res) => {
     let newLastTs  = sessionState.lastTs;
     const validCoords = [];
 
-    for (const coord of coordinates) {
+    const orderedCoordinates = [...coordinates].sort((first, second) => {
+      return new Date(first?.timestamp).getTime() - new Date(second?.timestamp).getTime();
+    });
+
+    for (const coord of orderedCoordinates) {
       const lat = Number(coord?.lat);
       const lng = Number(coord?.lng);
       const timestamp = new Date(coord?.timestamp);
       if (!Number.isFinite(lat) || !Number.isFinite(lng) || Number.isNaN(timestamp.getTime())) continue;
 
       const normalizedCoord = { ...coord, lat, lng, timestamp: timestamp.toISOString() };
+      if (coord.eventId) {
+        const duplicate = await LiveLocation.exists({
+          sessionId,
+          employee: req.user._id,
+          'coordinates.eventId': coord.eventId,
+        });
+        if (duplicate) continue;
+      }
+      if (newLastTs && timestamp.getTime() <= new Date(newLastTs).getTime()) continue;
       if (coord.accuracy && coord.accuracy > MAX_ACCURACY) continue; // poor accuracy
 
       const dist = haversineDistance({ lat: newLastLat, lng: newLastLng }, normalizedCoord); // km
@@ -137,8 +168,17 @@ exports.updateLocation = async (req, res) => {
         ? (timestamp - new Date(newLastTs)) / 1000
         : 0;
       const speed = timeDiff > 0 ? dist / (timeDiff / 3600) : 0;
+      const reportedSpeedMps = Number(coord.speed);
+      // A low-speed fix with accuracy above 30m is normal GPS drift. Reject it
+      // before calculating distance; deriving speed from the jump would accept
+      // stationary drift as real travel.
+      if ((!Number.isFinite(reportedSpeedMps) || reportedSpeedMps < STATIONARY_SPEED_MPS) && Number(coord.accuracy) > 30) continue;
+      const calculatedSpeedMps = timeDiff > 0 ? (dist * 1000) / timeDiff : 0;
+      const effectiveSpeedMps = Math.max(reportedSpeedMps || 0, calculatedSpeedMps);
 
       if (dist < MIN_MOVE_KM) continue;          // tiny jitter
+      const accuracyDriftLimit = Math.max(STATIONARY_DRIFT_KM, (Number(coord.accuracy) || 0) * 0.00075);
+      if (effectiveSpeedMps < STATIONARY_SPEED_MPS && dist < accuracyDriftLimit) continue;
       if (speed > MAX_SPEED_KMH) continue;        // GPS teleport
 
       incrementalDist += dist;
@@ -157,27 +197,34 @@ exports.updateLocation = async (req, res) => {
       lastTs: newLastTs,
     });
 
-    // ── Step 4: Persist to MongoDB async (non-blocking) ───────────────────────
+    // ── Step 4: Persist the authoritative total before responding ────────────
+    // Do not fire-and-forget this write: stop/restart immediately after a GPS
+    // tick must still see the accepted distance in MongoDB.
     if (validCoords.length > 0) {
       const lastCoord = validCoords[validCoords.length - 1];
-      // Geocode in background — don't block the response
-      reverseGeocode(lastCoord.lat, lastCoord.lng)
-        .then(address => {
-          const tagged = validCoords.map(c => ({ ...c, address }));
-          return LiveLocation.findOneAndUpdate(
-            { sessionId, employee: req.user._id, isActive: true },
-            {
-              $push: { coordinates: { $each: tagged } },
-              $set:  { totalDistance: newTotal },
-            }
-          );
-        })
-        .catch(() => {});
-    } else {
-      // No new valid coords, but update totalDistance in DB non-blocking
-      LiveLocation.findOneAndUpdate(
+      const tagged = validCoords.map((coord) => ({ ...coord, address: coord.address || '' }));
+      await LiveLocation.findOneAndUpdate(
         { sessionId, employee: req.user._id, isActive: true },
-        { $set: { totalDistance: newTotal } }
+        {
+          $push: { coordinates: { $each: tagged } },
+          $max: { totalDistance: newTotal },
+        },
+        { runValidators: true }
+      );
+      reverseGeocode(lastCoord.lat, lastCoord.lng).then((address) => {
+        if (!address) return;
+        return LiveLocation.updateOne(
+          { sessionId, employee: req.user._id, isActive: true },
+          { $set: { 'coordinates.$[point].address': address } },
+          { arrayFilters: [{ 'point.eventId': lastCoord.eventId }] }
+        );
+      }).catch(() => {});
+    } else {
+      // Keep the durable total monotonic even when this batch has no point.
+      await LiveLocation.findOneAndUpdate(
+        { sessionId, employee: req.user._id, isActive: true },
+        { $max: { totalDistance: newTotal } },
+        { runValidators: true }
       ).catch(() => {});
     }
 
@@ -197,6 +244,8 @@ exports.updateLocation = async (req, res) => {
     res.json({ success: true, totalDistance: newTotal });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
+  } finally {
+    releaseSessionLock?.();
   }
 };
 
@@ -215,10 +264,11 @@ exports.stopTracking = async (req, res) => {
     session.isActive = false;
     session.endTime = new Date();
 
-    // Use Redis distance if available (more accurate than DB, which might lag)
-    if (redisTotalDist !== null) {
-      session.totalDistance = redisTotalDist;
-    }
+    // Never allow a stale cache read to lower the durable MongoDB total.
+    session.totalDistance = Math.max(
+      Number(session.totalDistance) || 0,
+      Number(redisTotalDist) || 0
+    );
 
     // Get end address from last coordinate
     if (session.coordinates.length > 0) {
@@ -255,6 +305,65 @@ exports.stopTracking = async (req, res) => {
     res.json({ success: true, totalDistance: totalDist, session });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// Close sessions whose last accepted GPS fix is older than the inactivity window.
+// This is intentionally server-side: a killed mobile process cannot be trusted
+// to turn its own stale tracking state off.
+exports.autoStopInactiveSessions = async (io, inactivityMs = 60 * 60 * 1000) => {
+  const now = Date.now();
+  const activeSessions = await LiveLocation.find({ isActive: true }).select(
+    'employee sessionId coordinates totalDistance startTime date'
+  );
+
+  for (const candidate of activeSessions) {
+    const lastCoordinate = candidate.coordinates?.[candidate.coordinates.length - 1];
+    const lastActivity = lastCoordinate?.timestamp || candidate.startTime;
+    if (!lastActivity || now - new Date(lastActivity).getTime() < inactivityMs) continue;
+
+    // Claim the session atomically so overlapping cron ticks cannot close it twice.
+    const session = await LiveLocation.findOneAndUpdate(
+      { _id: candidate._id, isActive: true },
+      { $set: { isActive: false, endTime: new Date(), totalDistance: Number(candidate.totalDistance) || 0 } },
+      { new: true }
+    );
+    if (!session) continue;
+
+    const totalDistance = Number(session.totalDistance) || 0;
+    await clearSessionState(session.sessionId);
+    await User.findByIdAndUpdate(session.employee, { isTracking: false });
+    await Attendance.findOneAndUpdate(
+      { employee: session.employee, date: session.date },
+      { $set: { checkOut: new Date(), totalDistanceTraveled: totalDistance } }
+    );
+    await ActivityLog.create({
+      employee: session.employee,
+      action: 'TRACKING_AUTO_STOPPED',
+      description: `Tracking auto-stopped after ${Math.round(inactivityMs / 3600000)} hour of no movement. Distance: ${totalDistance.toFixed(2)} km`,
+      metadata: { sessionId: session.sessionId, totalDistance, lastActivity },
+    });
+
+    await Notification.create({
+      recipient: session.employee,
+      type: 'tracking',
+      title: 'Tracking stopped automatically',
+      message: 'Tracking was stopped after 1 hour without accepted GPS movement. Start a new shift when you leave.',
+      data: { sessionId: session.sessionId, totalDistance },
+    });
+
+    io.to(String(session.employee)).emit('tracking_auto_stopped', {
+      sessionId: session.sessionId,
+      totalDistance,
+      reason: 'no_movement_timeout',
+    });
+    io.to('admins').emit('employee_tracking_stopped', {
+      employeeId: session.employee,
+      sessionId: session.sessionId,
+      totalDistance,
+      reason: 'no_movement_timeout',
+    });
+    console.log(`⏹️ [TRACKING] Auto-stopped ${session.sessionId}; no movement for ${Math.round(inactivityMs / 3600000)} hour.`);
   }
 };
 

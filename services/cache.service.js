@@ -10,8 +10,11 @@ let redisAvailable = false;
 
 if (process.env.REDIS_URL) {
   try {
+    const isRediss = process.env.REDIS_URL.startsWith('rediss://');
     redisClient = new Redis(process.env.REDIS_URL, {
       lazyConnect: true,
+      family: 4, // Force IPv4 (Solves timeout/drop issues on some hostings)
+      ...(isRediss && { tls: { rejectUnauthorized: false } }), // Prevent strict SSL rejection on MilesWeb
       retryStrategy: (times) => {
         if (times > 5) {
           console.warn('⚠️  Redis: Max retries reached. Falling back to in-memory cache.');

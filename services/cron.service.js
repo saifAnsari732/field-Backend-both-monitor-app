@@ -1,11 +1,21 @@
 const cron = require('node-cron');
 const { Notification } = require('../models');
+const { autoStopInactiveSessions } = require('../controllers/tracking.controller');
 
 /**
  * Initializes all background cron jobs.
  * @param {Object} io - Socket.io instance for emitting real-time events
  */
 const initCronJobs = (io) => {
+  // Run every five minutes so a stale shift is closed shortly after its 1-hour deadline.
+  cron.schedule('*/5 * * * *', async () => {
+    try {
+      await autoStopInactiveSessions(io);
+    } catch (error) {
+      console.error('❌ [CRON] Error auto-stopping inactive tracking:', error.message);
+    }
+  });
+
   // Run at minute 0 past every hour: '0 * * * *'
   cron.schedule('0 * * * *', async () => {
     try {
