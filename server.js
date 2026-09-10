@@ -162,7 +162,7 @@ app.post('/api/gemini/generate', async (req, res) => {
     if (!prompt) return res.status(400).json({ success: false, message: 'Prompt is required' });
 
     // Using the key from the test script. Ideally, move this to .env (GEMINI_API_KEY) in the future.
-    const API_KEY = process.env.GEMINI_API_KEY || "AQ.Ab8RN6Iych1FQlpsdPw3UTN3VmrzxvJ0eSG-OySXvDo3aKvLKQ";
+    const API_KEY = process.env.GEMINI_API_KEY;
     
     // NOTE: Using native fetch from Node 18+ (since we use node-fetch or native fetch)
     const fetch = require('node-fetch'); // Ensure fetch is available if older node

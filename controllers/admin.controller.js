@@ -224,10 +224,15 @@ exports.getAttendanceReport = async (req, res) => {
 
 exports.getTrackingHistory = async (req, res) => {
   try {
-    const { employeeId, date, page = 1, limit = 100 } = req.query;
+    const { employeeId, date, startDate, endDate, page = 1, limit = 100 } = req.query;
     const filter = {};
     if (employeeId) filter.employee = employeeId;
-    if (date) filter.date = date;
+    
+    if (startDate && endDate) {
+      filter.date = { $gte: startDate, $lte: endDate };
+    } else if (date) {
+      filter.date = date;
+    }
 
     const history = await LiveLocation.find(filter, { 
       coordinates: { $slice: -1 } // Only get the last coordinate for the marker

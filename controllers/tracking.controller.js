@@ -392,6 +392,46 @@ exports.getSessionRoute = async (req, res) => {
     // 24-character Mongo ObjectId may use the _id lookup path.
     if (/^[0-9a-fA-F]{24}$/.test(id)) {
       session = await LiveLocation.findById(id).populate('employee', 'name employeeId avatar');
+      // If not found by document _id, check if id is an Employee _id
+      if (!session) {
+        const today = new Date().toISOString().slice(0, 10);
+        const daySessions = await LiveLocation.find({ employee: id, date: today })
+          .sort({ startTime: 1 })
+          .populate('employee', 'name employeeId avatar department');
+
+        if (daySessions && daySessions.length > 0) {
+          let cumulativeDistance = 0;
+          let combinedCoordinates = [];
+
+          daySessions.forEach((s) => {
+            cumulativeDistance += Number(s.totalDistance) || 0;
+            if (Array.isArray(s.coordinates)) {
+              combinedCoordinates.push(...s.coordinates);
+            }
+          });
+
+          const firstSess = daySessions[0];
+          session = {
+            _id: id,
+            employee: firstSess.employee,
+            totalDistance: Math.round(cumulativeDistance * 100) / 100,
+            coordinates: combinedCoordinates,
+            startTime: firstSess.startTime,
+            endTime: daySessions[daySessions.length - 1].endTime,
+            isCombined: true,
+          };
+        } else {
+          // If employee did NOT punch in / track today, return 0 KM and empty coordinates
+          const empObj = await User.findById(id).select('name employeeId avatar department');
+          session = {
+            _id: id,
+            employee: empObj || { name: 'Employee' },
+            totalDistance: 0,
+            coordinates: [],
+            isCombined: true,
+          };
+        }
+      }
     }
     if (!session) {
       session = await LiveLocation.findOne({ sessionId: id }).populate('employee', 'name employeeId avatar');
@@ -463,6 +503,19 @@ exports.getLiveLocations = async (req, res) => {
     const locations = await Promise.all(activeSessions.map(async (session) => {
       const latestCoord = session.coordinates[session.coordinates.length - 1] || {};
       const sessionState = await getSessionState(session.sessionId);
+
+      // Sum up total distance across ALL sessions for this employee today
+      const allTodaySessions = await LiveLocation.find({ 
+        employee: session.employee._id, 
+        date: today 
+      });
+      const cumulativeDistance = allTodaySessions.reduce((sum, s) => {
+        if (s.sessionId === session.sessionId) {
+          return sum + (sessionState?.totalDistance ?? s.totalDistance ?? 0);
+        }
+        return sum + (s.totalDistance || 0);
+      }, 0);
+
       return {
         employeeId: session.employee._id,
         name: session.employee.name,
@@ -473,7 +526,7 @@ exports.getLiveLocations = async (req, res) => {
         lng: latestCoord.lng,
         speed: latestCoord.speed || 0,
         address: latestCoord.address,
-        totalDistance: sessionState?.totalDistance ?? session.totalDistance ?? 0,
+        totalDistance: Math.round(cumulativeDistance * 100) / 100,
         sessionId: session.sessionId,
         startTime: session.startTime,
         updatedAt: latestCoord.timestamp || session.updatedAt,
