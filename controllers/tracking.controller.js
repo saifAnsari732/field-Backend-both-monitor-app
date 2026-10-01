@@ -129,11 +129,9 @@ exports.updateLocation = async (req, res) => {
     }
 
     // ── Step 2: Filter + calculate incremental distance ─────────────────────────
-    const MIN_MOVE_KM   = 0.010; // 10 meters (matches frontend, captures road curves)
-    const STATIONARY_SPEED_MPS = 0.5;
-    const STATIONARY_DRIFT_KM = 0.120; // 120m GPS drift while phone is stationary
-    const MAX_SPEED_KMH = 200;   // teleport guard
-    const MAX_ACCURACY  = 120;
+    const MIN_MOVE_KM   = 0.008; // 8 meters (matches frontend, captures road curves)
+    const MAX_SPEED_KMH = 220;   // Teleport guard (airplane / GPS flip)
+    const MAX_ACCURACY  = 500;   // 500m accuracy gate (allows pocket mode / weak signals)
 
     let incrementalDist = 0;
     let newLastLat = sessionState.lastLat;
@@ -152,6 +150,8 @@ exports.updateLocation = async (req, res) => {
       if (!Number.isFinite(lat) || !Number.isFinite(lng) || Number.isNaN(timestamp.getTime())) continue;
 
       const normalizedCoord = { ...coord, lat, lng, timestamp: timestamp.toISOString() };
+
+      // Deduplicate eventId
       if (coord.eventId) {
         const duplicate = await LiveLocation.exists({
           sessionId,
@@ -160,26 +160,24 @@ exports.updateLocation = async (req, res) => {
         });
         if (duplicate) continue;
       }
+
+      // Ignore heartbeats or older timestamps
+      if (coord.isHeartbeat) continue;
       if (newLastTs && timestamp.getTime() <= new Date(newLastTs).getTime()) continue;
-      if (coord.accuracy && coord.accuracy > MAX_ACCURACY) continue; // poor accuracy
 
+      // Gate 1: Accuracy check (accept up to 500m accuracy for pocket mode)
+      if (coord.accuracy && Number(coord.accuracy) > MAX_ACCURACY) continue;
+
+      // Gate 2: Distance check (minimum 8 meters movement to ignore stationary jitter)
       const dist = haversineDistance({ lat: newLastLat, lng: newLastLng }, normalizedCoord); // km
-      const timeDiff = newLastTs
-        ? (timestamp - new Date(newLastTs)) / 1000
-        : 0;
-      const speed = timeDiff > 0 ? dist / (timeDiff / 3600) : 0;
-      const reportedSpeedMps = Number(coord.speed);
-      // A low-speed fix with accuracy above 30m is normal GPS drift. Reject it
-      // before calculating distance; deriving speed from the jump would accept
-      // stationary drift as real travel.
-      if ((!Number.isFinite(reportedSpeedMps) || reportedSpeedMps < STATIONARY_SPEED_MPS) && Number(coord.accuracy) > 30) continue;
-      const calculatedSpeedMps = timeDiff > 0 ? (dist * 1000) / timeDiff : 0;
-      const effectiveSpeedMps = Math.max(reportedSpeedMps || 0, calculatedSpeedMps);
+      if (dist < MIN_MOVE_KM) continue;
 
-      if (dist < MIN_MOVE_KM) continue;          // tiny jitter
-      const accuracyDriftLimit = Math.max(STATIONARY_DRIFT_KM, (Number(coord.accuracy) || 0) * 0.00075);
-      if (effectiveSpeedMps < STATIONARY_SPEED_MPS && dist < accuracyDriftLimit) continue;
-      if (speed > MAX_SPEED_KMH) continue;        // GPS teleport
+      // Gate 3: Teleport protection (speed check calculated from time difference)
+      const timeDiffSec = newLastTs ? (timestamp.getTime() - new Date(newLastTs).getTime()) / 1000 : 0;
+      if (timeDiffSec > 0) {
+        const calculatedSpeedKmh = (dist / timeDiffSec) * 3600;
+        if (calculatedSpeedKmh > MAX_SPEED_KMH) continue; // Impossible speed jump
+      }
 
       incrementalDist += dist;
       newLastLat = lat;
