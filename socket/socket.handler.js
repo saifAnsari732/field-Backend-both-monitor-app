@@ -1,7 +1,7 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User.model');
 
-const HEARTBEAT_TIMEOUT = 60000; // 60 seconds
+const HEARTBEAT_TIMEOUT = 180000; // 180 seconds (3 minutes — prevents disconnect when browser tab is inactive)
 const heartbeatTimers = new Map(); // Track heartbeat timers per socket
 
 module.exports = (io) => {
@@ -22,20 +22,44 @@ module.exports = (io) => {
 
   io.on('connection', async (socket) => {
     const user = socket.user;
-    console.log(`🔌 ${user.name} connected [${user.role}] - ${socket.id}`);
+    const normalizedRole = (user.role || '').toUpperCase();
+    const isSuperAdmin = ['SUPER_ADMIN', 'SUPERADMIN'].includes(normalizedRole);
+    const orgId = user.organizationId?._id || user.organizationId;
+    const orgRoom = orgId ? `org_${orgId}` : null;
+    const adminOrgRoom = orgId ? `org_admins_${orgId}` : null;
+
+    console.log(`🔌 ${user.name} connected [${user.role}] (Org: ${orgId || 'N/A'}) - ${socket.id}`);
 
     // Update user socket ID and online status
     await User.findByIdAndUpdate(user._id, { socketId: socket.id, isOnline: true });
 
-    // Join role-based rooms
-    if (user.role === 'admin' || user.role === 'hr') {
+    // Join user & organization rooms
+    socket.join(`user_${user._id}`);
+
+    if (isSuperAdmin) {
+      socket.join('superadmins');
       socket.join('admins');
-      // Send current online employees to admin
-      const onlineEmployees = await User.find({ isOnline: true, role: 'employee' })
-        .select('name employeeId isTracking isOnline lastSeen avatar department');
+    }
+
+    if (orgRoom) {
+      socket.join(orgRoom);
+      socket.join(`org:${orgId}`);
+      if (['ORG_ADMIN', 'ORGADMIN', 'ADMIN', 'HR', 'MANAGER'].includes(normalizedRole)) {
+        socket.join(adminOrgRoom);
+        socket.join(`org:${orgId}:admins`);
+      }
+    }
+
+    // Legacy admin room with org scoping
+    if (['ADMIN', 'ORG_ADMIN', 'ORGADMIN', 'HR', 'MANAGER'].includes(normalizedRole)) {
+      socket.join('admins');
+      const onlineEmployees = await User.find({
+        isOnline: true,
+        role: { $nin: ['SUPER_ADMIN', 'SUPERADMIN'] },
+        ...(isSuperAdmin ? {} : { organizationId: orgId }),
+      }).select('name employeeId isTracking isOnline lastSeen avatar department organizationId');
       socket.emit('online_employees', onlineEmployees);
     }
-    socket.join(`user_${user._id}`);
 
     // ─── Heartbeat Mechanism ────────────────────────────────────────────────────
     const setupHeartbeatTimeout = () => {
@@ -52,40 +76,59 @@ module.exports = (io) => {
     };
 
     socket.on('heartbeat', (data) => {
-      // Reset heartbeat timeout on client heartbeat
       setupHeartbeatTimeout();
       socket.emit('heartbeat_ack', { timestamp: Date.now() });
     });
 
     setupHeartbeatTimeout();
 
-    // ─── Tracking Events ────────────────────────────────────────────────────────
+    // ─── Tracking Events (Scoped by Org Room) ──────────────────────────────────
     socket.on('location_ping', async (data) => {
-      // Real-time location broadcast to admins
-      io.to('admins').emit('employee_location', {
+      const payload = {
         employeeId: user._id,
         name: user.name,
         avatar: user.avatar,
         department: user.department,
+        organizationId: user.organizationId,
         ...data,
-      });
+      };
+
+      if (adminOrgRoom) {
+        io.to(adminOrgRoom).to(`org:${orgId}:admins`).to('superadmins').emit('employee_location', payload);
+      } else {
+        io.to('admins').emit('employee_location', payload);
+      }
     });
 
     socket.on('tracking_started', (data) => {
-      io.to('admins').emit('employee_tracking_started', {
+      const payload = {
         employeeId: user._id,
         name: user.name,
         avatar: user.avatar,
+        organizationId: user.organizationId,
         ...data,
-      });
+      };
+
+      if (adminOrgRoom) {
+        io.to(adminOrgRoom).to(`org:${orgId}:admins`).to('superadmins').emit('employee_tracking_started', payload);
+      } else {
+        io.to('admins').emit('employee_tracking_started', payload);
+      }
     });
 
     socket.on('tracking_stopped', (data) => {
-      io.to('admins').emit('employee_tracking_stopped', {
+      const payload = {
         employeeId: user._id,
         name: user.name,
+        organizationId: user.organizationId,
         ...data,
-      });
+      };
+
+      if (adminOrgRoom) {
+        io.to(adminOrgRoom).to(`org:${orgId}:admins`).to('superadmins').emit('employee_tracking_stopped', payload);
+      } else {
+        io.to('admins').emit('employee_tracking_stopped', payload);
+      }
     });
 
     // ─── Chat / Notifications ────────────────────────────────────────────────────

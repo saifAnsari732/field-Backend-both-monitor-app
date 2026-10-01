@@ -7,7 +7,7 @@ const { autoStopInactiveSessions } = require('../controllers/tracking.controller
  * @param {Object} io - Socket.io instance for emitting real-time events
  */
 const initCronJobs = (io) => {
-  // Run every five minutes so a stale shift is closed shortly after its 1-hour deadline.
+  // Run every five minutes so a stale shift is closed shortly after its 3-hour deadline.
   cron.schedule('*/5 * * * *', async () => {
     try {
       await autoStopInactiveSessions(io);

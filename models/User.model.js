@@ -3,57 +3,86 @@ const bcrypt = require("bcryptjs");
 
 const userSchema = new mongoose.Schema(
   {
+    organizationId: { type: mongoose.Schema.Types.ObjectId, ref: "Organization" },
     name: { type: String, required: true, trim: true },
-    email: { type: String, required: true, unique: true, lowercase: true },
+    email: { type: String, required: true, lowercase: true, trim: true },
     password: { type: String, required: true, minlength: 6 },
     role: {
       type: String,
-      enum: ["employee", "admin", "hr", "manager"],
-      default: "employee",
+      enum: [
+        "SUPER_ADMIN",
+        "ORG_ADMIN",
+        "MANAGER",
+        "EMPLOYEE",
+        "superadmin",
+        "admin",
+        "hr",
+        "manager",
+        "employee",
+        "agent",
+      ],
+      default: "EMPLOYEE",
     },
-    employeeId: { type: String, unique: true },
+    employeeId: { type: String },
     phone: { type: String },
     avatar: { type: String, default: "" },
     department: { type: String },
-    designation: { type: String },
+    departmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Department" },
+    teamId: { type: mongoose.Schema.Types.ObjectId, ref: "Team" },
+    teamName: { type: String, default: "" },
+    designation: { type: String, default: "" },
     joiningDate: { type: Date },
     manager: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    managerId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    managerName: { type: String, default: "" },
+    assignedEmployees: [
+      {
+        _id: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+        name: { type: String },
+      },
+    ],
     emergencyContact: {
-      name: { type: String, default: 'kuchh bhi' },
-      phone: { type: String, default: '123456789' },
-      relation: { type: String, default: 'friend' },
+      name: { type: String, default: "" },
+      phone: { type: String, default: "" },
+      relation: { type: String, default: "" },
     },
     address: {
-      street: { type: String, default: '' },
-      city: { type: String, default: '' },
-      state: { type: String, default: '' },
-      pincode: { type: String, default: '' }
+      street: { type: String, default: "" },
+      city: { type: String, default: "" },
+      state: { type: String, default: "" },
+      pincode: { type: String, default: "" },
     },
     isActive: { type: Boolean, default: true },
     isBlocked: { type: Boolean, default: false },
-    isApproved: { type: Boolean, default: false },
+    isApproved: { type: Boolean, default: true },
     isTracking: { type: Boolean, default: false },
     isOnline: { type: Boolean, default: false },
     lastSeen: { type: Date },
     socketId: { type: String },
     fcmToken: { type: String },
-    // Management Fields
+    mustChangePassword: { type: Boolean, default: false },
+
+    // Financial & Management Fields
     salary: { type: Number, default: 12000 },
-    TA: { type: Number, default: 2.50 }, // Travel Allowance
-    DA: { type: Number, default: 0 }, // Daily Allowance (total)
-    daReceipt: { type: String, default: '' },
-    // har baar DA claim ka history
+    TA: { type: Number, default: 2.50 }, // Travel Allowance per KM
+    DA: { type: Number, default: 0 },
+    daReceipt: { type: String, default: "" },
     daHistory: [
       {
         amount: { type: Number, default: 0 },
-        receipt: { type: String, default: '' },
+        receipt: { type: String, default: "" },
         date: { type: Date, default: Date.now },
       },
     ],
-    allocatedArea: { type: String, default: "kushinagar" },
+    allocatedArea: { type: String, default: "Default Area" },
   },
-  { timestamps: true },
+  { timestamps: true }
 );
+
+userSchema.index({ organizationId: 1, email: 1 });
+userSchema.index({ organizationId: 1, role: 1 });
+userSchema.index({ organizationId: 1, managerId: 1 });
+userSchema.index({ organizationId: 1, departmentId: 1 });
 
 userSchema.pre("save", async function (next) {
   if (!this.isModified("password")) return next();

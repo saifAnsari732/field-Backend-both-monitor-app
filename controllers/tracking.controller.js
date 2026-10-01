@@ -128,20 +128,34 @@ exports.updateLocation = async (req, res) => {
       await saveSessionState(sessionId, sessionState);
     }
 
-    // ── Step 2: Filter + calculate incremental distance ─────────────────────────
-    const MIN_MOVE_KM   = 0.008; // 8 meters (matches frontend, captures road curves)
-    const MAX_SPEED_KMH = 220;   // Teleport guard (airplane / GPS flip)
-    const MAX_ACCURACY  = 500;   // 500m accuracy gate (allows pocket mode / weak signals)
+    // ── Step 2: Batch eventId deduplication (1 query for full batch instead of N queries) ──
+    const incomingEventIds = orderedCoordinates.map(c => c?.eventId).filter(Boolean);
+    const existingEventIdSet = new Set();
+    if (incomingEventIds.length > 0) {
+      try {
+        const existingDoc = await LiveLocation.findOne(
+          { sessionId, employee: req.user._id, 'coordinates.eventId': { $in: incomingEventIds } },
+          { 'coordinates.eventId': 1 }
+        ).lean();
+        if (existingDoc && Array.isArray(existingDoc.coordinates)) {
+          existingDoc.coordinates.forEach(c => {
+            if (c?.eventId) existingEventIdSet.add(c.eventId);
+          });
+        }
+      } catch (_) {}
+    }
+
+    // ── Step 3: Multi-Tier Accuracy & Speed Confidence Filter ─────────────────
+    const MIN_MOVE_KM            = 0.008; // 8 meters minimum movement
+    const MAX_ACCURACY_FOR_KM    = 200;   // Coords > 200m accuracy stored for map, but NOT counted for KM
+    const MAX_SPEED_KMH          = 180;   // Realistic max speed for field staff
+    const SUDDEN_JUMP_SPEED_KMH  = 130;   // Sudden jump threshold for small time gaps
 
     let incrementalDist = 0;
     let newLastLat = sessionState.lastLat;
     let newLastLng = sessionState.lastLng;
     let newLastTs  = sessionState.lastTs;
     const validCoords = [];
-
-    const orderedCoordinates = [...coordinates].sort((first, second) => {
-      return new Date(first?.timestamp).getTime() - new Date(second?.timestamp).getTime();
-    });
 
     for (const coord of orderedCoordinates) {
       const lat = Number(coord?.lat);
@@ -151,38 +165,42 @@ exports.updateLocation = async (req, res) => {
 
       const normalizedCoord = { ...coord, lat, lng, timestamp: timestamp.toISOString() };
 
-      // Deduplicate eventId
-      if (coord.eventId) {
-        const duplicate = await LiveLocation.exists({
-          sessionId,
-          employee: req.user._id,
-          'coordinates.eventId': coord.eventId,
-        });
-        if (duplicate) continue;
-      }
+      // 1. Fast O(1) deduplication check
+      if (coord.eventId && existingEventIdSet.has(coord.eventId)) continue;
 
-      // Ignore heartbeats or older timestamps
+      // 2. Ignore keepalive heartbeats or older timestamps
       if (coord.isHeartbeat) continue;
       if (newLastTs && timestamp.getTime() <= new Date(newLastTs).getTime()) continue;
 
-      // Gate 1: Accuracy check (accept up to 500m accuracy for pocket mode)
-      if (coord.accuracy && Number(coord.accuracy) > MAX_ACCURACY) continue;
+      const accuracy = Number(coord.accuracy) || 50;
 
-      // Gate 2: Distance check (minimum 8 meters movement to ignore stationary jitter)
+      // 3. Distance calculation from last accepted position
       const dist = haversineDistance({ lat: newLastLat, lng: newLastLng }, normalizedCoord); // km
-      if (dist < MIN_MOVE_KM) continue;
-
-      // Gate 3: Teleport protection (speed check calculated from time difference)
       const timeDiffSec = newLastTs ? (timestamp.getTime() - new Date(newLastTs).getTime()) / 1000 : 0;
+
+      // 4. Speed outlier protection
+      let calculatedSpeedKmh = 0;
       if (timeDiffSec > 0) {
-        const calculatedSpeedKmh = (dist / timeDiffSec) * 3600;
-        if (calculatedSpeedKmh > MAX_SPEED_KMH) continue; // Impossible speed jump
+        calculatedSpeedKmh = (dist / timeDiffSec) * 3600;
+        if (calculatedSpeedKmh > MAX_SPEED_KMH) continue; // Teleport jump reject
+        // Sudden speed jump check for very short time gaps (< 8 seconds)
+        if (timeDiffSec < 8 && calculatedSpeedKmh > SUDDEN_JUMP_SPEED_KMH) continue;
       }
 
-      incrementalDist += dist;
-      newLastLat = lat;
-      newLastLng = lng;
-      newLastTs  = timestamp.toISOString();
+      // 5. Accuracy Tiers:
+      // High (<= 30m) & Good (30-80m): Accept >= 8m movement
+      // Low (80-200m): Accept if movement >= 15m (pocket mode filter)
+      // Poor (> 200m): Save to route history, but DO NOT add to distance calculation
+      const effectiveMinMoveKm = accuracy > 80 ? 0.015 : MIN_MOVE_KM;
+
+      if (accuracy <= MAX_ACCURACY_FOR_KM && dist >= effectiveMinMoveKm) {
+        incrementalDist += dist;
+        newLastLat = lat;
+        newLastLng = lng;
+        newLastTs  = timestamp.toISOString();
+      }
+
+      // Always save valid coordinate to route array so path display stays continuous
       validCoords.push(normalizedCoord);
     }
 
@@ -497,11 +515,25 @@ exports.getSessionRoute = async (req, res) => {
 // @desc Get all live employees (admin)
 exports.getLiveEmployees = async (req, res) => {
   try {
-    const employees = await User.find({ isTracking: true, isOnline: true })
+    const userRole = (req.user?.role || '').toUpperCase();
+    const isSuperAdmin = ['SUPER_ADMIN', 'SUPERADMIN'].includes(userRole);
+    const orgId = req.user?.organizationId?._id || req.user?.organizationId;
+
+    const userScope = isSuperAdmin ? {} : { organizationId: orgId };
+    if (userRole === 'MANAGER') {
+      userScope.$or = [{ managerId: req.user._id }, { manager: req.user._id }, { _id: req.user._id }];
+    }
+
+    const employees = await User.find({ isTracking: true, isOnline: true, ...userScope })
       .select('name employeeId department avatar isTracking isOnline lastSeen');
+    
+    const empIds = employees.map(e => e._id);
     const locations = await LiveLocation.find({
-      isActive: true, date: new Date().toISOString().slice(0, 10)
+      isActive: true,
+      date: new Date().toISOString().slice(0, 10),
+      employee: { $in: empIds }
     }).populate('employee', 'name employeeId avatar department');
+
     res.json({ success: true, employees, locations });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -531,11 +563,14 @@ function haversineDistance(p1, p2) {
 }
 function toRad(deg) { return deg * (Math.PI / 180); }
 
-// @desc Get live locations (optimized with server-side caching)
+// @desc Get live locations (optimized with server-side caching & tenant isolation)
 exports.getLiveLocations = async (req, res) => {
   try {
+    const userRole = (req.user?.role || '').toUpperCase();
+    const isSuperAdmin = ['SUPER_ADMIN', 'SUPERADMIN'].includes(userRole);
+    const orgId = req.user?.organizationId?._id || req.user?.organizationId;
     const today = new Date().toISOString().slice(0, 10);
-    const cacheKey = 'live_locations_all';
+    const cacheKey = `live_locations_${isSuperAdmin ? 'all' : orgId || req.user?._id}`;
     
     // Check cache
     const cachedData = await liveCache.get(cacheKey);
@@ -543,14 +578,25 @@ exports.getLiveLocations = async (req, res) => {
       return res.json({ success: true, ...cachedData, fromCache: true });
     }
     
-    // Get all active tracking sessions
+    // Scope employee IDs to tenant/manager
+    const userScope = isSuperAdmin ? {} : { organizationId: orgId };
+    if (userRole === 'MANAGER') {
+      userScope.$or = [{ managerId: req.user._id }, { manager: req.user._id }, { _id: req.user._id }];
+    }
+
+    const orgEmployees = await User.find(userScope).select('_id');
+    const empIds = orgEmployees.map(e => e._id);
+
+    // Get active tracking sessions for scoped employees
     const activeSessions = await LiveLocation.find({
       isActive: true,
       date: today,
-    }).populate('employee', 'name employeeId avatar department');
+      employee: { $in: empIds }
+    }).populate('employee', 'name employeeId avatar department organizationId');
 
     // Format for frontend
-    const locations = await Promise.all(activeSessions.map(async (session) => {
+    const rawLocations = await Promise.all(activeSessions.map(async (session) => {
+      if (!session.employee) return null;
       const latestCoord = session.coordinates[session.coordinates.length - 1] || {};
       const sessionState = await getSessionState(session.sessionId);
 
@@ -583,9 +629,10 @@ exports.getLiveLocations = async (req, res) => {
       };
     }));
 
+    const locations = rawLocations.filter(Boolean);
     const responseData = { locations, count: locations.length };
     
-    // Store in cache for 10 seconds (very short but helps with burst requests)
+    // Store in cache for 10 seconds
     await liveCache.set(cacheKey, responseData, 10);
 
     res.json({ success: true, ...responseData });

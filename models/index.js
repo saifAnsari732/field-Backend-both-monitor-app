@@ -28,6 +28,12 @@ const liveLocationSchema = new mongoose.Schema({
   selfieUrl:           { type: String, default: null },
   totalDistance:       { type: Number, default: 0 },     // km, written with $max (never decreases)
   manualDistanceAdded: { type: Number, default: 0 },     // admin KM credit
+  // ─── Multi-Metric Tracking Audit Ledger ───────────
+  rawGpsDistance:      { type: Number, default: 0 },     // Raw unverified GPS distance
+  acceptedDistance:    { type: Number, default: 0 },     // Verified high & good confidence KM
+  recoveredDistance:   { type: Number, default: 0 },     // Soft-accept recovered KM
+  rejectedDistance:    { type: Number, default: 0 },     // Dropped GPS noise / teleport jumps
+  trackingQuality:     { type: Number, default: 100 },   // 0-100% confidence score
   isActive:            { type: Boolean, default: true },
   date:                { type: String },                  // YYYY-MM-DD
   lastActivity:        { type: Date, default: Date.now }, // Updated on GPS update + heartbeat

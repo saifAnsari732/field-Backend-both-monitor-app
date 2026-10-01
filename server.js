@@ -35,8 +35,11 @@ const allowedOrigins = new Set([
   'https://kisanteamweb.it.com',
   'https://tm-24news.vercel.app',
   'https://tm24news.vercel.app',
-  'http://localhost:3000',
+  'http://localhost:3000', 
   'http://localhost:8081',
+  'http://127.0.0.1:8081', 
+  'http://192.168.0.110:8081',
+  'http://192.168.0.107:8081', 
   'http://localhost:19006',
   ...(process.env.CORS_ORIGINS || '').split(',').map((origin) => origin.trim()).filter(Boolean),
 ]);
@@ -138,7 +141,7 @@ app.get('/api/dashboard/stats', protect, async (req, res) => {
         distanceToday: distanceToday.toFixed(2),
         totalDistanceAllDates: totalDistanceAllDates.toFixed(2),
         meetingCount,
-        travelRate: req.user.travelRate || 0,
+        travelRate: req.user.TA || req.user.travelRate || 0,
         todayAttendance: { status: 'present' },
         monthlyAttendance: { present: 20, absent: 2, leave: 1 },
         totalExpenses: 0
@@ -206,3 +209,4 @@ const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
 
 module.exports = { app, server, io };
+  

@@ -20,10 +20,34 @@ const protect = async (req, res, next) => {
 };
 
 const authorize = (...roles) => (req, res, next) => {
-  if (!roles.includes(req.user.role)) {
-    return res.status(403).json({ success: false, message: 'Access denied' });
+  if (!req.user || !req.user.role) {
+    return res.status(403).json({ success: false, message: 'Access denied: No user role' });
   }
-  next();
+
+  const userRole = req.user.role.toUpperCase();
+  const allowedRoles = roles.map(r => r.toUpperCase());
+
+  // Super admin & Org admin bypass all management endpoints
+  if (['SUPER_ADMIN', 'SUPERADMIN', 'ORG_ADMIN', 'ORGADMIN'].includes(userRole)) {
+    return next();
+  }
+
+  // Managers/HR can access administrative/management endpoints
+  if (userRole === 'MANAGER' || userRole === 'HR') {
+    if (allowedRoles.includes('MANAGER') || allowedRoles.includes('ADMIN') || allowedRoles.includes('HR') || allowedRoles.includes('ALL')) {
+      return next();
+    }
+  }
+
+  if (allowedRoles.includes(userRole) || allowedRoles.includes('ALL')) {
+    return next();
+  }
+
+  if (roles.includes(req.user.role)) {
+    return next();
+  }
+
+  return res.status(403).json({ success: false, message: 'Access denied' });
 };
 
 const generateToken = (id) =>

@@ -32,7 +32,7 @@ exports.register = async (req, res) => {
 exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await User.findOne({ email }).populate('manager', 'name email');
+    const user = await User.findOne({ email }).populate('manager', 'name email').populate('organizationId');
     if (!user || !(await user.matchPassword(password)))
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     if (user.isBlocked)
@@ -52,7 +52,7 @@ exports.login = async (req, res) => {
 // @desc Refresh Token
 exports.refreshToken = async (req, res) => {
   try {
-    const user = await User.findById(req.user._id);
+    const user = await User.findById(req.user._id).populate('organizationId');
     if (!user) {
       return res.status(401).json({ success: false, message: 'User not found' });
     }
@@ -82,7 +82,7 @@ exports.logout = async (req, res) => {
 
 // @desc Get current user
 exports.getMe = async (req, res) => {
-  const user = await User.findById(req.user._id).populate('manager', 'name email avatar');
+  const user = await User.findById(req.user._id).populate('manager', 'name email avatar').populate('organizationId');
   res.json({ success: true, user });
 };
 

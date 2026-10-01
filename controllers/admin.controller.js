@@ -62,43 +62,61 @@ exports.getMyExpenses = async (req, res) => {
 // ─── Admin Controller ─────────────────────────────────────────────────────────
 exports.getDashboardStats = async (req, res) => {
   try {
-    const cacheKey = 'admin_dashboard_stats';
+    const userRole = (req.user?.role || '').toUpperCase();
+    const isSuperAdmin = ['SUPER_ADMIN', 'SUPERADMIN'].includes(userRole);
+    const orgId = req.user?.organizationId?._id || req.user?.organizationId;
+    const cacheKey = `admin_dashboard_stats_${isSuperAdmin ? 'super' : orgId || req.user?._id}`;
+
     const cachedStats = await liveCache.get(cacheKey);
     if (cachedStats) {
       return res.json({ success: true, stats: cachedStats, fromCache: true });
     }
 
     const today = new Date().toISOString().slice(0, 10);
+    const userFilter = isSuperAdmin ? {} : { organizationId: orgId };
+
+    if (userRole === 'MANAGER') {
+      userFilter.$or = [{ managerId: req.user._id }, { manager: req.user._id }, { _id: req.user._id }];
+    }
+
+    // Get list of matching employee IDs for scoped sub-queries
+    const scopedEmployees = await User.find(userFilter).select('_id');
+    const empIds = scopedEmployees.map(e => e._id);
+
     const [
       totalEmployees, activeEmployees, trackingNow,
       totalMeetings, todayMeetings, pendingExpenses,
       totalExpenses, todayAttendance, totalKmData,
       totalLeads, totalLeaves, totalTasks
     ] = await Promise.all([
-      User.countDocuments({ role: 'employee', isApproved: true }),
-      User.countDocuments({ role: 'employee', isOnline: true }),
-      User.countDocuments({ role: 'employee', isTracking: true }),
-      Meeting.countDocuments(),
-      Meeting.countDocuments({ date: { $gte: new Date(today) } }),
-      Expense.countDocuments({ status: 'pending' }),
-      Expense.aggregate([{ $group: { _id: null, total: { $sum: '$amount' } } }]),
-      Attendance.countDocuments({ date: today, status: 'present' }),
+      User.countDocuments({ role: { $nin: ['SUPER_ADMIN', 'SUPERADMIN'] }, isApproved: true, ...userFilter }),
+      User.countDocuments({ role: { $nin: ['SUPER_ADMIN', 'SUPERADMIN'] }, isOnline: true, ...userFilter }),
+      User.countDocuments({ role: { $nin: ['SUPER_ADMIN', 'SUPERADMIN'] }, isTracking: true, ...userFilter }),
+      Meeting.countDocuments(isSuperAdmin ? {} : { employee: { $in: empIds } }),
+      Meeting.countDocuments(isSuperAdmin ? { date: { $gte: new Date(today) } } : { employee: { $in: empIds }, date: { $gte: new Date(today) } }),
+      Expense.countDocuments(isSuperAdmin ? { status: 'pending' } : { employee: { $in: empIds }, status: 'pending' }),
+      Expense.aggregate([
+        ...(isSuperAdmin ? [] : [{ $match: { employee: { $in: empIds } } }]),
+        { $group: { _id: null, total: { $sum: '$amount' } } }
+      ]),
+      Attendance.countDocuments(isSuperAdmin ? { date: today, status: 'present' } : { employee: { $in: empIds }, date: today, status: 'present' }),
       LiveLocation.aggregate([
-        { $match: { date: today } },
+        { $match: { date: today, ...(isSuperAdmin ? {} : { employee: { $in: empIds } }) } },
         { $group: { _id: null, total: { $sum: '$totalDistance' } } }
       ]),
-      Lead.countDocuments(),
-      Leave.countDocuments({}),
-      Task.countDocuments({}),
+      Lead.countDocuments(isSuperAdmin ? {} : { employee: { $in: empIds } }),
+      Leave.countDocuments(isSuperAdmin ? {} : { employee: { $in: empIds } }),
+      Task.countDocuments(isSuperAdmin ? {} : { employee: { $in: empIds } }),
     ]);
 
     const monthlyMeetings = await Meeting.aggregate([
+      ...(isSuperAdmin ? [] : [{ $match: { employee: { $in: empIds } } }]),
       { $group: { _id: { $month: '$date' }, count: { $sum: 1 } } },
       { $sort: { '_id': 1 } }
     ]);
 
     const expenseByCategory = await Expense.aggregate([
-      { $match: { status: 'approved' } },
+      { $match: { status: 'approved', ...(isSuperAdmin ? {} : { employee: { $in: empIds } }) } },
       { $group: { _id: '$category', total: { $sum: '$amount' } } }
     ]);
 
@@ -114,7 +132,7 @@ exports.getDashboardStats = async (req, res) => {
       monthlyMeetings, expenseByCategory,
     };
 
-    await liveCache.set(cacheKey, stats, 60); // Cache for 1 minute
+    await liveCache.set(cacheKey, stats, 30);
 
     res.json({
       success: true,
@@ -125,17 +143,57 @@ exports.getDashboardStats = async (req, res) => {
 
 exports.getAllEmployees = async (req, res) => {
   try {
-    const { page = 1, limit = 20, search, department, isActive, role } = req.query;
+    const { page = 1, limit = 100, search, department, isActive, role } = req.query;
+    const userRole = (req.user?.role || '').toUpperCase();
+    const isSuperAdmin = ['SUPER_ADMIN', 'SUPERADMIN'].includes(userRole);
+    const orgId = req.user?.organizationId?._id || req.user?.organizationId;
+
     const filter = {};
-    if (role) filter.role = role;
-    else filter.role = 'employee';
-    if (search) filter.$or = [{ name: { $regex: search, $options: 'i' } }, { email: { $regex: search, $options: 'i' } }, { employeeId: { $regex: search, $options: 'i' } }];
+    if (!isSuperAdmin && orgId) {
+      filter.organizationId = orgId;
+    }
+
+    if (userRole === 'MANAGER') {
+      filter.$or = [{ managerId: req.user._id }, { manager: req.user._id }, { _id: req.user._id }];
+    }
+
+    if (role && role !== 'all') {
+      filter.role = role;
+    } else if (!isSuperAdmin) {
+      filter.role = { $nin: ['super_admin', 'SUPER_ADMIN', 'org_admin', 'ORG_ADMIN'] };
+    }
+
+    if (search) {
+      const searchRegex = { $regex: search, $options: 'i' };
+      if (filter.$or) {
+        filter.$and = [
+          { $or: filter.$or },
+          { $or: [{ name: searchRegex }, { email: searchRegex }, { employeeId: searchRegex }] }
+        ];
+        delete filter.$or;
+      } else {
+        filter.$or = [
+          { name: searchRegex },
+          { email: searchRegex },
+          { employeeId: searchRegex },
+        ];
+      }
+    }
+
     if (department) filter.department = department;
     if (isActive !== undefined) filter.isActive = isActive === 'true';
-    const employees = await User.find(filter).populate('manager', 'name').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(+limit);
+
+    const employees = await User.find(filter)
+      .populate('manager', 'name')
+      .sort({ isTracking: -1, isOnline: -1, createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(+limit);
+
     const total = await User.countDocuments(filter);
     res.json({ success: true, employees, total, pages: Math.ceil(total / limit) });
-  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 };
 
 exports.approveEmployee = async (req, res) => {
@@ -165,9 +223,35 @@ exports.updateEmployee = async (req, res) => {
 
 exports.getManagers = async (req, res) => {
   try {
-    const managers = await User.find({ role: 'manager' }).select('name email designation employeeId department role allocatedArea address isActive isOnline isTracking isApproved isBlocked salary TA').sort({ name: 1 });
+    const userRole = (req.user?.role || '').toUpperCase();
+    const isSuperAdmin = ['SUPER_ADMIN', 'SUPERADMIN'].includes(userRole);
+    const orgId = req.user?.organizationId?._id || req.user?.organizationId;
+
+    const filter = { role: { $in: ['manager', 'MANAGER'] } };
+    if (!isSuperAdmin && orgId) {
+      filter.organizationId = orgId;
+    }
+
+    const managers = await User.find(filter).select('name email designation employeeId department role allocatedArea address isActive isOnline isTracking isApproved isBlocked salary TA').sort({ name: 1 });
     res.json({ success: true, managers });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
+
+// Helper to scope employee IDs by tenant and role
+const getScopedEmployeeIds = async (user) => {
+  const userRole = (user?.role || '').toUpperCase();
+  if (['SUPER_ADMIN', 'SUPERADMIN'].includes(userRole)) return null;
+
+  const orgId = user?.organizationId?._id || user?.organizationId;
+  const userScope = { organizationId: orgId };
+  if (userRole === 'MANAGER') {
+    userScope.$or = [{ managerId: user._id }, { manager: user._id }, { _id: user._id }];
+  } else if (userRole === 'EMPLOYEE') {
+    userScope._id = user._id;
+  }
+
+  const scopedUsers = await User.find(userScope).select('_id');
+  return scopedUsers.map(u => u._id);
 };
 
 exports.approveExpense = async (req, res) => {
@@ -179,7 +263,7 @@ exports.approveExpense = async (req, res) => {
     }, { new: true }).populate('employee', 'name socketId');
     
     const io = req.app.get('io');
-    if (expense.employee.socketId) {
+    if (expense?.employee?.socketId) {
       io.to(expense.employee.socketId).emit('expense_status_update', { expenseId: expense._id, status });
     }
     res.json({ success: true, expense });
@@ -190,7 +274,21 @@ exports.getAllMeetings = async (req, res) => {
   try {
     const { page = 1, limit = 20, employeeId, status } = req.query;
     const filter = {};
-    if (employeeId) filter.employee = employeeId;
+
+    const scopedIds = await getScopedEmployeeIds(req.user);
+    if (scopedIds !== null) {
+      if (employeeId) {
+        if (!scopedIds.some(id => String(id) === String(employeeId))) {
+          return res.json({ success: true, meetings: [], total: 0, pages: 0 });
+        }
+        filter.employee = employeeId;
+      } else {
+        filter.employee = { $in: scopedIds };
+      }
+    } else if (employeeId) {
+      filter.employee = employeeId;
+    }
+
     if (status) filter.status = status;
     const meetings = await Meeting.find(filter).populate('employee', 'name employeeId department').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(+limit);
     const total = await Meeting.countDocuments(filter);
@@ -202,8 +300,22 @@ exports.getAllExpenses = async (req, res) => {
   try {
     const { page = 1, limit = 20, status, employeeId, category } = req.query;
     const filter = {};
+
+    const scopedIds = await getScopedEmployeeIds(req.user);
+    if (scopedIds !== null) {
+      if (employeeId) {
+        if (!scopedIds.some(id => String(id) === String(employeeId))) {
+          return res.json({ success: true, expenses: [], total: 0, pages: 0 });
+        }
+        filter.employee = employeeId;
+      } else {
+        filter.employee = { $in: scopedIds };
+      }
+    } else if (employeeId) {
+      filter.employee = employeeId;
+    }
+
     if (status) filter.status = status;
-    if (employeeId) filter.employee = employeeId;
     if (category) filter.category = category;
     const expenses = await Expense.find(filter).populate('employee', 'name employeeId department').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(+limit);
     const total = await Expense.countDocuments(filter);
@@ -215,8 +327,22 @@ exports.getAttendanceReport = async (req, res) => {
   try {
     const { date, employeeId } = req.query;
     const filter = {};
+
+    const scopedIds = await getScopedEmployeeIds(req.user);
+    if (scopedIds !== null) {
+      if (employeeId) {
+        if (!scopedIds.some(id => String(id) === String(employeeId))) {
+          return res.json({ success: true, records: [] });
+        }
+        filter.employee = employeeId;
+      } else {
+        filter.employee = { $in: scopedIds };
+      }
+    } else if (employeeId) {
+      filter.employee = employeeId;
+    }
+
     if (date) filter.date = date;
-    if (employeeId) filter.employee = employeeId;
     const records = await Attendance.find(filter).populate('employee', 'name employeeId department').sort({ date: -1 });
     res.json({ success: true, records });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
@@ -226,8 +352,21 @@ exports.getTrackingHistory = async (req, res) => {
   try {
     const { employeeId, date, startDate, endDate, page = 1, limit = 100 } = req.query;
     const filter = {};
-    if (employeeId) filter.employee = employeeId;
-    
+
+    const scopedIds = await getScopedEmployeeIds(req.user);
+    if (scopedIds !== null) {
+      if (employeeId) {
+        if (!scopedIds.some(id => String(id) === String(employeeId))) {
+          return res.json({ success: true, history: [], total: 0, pages: 0 });
+        }
+        filter.employee = employeeId;
+      } else {
+        filter.employee = { $in: scopedIds };
+      }
+    } else if (employeeId) {
+      filter.employee = employeeId;
+    }
+
     if (startDate && endDate) {
       filter.date = { $gte: startDate, $lte: endDate };
     } else if (date) {
@@ -235,7 +374,7 @@ exports.getTrackingHistory = async (req, res) => {
     }
 
     const history = await LiveLocation.find(filter, { 
-      coordinates: { $slice: -1 } // Only get the last coordinate for the marker
+      coordinates: { $slice: -1 }
     })
       .populate('employee', 'name employeeId department avatar')
       .sort({ createdAt: -1 })
@@ -255,14 +394,52 @@ exports.getTrackingHistory = async (req, res) => {
   }
 };
 
-// ─── Get All Managers (for dropdown) ─────────────────────────────────────────
-exports.getManagers = async (req, res) => {
+// @desc Get organization profile & settings
+exports.getOrganizationSettings = async (req, res) => {
   try {
-    const managers = await User.find({ role: 'manager' })
-      .select('_id name email employeeId department designation')
-      .sort({ name: 1 });
-    res.json({ success: true, managers });
+    const Organization = require('../models/Organization.model');
+    let orgId = req.organizationId || req.user?.organizationId?._id || req.user?.organizationId;
+    let organization = null;
+    if (orgId) {
+      organization = await Organization.findById(orgId);
+    }
+    if (!organization) {
+      organization = await Organization.findOne();
+    }
+    if (!organization) return res.status(404).json({ success: false, message: 'Organization record not found' });
+    res.json({ success: true, organization });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 };
+
+// @desc Update organization profile & settings
+exports.updateOrganizationSettings = async (req, res) => {
+  try {
+    const Organization = require('../models/Organization.model');
+    let orgId = req.organizationId || req.user?.organizationId?._id || req.user?.organizationId;
+    if (!orgId) {
+      const existing = await Organization.findOne();
+      if (existing) orgId = existing._id;
+    }
+    if (!orgId) return res.status(404).json({ success: false, message: 'Organization record not found' });
+    const { name, phone, email, address, settings, logo } = req.body;
+    const updateData = {};
+    if (name) updateData.name = name;
+    if (phone) updateData.phone = phone;
+    if (email) updateData.email = email;
+    if (address) updateData.address = address;
+    if (settings) updateData.settings = settings;
+    if (logo !== undefined) updateData.logo = logo;
+
+    const organization = await Organization.findByIdAndUpdate(
+      orgId,
+      { $set: updateData },
+      { new: true }
+    );
+    res.json({ success: true, organization, message: 'Organization settings updated successfully' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
