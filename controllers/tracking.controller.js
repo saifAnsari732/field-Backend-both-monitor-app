@@ -208,6 +208,7 @@ exports.updateLocation = async (req, res) => {
         {
           $push: { coordinates: { $each: tagged } },
           $max: { totalDistance: newTotal },
+          $set: { lastActivity: new Date() },    // ← Reset inactivity clock on every valid GPS fix
         },
         { runValidators: true }
       );
@@ -308,21 +309,38 @@ exports.stopTracking = async (req, res) => {
   }
 };
 
-// Close sessions whose last accepted GPS fix is older than the inactivity window.
-// This is intentionally server-side: a killed mobile process cannot be trusted
-// to turn its own stale tracking state off.
-exports.autoStopInactiveSessions = async (io, inactivityMs = 60 * 60 * 1000) => {
-  const now = Date.now();
-  const activeSessions = await LiveLocation.find({ isActive: true }).select(
-    'employee sessionId coordinates totalDistance startTime date'
-  );
+// Close sessions whose last accepted GPS fix OR heartbeat is older than the inactivity window.
+// Uses lastActivity field (updated on both GPS update and heartbeat) as the authoritative clock.
+// Stationary employees sending heartbeats every 8 min will never be falsely auto-stopped.
+exports.autoStopInactiveSessions = async (io, inactivityMs = 3 * 60 * 60 * 1000) => {
+  const cutoff = new Date(Date.now() - inactivityMs);
 
-  for (const candidate of activeSessions) {
-    const lastCoordinate = candidate.coordinates?.[candidate.coordinates.length - 1];
-    const lastActivity = lastCoordinate?.timestamp || candidate.startTime;
-    if (!lastActivity || now - new Date(lastActivity).getTime() < inactivityMs) continue;
+  // Fetch only sessions where BOTH lastActivity AND last-coord are stale.
+  // Compound index {isActive, lastActivity} makes this O(log n) instead of full scan.
+  const staleSessions = await LiveLocation.find({
+    isActive: true,
+    $or: [
+      { lastActivity: { $lt: cutoff } },
+      { lastActivity: null, updatedAt: { $lt: cutoff } },
+    ],
+  }).select('employee sessionId coordinates totalDistance startTime date lastActivity');
 
-    // Claim the session atomically so overlapping cron ticks cannot close it twice.
+  for (const candidate of staleSessions) {
+    // Double-check with last GPS coordinate timestamp in case lastActivity wasn't set
+    // (sessions created before this migration don't have lastActivity)
+    const lastCoordTime = candidate.coordinates?.length
+      ? new Date(candidate.coordinates[candidate.coordinates.length - 1].timestamp || 0)
+      : null;
+    const effectiveLastActive = candidate.lastActivity
+      ? new Date(Math.max(
+          new Date(candidate.lastActivity).getTime(),
+          lastCoordTime ? lastCoordTime.getTime() : 0
+        ))
+      : (lastCoordTime || candidate.startTime);
+
+    if (effectiveLastActive && Date.now() - effectiveLastActive.getTime() < inactivityMs) continue;
+
+    // Claim atomically so overlapping cron ticks cannot close it twice.
     const session = await LiveLocation.findOneAndUpdate(
       { _id: candidate._id, isActive: true },
       { $set: { isActive: false, endTime: new Date(), totalDistance: Number(candidate.totalDistance) || 0 } },
@@ -340,15 +358,15 @@ exports.autoStopInactiveSessions = async (io, inactivityMs = 60 * 60 * 1000) => 
     await ActivityLog.create({
       employee: session.employee,
       action: 'TRACKING_AUTO_STOPPED',
-      description: `Tracking auto-stopped after ${Math.round(inactivityMs / 3600000)} hour of no movement. Distance: ${totalDistance.toFixed(2)} km`,
-      metadata: { sessionId: session.sessionId, totalDistance, lastActivity },
+      description: `Tracking auto-stopped after ${Math.round(inactivityMs / 3600000)} hour(s) of no movement. Distance: ${totalDistance.toFixed(2)} km`,
+      metadata: { sessionId: session.sessionId, totalDistance, effectiveLastActive },
     });
 
     await Notification.create({
       recipient: session.employee,
       type: 'tracking',
       title: 'Tracking stopped automatically',
-      message: 'Tracking was stopped after 1 hour without accepted GPS movement. Start a new shift when you leave.',
+      message: `Tracking was stopped after ${Math.round(inactivityMs / 3600000)} hour without GPS movement. Start a new shift when you leave.`,
       data: { sessionId: session.sessionId, totalDistance },
     });
 
@@ -363,7 +381,41 @@ exports.autoStopInactiveSessions = async (io, inactivityMs = 60 * 60 * 1000) => 
       totalDistance,
       reason: 'no_movement_timeout',
     });
-    console.log(`⏹️ [TRACKING] Auto-stopped ${session.sessionId}; no movement for ${Math.round(inactivityMs / 3600000)} hour.`);
+    console.log(`⏹️ [TRACKING] Auto-stopped ${session.sessionId}; inactive since ${effectiveLastActive?.toISOString()}.`);
+  }
+};
+
+// ─── HEARTBEAT ────────────────────────────────────────────────────────────────
+// Mobile app calls this every ~8 minutes while the employee is stationary.
+// Resets lastActivity so the 3-hour auto-stop cron doesn't fire on standing workers.
+// Does NOT add distance (idempotent, safe to call multiple times).
+exports.heartbeat = async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    if (!sessionId) return res.status(400).json({ success: false, message: 'sessionId required' });
+
+    const updated = await LiveLocation.findOneAndUpdate(
+      { sessionId, employee: req.user._id, isActive: true },
+      { $set: { lastActivity: new Date() } },
+      { new: true, select: 'totalDistance isActive' }
+    );
+
+    if (!updated) {
+      // Session was closed (auto-stop or manual) — tell the app
+      return res.json({ success: false, sessionClosed: true, message: 'Session is no longer active.' });
+    }
+
+    // Keep user marked as online
+    await User.findByIdAndUpdate(req.user._id, { isOnline: true, lastSeen: new Date() });
+
+    // Return cached distance so mobile can sync its local display
+    const sessionState = await getSessionState(sessionId);
+    const totalDistance = sessionState?.totalDistance ?? updated.totalDistance ?? 0;
+
+    res.json({ success: true, totalDistance });
+  } catch (err) {
+    console.error('[tracking] heartbeat error:', err.message);
+    res.status(500).json({ success: false, message: err.message });
   }
 };
 
