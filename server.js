@@ -156,7 +156,7 @@ app.use('/api/leads', require('./routes/lead.routes'));
 app.use('/api', require('./routes/newsRouts'));
 
 // Health check
-app.get('/api/health', (req, res) => res.json({ status: 'OK', timestamp: new Date() }));
+app.get('/api/health', (req, res) => res.json({ status: 'OK AWS Workking', timestamp: new Date() }));
 
 // Gemini Integration (Moved from test-gemini.js)
 app.post('/api/gemini/generate', async (req, res) => {   

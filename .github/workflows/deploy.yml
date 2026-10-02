@@ -1,0 +1,43 @@
+name: Automated CI/CD Deployment
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Build & Deploy to AWS EC2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Dependencies & Run Verification
+        run: |
+          npm ci --omit=dev
+          node -c server.js
+
+      - name: Deploy to AWS EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script: |
+            echo "🚀 Starting Automated Deployment..."
+            cd ~/field-Backend-both-monitor-app
+            git pull origin main
+            npm install --omit=dev
+            pm2 restart field-App-backend || pm2 start server.js --name "field-App-backend"
+            pm2 save
+            echo "✅ Deployment Successful!"
