@@ -36,7 +36,8 @@ jobs:
           script: |
             echo "🚀 Starting Automated Deployment..."
             cd ~/field-Backend-both-monitor-app
-            git pull origin main
+            git fetch origin main
+            git reset --hard origin/main
             npm install --omit=dev
             pm2 restart field-App-backend || pm2 start server.js --name "field-App-backend"
             pm2 save
