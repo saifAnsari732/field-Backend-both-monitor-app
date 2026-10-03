@@ -28,7 +28,28 @@ exports.startTracking = async (req, res) => {
       new Promise(resolve => setTimeout(() => resolve(`Location (${lat.toFixed(4)}, ${lng.toFixed(4)})`), 800))
     ]);
 
-    // Close any previous orphaned active sessions for this employee
+    // Check if employee already has an active session for today (Punch-In Protection)
+    const existingActiveSession = await LiveLocation.findOne({
+      employee: req.user._id,
+      isActive: true,
+      date: today,
+    });
+
+    if (existingActiveSession) {
+      console.log(`📍 startTracking: Re-attaching to existing active session ${existingActiveSession.sessionId}`);
+      await User.findByIdAndUpdate(req.user._id, { isTracking: true });
+      return res.status(200).json({
+        success: true,
+        message: 'Active shift already exists for today. Reconnected.',
+        sessionId: existingActiveSession.sessionId,
+        totalDistance: existingActiveSession.totalDistance || 0,
+        totalDistanceToday: existingActiveSession.totalDistance || 0,
+        startTime: existingActiveSession.startTime,
+        session: existingActiveSession,
+      });
+    }
+
+    // Close any previous orphaned active sessions from prior days for this employee
     await LiveLocation.updateMany(
       { employee: req.user._id, isActive: true },
       { $set: { isActive: false, endTime: new Date() } }
