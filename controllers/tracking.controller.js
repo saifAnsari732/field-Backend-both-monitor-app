@@ -504,9 +504,14 @@ exports.autoStopInactiveSessions = async (io, inactivityMs = 14 * 60 * 60 * 1000
     const totalDistance = Number(session.totalDistance) || 0;
     await clearSessionState(session.sessionId);
     await User.findByIdAndUpdate(session.employee, { isTracking: false });
+    
+    // Sum total distance across all sessions today for this employee
+    const todaySessions = await LiveLocation.find({ employee: session.employee, date: session.date });
+    const dayTotalDistance = todaySessions.reduce((acc, s) => acc + (Number(s.totalDistance) || 0), 0);
+
     await Attendance.findOneAndUpdate(
       { employee: session.employee, date: session.date },
-      { $set: { checkOut: new Date(), totalDistanceTraveled: totalDistance } }
+      { $set: { checkOut: new Date(), totalDistanceTraveled: dayTotalDistance } }
     );
     await ActivityLog.create({
       employee: session.employee,

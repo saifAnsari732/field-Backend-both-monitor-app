@@ -35,6 +35,7 @@ module.exports = (io) => {
 
     // Join user & organization rooms
     socket.join(`user_${user._id}`);
+    socket.join(String(user._id));
 
     if (isSuperAdmin) {
       socket.join('superadmins');
