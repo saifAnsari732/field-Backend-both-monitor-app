@@ -31,6 +31,7 @@ const liveLocationSchema = new mongoose.Schema({
   // ─── AGTRIE-X v7 Session Audit Ledger ───────────
   unverifiedDistance:  { type: Number, default: 0 },     // Distance from poor GPS that couldn't be verified
   officialDistance:    { type: Number, default: 0 },     // Final authoritative KM = accepted + recovered
+  distanceUncertainty: { type: Number, default: 0 },     // +/- sigma KM confidence bound
   gpsPointCount:       { type: Number, default: 0 },     // Total raw GPS points received
   acceptedPointCount:  { type: Number, default: 0 },     // Points that passed all validation
   recoveredPointCount: { type: Number, default: 0 },     // Points recovered via RTS smoothing

@@ -102,43 +102,24 @@ exports.startTracking = async (req, res) => {
 
 const { reverseGeocode } = require('../services/geocode.service');
 
-// AGTRIE-X v7 Advanced Mathematical GPS Tracking Engine - Helpers
-function kalmanSmooth(rawLat, rawLng, accuracyM, lastState) {
-  const Q = 0.00001;
-  const R = Math.pow(Math.max(accuracyM, 5) / 111320, 2);
-  if (!lastState) {
-    return { lat: rawLat, lng: rawLng, pLat: R, pLng: R };
-  }
-  const predictedLat = lastState.lat;
-  const predictedLng = lastState.lng;
-  const predictedPLat = lastState.pLat + Q;
-  const predictedPLng = lastState.pLng + Q;
-  const kLat = predictedPLat / (predictedPLat + R);
-  const kLng = predictedPLng / (predictedPLng + R);
-  return {
-    lat: predictedLat + kLat * (rawLat - predictedLat),
-    lng: predictedLng + kLng * (rawLng - predictedLng),
-    pLat: (1 - kLat) * predictedPLat,
-    pLng: (1 - kLng) * predictedPLng,
-  };
-}
+// AGTRIE-X v7 State-Space Trajectory Reconstruction Engine
+const {
+  ENUProjection,
+  KinematicKalmanFilter,
+  RTSFixedLagSmoother,
+  KinematicGapRecoverer,
+  DistanceLedger
+} = require('../services/trajectoryEngine');
 
 function classifyMotionState(speedKmh) {
-  if (speedKmh < 1) return 'STATIONARY';
-  if (speedKmh < 7) return 'WALKING';
-  if (speedKmh < 15) return 'RUNNING';
-  if (speedKmh < 40) return 'BIKE';
+  if (speedKmh < 1.0) return 'STATIONARY';
+  if (speedKmh < 7.0) return 'WALKING';
+  if (speedKmh < 15.0) return 'RUNNING';
+  if (speedKmh < 45.0) return 'BIKE';
   return 'VEHICLE';
 }
 
-function mahalanobisTest(predicted, observed, covarianceLat, covarianceLng) {
-  const dLat = observed.lat - predicted.lat;
-  const dLng = observed.lng - predicted.lng;
-  const md = Math.sqrt((dLat * dLat) / covarianceLat + (dLng * dLng) / covarianceLng);
-  return { md, accepted: md < 10.6 };
-}
-
-// @desc Update location (bulk coordinates)
+// @desc Update location (bulk coordinates) — AGTRIE-X v7 State-Space Pipeline
 exports.updateLocation = async (req, res) => {
   let releaseSessionLock;
   try {
@@ -158,13 +139,15 @@ exports.updateLocation = async (req, res) => {
         lastLat: lastCoordDb.lat || 0,
         lastLng: lastCoordDb.lng || 0,
         lastTs: lastCoordDb.timestamp || new Date().toISOString(),
-        kalmanState: dbSession.kalmanState || null,
+        kfState: null,
+        lastVx: 0,
+        lastVy: 0,
         lastSpeed: 0,
       };
       await saveSessionState(sessionId, sessionState);
     }
 
-    // Layer 1: Input Validation & Chronological Ordering
+    // Step 1: Chronological Sorting & Deduplication
     const orderedCoordinates = [...coordinates].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
     const incomingEventIds = orderedCoordinates.map(c => c?.eventId).filter(Boolean);
     const existingEventIdSet = new Set();
@@ -182,19 +165,26 @@ exports.updateLocation = async (req, res) => {
       } catch (_) {}
     }
 
-    const MAX_SPEED_KMH = 180;
-    const MAX_ACCEL_MS2 = 6;
-    
-    let incrementalDist = 0;
-    let newLastLat = sessionState.lastLat;
-    let newLastLng = sessionState.lastLng;
-    let newLastTs  = sessionState.lastTs;
-    let kalmanState = sessionState.kalmanState || null;
-    let lastSpeedKmh = sessionState.lastSpeed || 0;
-    
+    // Initialize Local Cartesian ENU Projection anchored at session origin
+    const originLat = sessionState.lastLat || orderedCoordinates[0]?.lat || 0;
+    const originLng = sessionState.lastLng || orderedCoordinates[0]?.lng || 0;
+    const proj = new ENUProjection(originLat, originLng);
+
+    // Initialize 4-State Kinematic Kalman Filter [x, y, vx, vy]^T
+    const initEnu = proj.toENU(sessionState.lastLat || originLat, sessionState.lastLng || originLng);
+    const kf = new KinematicKalmanFilter(initEnu.x, initEnu.y, 10);
+    if (sessionState.kfState) {
+      kf.x = [...sessionState.kfState.x];
+      kf.P = sessionState.kfState.P.map(r => [...r]);
+    }
+
+    // Initialize Distance Conservation Ledger: D_raw = D_accepted + D_recovered + D_rejected + D_unverified
+    const ledger = new DistanceLedger(sessionState.totalDistance || 0);
+
+    const forwardStates = [];
     const validCoords = [];
     const rejectionReasons = [];
-    
+
     let totalRawPoints = orderedCoordinates.length;
     let acceptedPoints = 0;
     let recoveredPoints = 0;
@@ -204,133 +194,157 @@ exports.updateLocation = async (req, res) => {
     let batchMaxSpeed = 0;
     let sumAccuracy = 0;
     let batchWorstAccuracy = 0;
-    
-    let currentMotionState = 'STATIONARY';
-    const processedPoints = [];
-    
+
+    let prevTimestamp = sessionState.lastTs ? new Date(sessionState.lastTs).getTime() : 0;
+    let prevAnchorPoint = {
+      x: kf.x[0],
+      y: kf.x[1],
+      vx: kf.x[2],
+      vy: kf.x[3],
+      timestamp: sessionState.lastTs || new Date().toISOString()
+    };
+
+    // Forward Kinematic Filtering Pass
     for (let i = 0; i < orderedCoordinates.length; i++) {
       const coord = orderedCoordinates[i];
       const lat = Number(coord?.lat);
       const lng = Number(coord?.lng);
       const timestamp = new Date(coord?.timestamp);
-      
-      if (!Number.isFinite(lat) || !Number.isFinite(lng) || Number.isNaN(timestamp.getTime()) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      const tMs = timestamp.getTime();
+
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || Number.isNaN(tMs) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
         rejectedPoints++;
+        ledger.addRejected(0);
         continue;
       }
-      
-      const normalizedCoord = { ...coord, lat, lng, timestamp: timestamp.toISOString() };
-      
+
       if (coord.eventId && existingEventIdSet.has(coord.eventId)) continue;
       if (coord.isHeartbeat) continue;
-      if (newLastTs && timestamp.getTime() <= new Date(newLastTs).getTime()) continue;
-      
-      const accuracy = Number(coord.accuracy) || 50;
+      if (prevTimestamp && tMs <= prevTimestamp) continue;
+
+      const accuracy = Number(coord.accuracy) || 30;
       sumAccuracy += accuracy;
       if (accuracy > batchWorstAccuracy) batchWorstAccuracy = accuracy;
-      
-      // Layer 2: EKF Smoothing
-      kalmanState = kalmanSmooth(lat, lng, accuracy, kalmanState);
-      
-      const timeDiffSec = newLastTs ? (timestamp.getTime() - new Date(newLastTs).getTime()) / 1000 : 0;
-      if (timeDiffSec > 60) gaps++;
-      if (accuracy > 100 && timeDiffSec > 30) lostEvents++;
-      
-      let speedKmh = 0;
-      let accelMs2 = 0;
-      const rawDist = haversineDistance({ lat: newLastLat, lng: newLastLng }, { lat: kalmanState.lat, lng: kalmanState.lng });
-      
-      if (timeDiffSec > 0) {
-        speedKmh = (rawDist / timeDiffSec) * 3600;
-        const speedMs = speedKmh / 3.6;
-        const lastSpeedMs = lastSpeedKmh / 3.6;
-        accelMs2 = Math.abs(speedMs - lastSpeedMs) / timeDiffSec;
-      }
-      
-      if (speedKmh > batchMaxSpeed) batchMaxSpeed = speedKmh;
-      
-      // Layer 4: Mahalanobis Test
-      const mTest = mahalanobisTest(
-        { lat: newLastLat, lng: newLastLng }, 
-        { lat: kalmanState.lat, lng: kalmanState.lng },
-        kalmanState.pLat || 0.00001,
-        kalmanState.pLng || 0.00001
-      );
-      
-      let accepted = true;
-      let reason = '';
-      
-      // Layer 5: Kinematic Validation
-      if (speedKmh > MAX_SPEED_KMH) { accepted = false; reason = 'SPEED_EXCEEDED'; }
-      else if (accelMs2 > MAX_ACCEL_MS2) { accepted = false; reason = 'ACCEL_EXCEEDED'; }
-      else if (newLastTs && !mTest.accepted && timeDiffSec < 10) { accepted = false; reason = 'MAHALANOBIS_FAIL'; }
-      
-      // Layer 6: Multi-Tier Accuracy Filter
-      let pointStatus = 'REJECTED';
-      if (accepted) {
-        if (accuracy <= 30) pointStatus = 'ACCEPT';
-        else if (accuracy <= 100) pointStatus = 'ACCEPT';
-        else if (accuracy <= 300) pointStatus = 'CANDIDATE';
-        else { pointStatus = 'UNVERIFIED'; accepted = false; reason = 'POOR_ACCURACY'; }
-      }
-      
-      if (!accepted) {
-        rejectedPoints++;
-        rejectionReasons.push({ timestamp: timestamp, reason, lat, lng, accuracy, speed: speedKmh });
-        processedPoints.push({ ...normalizedCoord, kalmanLat: kalmanState.lat, kalmanLng: kalmanState.lng, status: 'REJECTED', rawDist: 0 });
-      } else {
-        processedPoints.push({ ...normalizedCoord, kalmanLat: kalmanState.lat, kalmanLng: kalmanState.lng, status: pointStatus, rawDist, speedKmh });
-      }
-    }
-    
-    // Layer 7: RTS Backward Smoothing Pass
-    for (let i = 1; i < processedPoints.length - 1; i++) {
-      if (processedPoints[i].status === 'REJECTED') {
-        const prev = processedPoints[i-1];
-        const next = processedPoints[i+1];
-        if (prev.status === 'ACCEPT' && next.status === 'ACCEPT') {
-          const t1 = new Date(prev.timestamp).getTime();
-          const t3 = new Date(next.timestamp).getTime();
-          if (t3 - t1 < 30000) {
-            const totalDist = haversineDistance(prev, next);
-            const midDist = haversineDistance(prev, processedPoints[i]) + haversineDistance(processedPoints[i], next);
-            if (midDist < totalDist * 1.5) {
-              processedPoints[i].status = 'RECOVERED';
-              recoveredPoints++;
-              rejectedPoints--;
-            }
-          }
+
+      const dt = prevTimestamp ? Math.max((tMs - prevTimestamp) / 1000, 0.1) : 1.0;
+      prevTimestamp = tMs;
+
+      // Kinematic Gap Detection (e.g. flyover / tunnel dropout: 15s to 600s)
+      if (dt >= 15 && dt <= 600) {
+        gaps++;
+        const currEnu = proj.toENU(lat, lng);
+        const currAnchorPoint = { x: currEnu.x, y: currEnu.y, vx: kf.x[2], vy: kf.x[3], timestamp: timestamp.toISOString() };
+        const gapRecovery = KinematicGapRecoverer.reconstructGap(prevAnchorPoint, currAnchorPoint);
+        if (gapRecovery.plausible && gapRecovery.recoveredDistanceMeters > 0) {
+          const recKm = gapRecovery.recoveredDistanceMeters / 1000;
+          ledger.addRecovered(recKm, gapRecovery.confidence);
+          recoveredPoints++;
         }
       }
-    }
-    
-    // Aggregate Distances
-    let segmentUncertainty = 0;
-    for (const pt of processedPoints) {
-      if (pt.status === 'ACCEPT' || pt.status === 'RECOVERED') {
-        if (pt.status === 'ACCEPT') acceptedPoints++;
-        incrementalDist += pt.rawDist;
-        newLastLat = pt.kalmanLat;
-        newLastLng = pt.kalmanLng;
-        newLastTs = pt.timestamp;
-        lastSpeedKmh = pt.speedKmh || 0;
+
+      if (accuracy > 150 && dt > 30) lostEvents++;
+
+      // Kalman Prediction Step: x_pred = F * x, P_pred = F * P * F^T + Q(dt)
+      const pred = kf.predict(dt);
+
+      // Convert measurement to local Cartesian ENU
+      const zEnu = proj.toENU(lat, lng);
+
+      // Kalman Update Step with reported horizontal accuracy covariance R & Huber gating
+      const upd = kf.update(pred, zEnu.x, zEnu.y, accuracy, coord.speed, coord.heading);
+
+      // Speed from filtered velocity vector: v = sqrt(vx^2 + vy^2)
+      const speedKmh = Math.hypot(kf.x[2], kf.x[3]) * 3.6;
+      if (speedKmh > batchMaxSpeed) batchMaxSpeed = speedKmh;
+
+      if (!upd.accepted) {
+        rejectedPoints++;
+        ledger.addRejected(0);
+        rejectionReasons.push({ timestamp, reason: 'MAHALANOBIS_OUTLIER', lat, lng, accuracy, speed: speedKmh });
+        continue;
       }
-      validCoords.push(pt);
+
+      // Convert filtered position back to geodetic lat/lng
+      const smoothedGeo = proj.toGeo(kf.x[0], kf.x[1]);
+
+      // Calculate incremental step distance using geodetic curvature
+      const stepDistKm = haversineDistance(
+        { lat: prevAnchorPoint.lat || sessionState.lastLat, lng: prevAnchorPoint.lng || sessionState.lastLng },
+        smoothedGeo
+      );
+
+      // Multi-tier accuracy validation with distance ledger partitioning
+      if (accuracy <= 100) {
+        ledger.addAccepted(stepDistKm, accuracy);
+        acceptedPoints++;
+      } else if (accuracy <= 250) {
+        // Recoverable degraded signal: count with uncertainty downweighting
+        ledger.addRecovered(stepDistKm, 0.75);
+        recoveredPoints++;
+      } else {
+        // Unverified high-noise GPS (> 250m accuracy)
+        ledger.addUnverified(stepDistKm);
+      }
+
+      // Save state for backward RTS smoother
+      forwardStates.push({
+        xF: [...kf.x],
+        PF: kf.P.map(r => [...r]),
+        xPred: pred.x,
+        PPred: pred.P,
+        dt,
+        coord: { ...coord, lat: smoothedGeo.lat, lng: smoothedGeo.lng, timestamp: timestamp.toISOString() }
+      });
+
+      prevAnchorPoint = {
+        x: kf.x[0],
+        y: kf.x[1],
+        vx: kf.x[2],
+        vy: kf.x[3],
+        lat: smoothedGeo.lat,
+        lng: smoothedGeo.lng,
+        timestamp: timestamp.toISOString()
+      };
     }
-    
-    currentMotionState = classifyMotionState(lastSpeedKmh);
+
+    // Step 2: Full Rauch-Tung-Striebel (RTS) Fixed-Lag Backward Smoothing Pass
+    if (forwardStates.length >= 2) {
+      const smoothedStates = RTSFixedLagSmoother.smooth(forwardStates);
+      for (let sIdx = 0; sIdx < smoothedStates.length; sIdx++) {
+        const sm = smoothedStates[sIdx];
+        const smGeo = proj.toGeo(sm.xS[0], sm.xS[1]);
+        forwardStates[sIdx].coord.lat = smGeo.lat;
+        forwardStates[sIdx].coord.lng = smGeo.lng;
+        validCoords.push(forwardStates[sIdx].coord);
+      }
+    } else {
+      forwardStates.forEach(f => validCoords.push(f.coord));
+    }
+
+    // Step 3: Compute Strict Distance Conservation Ledger Snapshot
+    const snapshot = ledger.getSnapshot();
+    const newOfficialTotal = snapshot.officialKm;
+    const finalVx = kf.x[2];
+    const finalVy = kf.x[3];
+    const finalSpeedKmh = Math.hypot(finalVx, finalVy) * 3.6;
+    const currentMotionState = classifyMotionState(finalSpeedKmh);
     const runningAvgAccuracy = sumAccuracy / (totalRawPoints || 1);
-    const newOfficialTotal = parseFloat((sessionState.totalDistance + incrementalDist).toFixed(3));
-    
+
+    const lastGeo = proj.toGeo(kf.x[0], kf.x[1]);
+
+    // Persist Authoritative State to Redis
     await saveSessionState(sessionId, {
       totalDistance: newOfficialTotal,
-      lastLat: newLastLat,
-      lastLng: newLastLng,
-      lastTs: newLastTs,
-      kalmanState,
-      lastSpeed: lastSpeedKmh
+      lastLat: lastGeo.lat,
+      lastLng: lastGeo.lng,
+      lastTs: prevAnchorPoint.timestamp,
+      kfState: { x: kf.x, P: kf.P },
+      lastVx: finalVx,
+      lastVy: finalVy,
+      lastSpeed: finalSpeedKmh
     });
 
+    // Step 4: MongoDB Atomic Persistence with Full Audit Ledger
     if (validCoords.length > 0) {
       const lastCoord = validCoords[validCoords.length - 1];
       const tagged = validCoords.map((coord) => ({ ...coord, address: coord.address || '' }));
@@ -349,6 +363,12 @@ exports.updateLocation = async (req, res) => {
           $max: {
             totalDistance: newOfficialTotal,
             officialDistance: newOfficialTotal,
+            rawGpsDistance: snapshot.rawTotalKm,
+            acceptedDistance: snapshot.acceptedKm,
+            recoveredDistance: snapshot.recoveredKm,
+            rejectedDistance: snapshot.rejectedKm,
+            unverifiedDistance: snapshot.unverifiedKm,
+            distanceUncertainty: snapshot.uncertaintyKm,
             worstAccuracy: batchWorstAccuracy,
             maxSpeed: batchMaxSpeed,
           },
@@ -361,6 +381,7 @@ exports.updateLocation = async (req, res) => {
         },
         { runValidators: true }
       );
+
       reverseGeocode(lastCoord.lat, lastCoord.lng).then((address) => {
         if (!address) return;
         return LiveLocation.updateOne(
@@ -372,7 +393,7 @@ exports.updateLocation = async (req, res) => {
     } else {
       await LiveLocation.findOneAndUpdate(
         { sessionId, employee: req.user._id, isActive: true },
-        { $max: { totalDistance: newOfficialTotal } },
+        { $max: { totalDistance: newOfficialTotal, officialDistance: newOfficialTotal } },
         { runValidators: true }
       ).catch(() => {});
     }
@@ -383,8 +404,8 @@ exports.updateLocation = async (req, res) => {
       name: req.user.name,
       avatar: req.user.avatar,
       department: req.user.department,
-      lat: newLastLat,
-      lng: newLastLng,
+      lat: lastGeo.lat,
+      lng: lastGeo.lng,
       totalDistance: newOfficialTotal,
       sessionId,
       motionState: currentMotionState
@@ -394,7 +415,18 @@ exports.updateLocation = async (req, res) => {
       success: true, 
       totalDistance: newOfficialTotal, 
       motionState: currentMotionState, 
-      audit: { accepted: acceptedPoints, recovered: recoveredPoints, rejected: rejectedPoints, unverified: 0 } 
+      audit: {
+        rawGpsDistance: snapshot.rawTotalKm,
+        officialDistance: snapshot.officialKm,
+        acceptedDistance: snapshot.acceptedKm,
+        recoveredDistance: snapshot.recoveredKm,
+        rejectedDistance: snapshot.rejectedKm,
+        unverifiedDistance: snapshot.unverifiedKm,
+        uncertaintyKm: snapshot.uncertaintyKm,
+        acceptedPoints,
+        recoveredPoints,
+        rejectedPoints
+      } 
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
