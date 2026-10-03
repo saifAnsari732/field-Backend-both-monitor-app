@@ -46,6 +46,7 @@ const liveLocationSchema = new mongoose.Schema({
   motionState:         { type: String, enum: ['STATIONARY', 'WALKING', 'RUNNING', 'BIKE', 'VEHICLE', 'GPS_LOST', 'UNKNOWN'], default: 'STATIONARY' },
   rejectionReasons:    [{ timestamp: Date, reason: String, lat: Number, lng: Number, accuracy: Number, speed: Number }],
   isActive:            { type: Boolean, default: true },
+  autoClosed:          { type: Boolean, default: false }, // true = closed by inactivity cron (resumable)
   date:                { type: String },                  // YYYY-MM-DD
   lastActivity:        { type: Date, default: Date.now }, // Updated on GPS update + heartbeat
 }, { timestamps: true });

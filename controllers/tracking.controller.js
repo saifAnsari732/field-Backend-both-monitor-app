@@ -134,6 +134,22 @@ function classifyMotionState(speedKmh) {
   return 'VEHICLE';
 }
 
+// Re-open a session that the SERVER auto-closed (inactivity cron), never one the
+// employee punched out of manually. Only same-day sessions are resumed.
+async function reopenIfAutoClosed(sessionId, employeeId) {
+  const today = new Date().toISOString().slice(0, 10);
+  const doc = await LiveLocation.findOneAndUpdate(
+    { sessionId, employee: employeeId, isActive: false, autoClosed: true, date: today },
+    { $set: { isActive: true, autoClosed: false, lastActivity: new Date() }, $unset: { endTime: 1 } },
+    { new: true }
+  );
+  if (!doc) return false;
+  await User.findByIdAndUpdate(employeeId, { isTracking: true });
+  await Attendance.findOneAndUpdate({ employee: employeeId, date: today }, { $unset: { checkOut: 1 } }).catch(() => {});
+  console.log(`[tracking] Re-opened auto-closed session ${sessionId}`);
+  return true;
+}
+
 // @desc Update location (bulk coordinates) — AGTRIE-X v7 State-Space Pipeline
 exports.updateLocation = async (req, res) => {
   let releaseSessionLock;
@@ -144,10 +160,21 @@ exports.updateLocation = async (req, res) => {
     }
     releaseSessionLock = await acquireDistributedLock(sessionId, 6000);
 
+    // Verify the session is really active in MongoDB. A stale Redis key must never
+    // let GPS points be "accepted" (200 OK) while Mongo silently drops them.
+    const activeDoc = await LiveLocation.findOne({ sessionId, employee: req.user._id }, { isActive: 1 }).lean();
+    if (!activeDoc) return res.status(404).json({ success: false, message: 'Session not found', sessionClosed: true });
+    if (!activeDoc.isActive) {
+      const reopened = await reopenIfAutoClosed(sessionId, req.user._id);
+      if (!reopened) {
+        return res.status(409).json({ success: false, sessionClosed: true, message: 'Session is closed.' });
+      }
+    }
+
     let sessionState = await getSessionState(sessionId);
     if (!sessionState) {
       const dbSession = await LiveLocation.findOne({ sessionId, employee: req.user._id, isActive: true });
-      if (!dbSession) return res.status(404).json({ success: false, message: 'Session not found' });
+      if (!dbSession) return res.status(404).json({ success: false, message: 'Session not found', sessionClosed: true });
       const lastCoordDb = dbSession.coordinates[dbSession.coordinates.length - 1] || {};
       sessionState = {
         totalDistance: dbSession.totalDistance || 0,
@@ -280,20 +307,30 @@ exports.updateLocation = async (req, res) => {
       const dt = prevTimestamp ? Math.max((tMs - prevTimestamp) / 1000, 0.5) : 1.0;
       prevTimestamp = tMs;
 
+      // Snapshot filter so a rejected outlier can never contaminate the state
+      const snap = { lat: filterLat, lng: filterLng, pLat: filterPLat, pLng: filterPLng };
+
       // 3. Geodetic 2D Kalman Filter Update (directly in lat/lng degrees, 100% mathematically stable)
-      const Q = 0.0000001 * Math.min(dt, 30);
       const R = Math.pow(Math.max(accuracy, 5) / 111320, 2);
-
-      const predPLat = filterPLat + Q;
-      const predPLng = filterPLng + Q;
-      const kLat = predPLat / (predPLat + R);
-      const kLng = predPLng / (predPLng + R);
-
-      // State update
-      filterLat = filterLat + kLat * (lat - filterLat);
-      filterLng = filterLng + kLng * (lng - filterLng);
-      filterPLat = (1 - kLat) * predPLat;
-      filterPLng = (1 - kLng) * predPLng;
+      if (dt > 120) {
+        // Long gap (e.g. employee sat at home for hours, then left): the filter's
+        // covariance has collapsed and would LAG behind real movement, losing KM.
+        // Re-initialise on the fresh measurement instead of smoothing against stale state.
+        filterLat = lat;
+        filterLng = lng;
+        filterPLat = R;
+        filterPLng = R;
+      } else {
+        const Q = 0.0000001 * Math.min(dt, 30);
+        const predPLat = filterPLat + Q;
+        const predPLng = filterPLng + Q;
+        const kLat = predPLat / (predPLat + R);
+        const kLng = predPLng / (predPLng + R);
+        filterLat = filterLat + kLat * (lat - filterLat);
+        filterLng = filterLng + kLng * (lng - filterLng);
+        filterPLat = (1 - kLat) * predPLat;
+        filterPLng = (1 - kLng) * predPLng;
+      }
 
       // 4. Geodesic Step Distance
       const stepDistKm = haversineDistance(
@@ -303,7 +340,7 @@ exports.updateLocation = async (req, res) => {
 
       // 5. Mathematical Teleportation & Kinematic Speed Gate (180 km/h ceiling, 10 km single step)
       const stepSpeedKmh = (stepDistKm / dt) * 3600;
-      if (stepSpeedKmh > batchMaxSpeed) batchMaxSpeed = stepSpeedKmh;
+      if (stepSpeedKmh > batchMaxSpeed && stepSpeedKmh <= 180) batchMaxSpeed = stepSpeedKmh;
 
       if (stepSpeedKmh > 180 || (stepDistKm > 10 && dt < 300) || stepDistKm > 50) {
         rejectedPoints++;
@@ -315,17 +352,20 @@ exports.updateLocation = async (req, res) => {
           speed: stepSpeedKmh,
           stepDistKm
         });
+        // Roll back filter state to the last trusted estimate
+        filterLat = snap.lat; filterLng = snap.lng; filterPLat = snap.pLat; filterPLng = snap.pLng;
         continue; // Never count teleportation jump into official distance!
       }
 
-      // 6. Stationary Jitter Suppression (< 5 meters)
+      // 6. Stationary Jitter Suppression (< 5 meters).
+      // The anchor only advances when distance is actually counted, so slow walking
+      // (many tiny steps) accumulates against the anchor instead of being discarded.
       if (stepDistKm * 1000 >= 5) {
         currentTotalDistance += stepDistKm;
         acceptedPoints++;
+        lastValidLat = filterLat;
+        lastValidLng = filterLng;
       }
-
-      lastValidLat = filterLat;
-      lastValidLng = filterLng;
 
       validCoords.push({
         ...coord,
@@ -593,7 +633,7 @@ exports.autoStopInactiveSessions = async (io, inactivityMs = 14 * 60 * 60 * 1000
     // Claim atomically so overlapping cron ticks cannot close it twice.
     const session = await LiveLocation.findOneAndUpdate(
       { _id: candidate._id, isActive: true },
-      { $set: { isActive: false, endTime: new Date(), totalDistance: Number(candidate.totalDistance) || 0 } },
+      { $set: { isActive: false, autoClosed: true, endTime: new Date(), totalDistance: Number(candidate.totalDistance) || 0 } },
       { new: true }
     );
     if (!session) continue;
@@ -649,11 +689,15 @@ exports.heartbeat = async (req, res) => {
     const { sessionId } = req.body;
     if (!sessionId) return res.status(400).json({ success: false, message: 'sessionId required' });
 
-    const updated = await LiveLocation.findOneAndUpdate(
+    let updated = await LiveLocation.findOneAndUpdate(
       { sessionId, employee: req.user._id, isActive: true },
       { $set: { lastActivity: new Date() } },
       { new: true, select: 'totalDistance isActive' }
     );
+
+    if (!updated && await reopenIfAutoClosed(sessionId, req.user._id)) {
+      updated = await LiveLocation.findOne({ sessionId, employee: req.user._id, isActive: true }).select('totalDistance isActive');
+    }
 
     if (!updated) {
       // Session was closed (auto-stop or manual) — tell the app
