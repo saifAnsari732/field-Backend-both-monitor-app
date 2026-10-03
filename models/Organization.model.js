@@ -5,6 +5,8 @@ const organizationSchema = new mongoose.Schema(
     name: { type: String, required: true, trim: true },
     slug: { type: String, required: true, unique: true, lowercase: true, trim: true },
     logo: { type: String, default: '' },
+    Org_logo: { type: String, default: '' },
+    companyLogo: { type: String, default: '' },
     email: { type: String, required: true, lowercase: true, trim: true },
     phone: { type: String, required: true, trim: true },
     address: {
@@ -40,5 +42,15 @@ const organizationSchema = new mongoose.Schema(
 
 organizationSchema.index({ slug: 1 });
 organizationSchema.index({ status: 1 });
+
+organizationSchema.pre('save', function (next) {
+  const chosenLogo = this.Org_logo || this.companyLogo || this.logo || '';
+  if (chosenLogo) {
+    if (!this.Org_logo) this.Org_logo = chosenLogo;
+    if (!this.companyLogo) this.companyLogo = chosenLogo;
+    if (!this.logo) this.logo = chosenLogo;
+  }
+  next();
+});
 
 module.exports = mongoose.model('Organization', organizationSchema);

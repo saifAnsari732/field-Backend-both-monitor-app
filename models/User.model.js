@@ -26,6 +26,8 @@ const userSchema = new mongoose.Schema(
     employeeId: { type: String },
     phone: { type: String },
     avatar: { type: String, default: "" },
+    emp_profile_pic: { type: String, default: "" },
+    managerPro_pic: { type: String, default: "" },
     department: { type: String },
     departmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Department" },
     teamId: { type: mongoose.Schema.Types.ObjectId, ref: "Team" },
@@ -85,6 +87,31 @@ userSchema.index({ organizationId: 1, managerId: 1 });
 userSchema.index({ organizationId: 1, departmentId: 1 });
 
 userSchema.pre("save", async function (next) {
+  // Sync avatar with emp_profile_pic / managerPro_pic based on role
+  const roleUpper = (this.role || '').toUpperCase();
+  if (roleUpper === 'MANAGER') {
+    if (this.managerPro_pic && !this.avatar) {
+      this.avatar = this.managerPro_pic;
+    } else if (this.avatar && !this.managerPro_pic) {
+      this.managerPro_pic = this.avatar;
+    } else if (this.managerPro_pic && this.isModified('managerPro_pic')) {
+      this.avatar = this.managerPro_pic;
+    } else if (this.avatar && this.isModified('avatar')) {
+      this.managerPro_pic = this.avatar;
+    }
+  } else {
+    // EMPLOYEE / other roles
+    if (this.emp_profile_pic && !this.avatar) {
+      this.avatar = this.emp_profile_pic;
+    } else if (this.avatar && !this.emp_profile_pic) {
+      this.emp_profile_pic = this.avatar;
+    } else if (this.emp_profile_pic && this.isModified('emp_profile_pic')) {
+      this.avatar = this.emp_profile_pic;
+    } else if (this.avatar && this.isModified('avatar')) {
+      this.emp_profile_pic = this.avatar;
+    }
+  }
+
   if (!this.isModified("password")) return next();
   const salt = await bcrypt.genSalt(12);
   this.password = await bcrypt.hash(this.password, salt);

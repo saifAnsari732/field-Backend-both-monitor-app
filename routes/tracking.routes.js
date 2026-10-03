@@ -17,6 +17,10 @@ router.get('/live-locations', protect, authorize('admin', 'hr', 'manager', 'org_
 router.get('/session/:id', protect, tc.getSessionRoute);
 router.get('/geocode', protect, tc.geocode);
 
+// Reconcile distance from DistanceLedger
+router.post('/reconcile', protect, tc.reconcileSession);
+router.get('/session/:id/reconcile', protect, tc.reconcileSession);
+
 // Reports
 router.get('/report/employee/:employeeId', protect, tc.getEmployeeReport);
 

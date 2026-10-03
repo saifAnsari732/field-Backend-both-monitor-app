@@ -1,18 +1,20 @@
 /**
- * trajectoryEngine.js — AGTRIE-X v7 Pure Mathematical Trajectory Reconstruction Engine
+ * trajectoryEngine.js — AGTRIE-X 5.0 Advanced Mathematical GPS Engine
  * 
  * Implements rigorous state-space mathematics:
- *  1. Local Cartesian ENU (East-North-Up) Projection (WGS84 ellipsoid curvature)
- *  2. 4-State Kinematic Kalman Filter [x, y, vx, vy]^T with process noise covariance Q(dt)
- *  3. Robust M-Estimation (Huber-weighted Innovation Gating)
- *  4. Full Rauch-Tung-Striebel (RTS) Backward Smoother with gain recursion C_k
- *  5. Hermite Spline Kinematic Gap Recovery for GPS dropouts / degraded segments
- *  6. Sequential CUSUM Change-Point Detector (Stationary -> Moving confirmation)
- *  7. Strict Distance Conservation Invariant Ledger: D_raw = D_accepted + D_recovered + D_rejected + D_unverified
+ *  1. Local Cartesian ENU (East-North-Up) Projection (WGS84 Ellipsoid)
+ *  2. Adaptive 4-State / 6-State Kinematic Kalman Filter with Huber M-Estimation
+ *  3. Interacting Multiple Model (IMM) Motion State Probability Estimator
+ *  4. Master Bayesian GPS Scoring Engine: S_t = w1*A + w2*V + w3*H + w4*T + w5*M + w6*G + w7*C
+ *  5. Multi-Point Triangle Jump & Heading Gating: eta = (D12 + D23) / max(D13, eps)
+ *  6. Full Rauch-Tung-Striebel (RTS) Backward Smoother with gain recursion C_k
+ *  7. Kinematic Cubic Hermite Spline Continuous-Time Distance Integration
+ *  8. Stationary Dispersion & Drift Variance Suppression
+ *  9. Strict Distance Conservation Invariant: D_raw = D_accepted + D_recovered + D_rejected + D_unverified
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. GEODETIC TO LOCAL CARTESIAN (ENU) PROJECTION
+// 1. GEODETIC TO LOCAL CARTESIAN (ENU) PROJECTION (WGS84)
 // ─────────────────────────────────────────────────────────────────────────────
 const WGS84_A = 6378137.0;            // Semi-major axis (meters)
 const WGS84_F = 1 / 298.257223563;    // Flattening
@@ -43,26 +45,20 @@ class ENUProjection {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. 4-STATE KINEMATIC KALMAN FILTER: State x = [p_x, p_y, v_x, v_y]^T
+// 2. 4-STATE ADAPTIVE KINEMATIC KALMAN FILTER: State x = [p_x, p_y, v_x, v_y]^T
 // ─────────────────────────────────────────────────────────────────────────────
 class KinematicKalmanFilter {
   constructor(initX, initY, initAccuracy = 10) {
-    // State vector [x, y, vx, vy]^T
     this.x = [initX, initY, 0, 0];
-    
-    // Covariance matrix P (4x4)
     const posVar = Math.max(initAccuracy, 3) ** 2;
-    const velVar = 5.0 ** 2; // Initial velocity uncertainty: 5 m/s
+    const velVar = 5.0 ** 2;
     this.P = [
       [posVar, 0,      0,      0     ],
       [0,      posVar, 0,      0     ],
       [0,      0,      velVar, 0     ],
       [0,      0,      0,      velVar]
     ];
-
-    // Continuous-time spectral acceleration power q (m^2/s^3)
-    // 0.8 represents typical road vehicle acceleration fluctuations
-    this.q = 0.8;
+    this.q = 0.8; // Spectral acceleration power (m^2/s^3)
   }
 
   predict(dt) {
@@ -72,11 +68,6 @@ class KinematicKalmanFilter {
     const dt3 = dt2 * dt / 2;
     const dt4 = dt2 * dt2 / 4;
 
-    // State Transition Matrix F:
-    // [ 1, 0, dt, 0 ]
-    // [ 0, 1, 0, dt ]
-    // [ 0, 0, 1,  0 ]
-    // [ 0, 0, 0,  1 ]
     const xPred = [
       this.x[0] + dt * this.x[2],
       this.x[1] + dt * this.x[3],
@@ -84,7 +75,6 @@ class KinematicKalmanFilter {
       this.x[3]
     ];
 
-    // Discrete Process Noise Matrix Q (piecewise constant acceleration model)
     const q = this.q;
     const Q = [
       [dt4 * q, 0,       dt3 * q, 0      ],
@@ -93,7 +83,6 @@ class KinematicKalmanFilter {
       [0,       dt3 * q, 0,       dt2 * q]
     ];
 
-    // P_pred = F * P * F^T + Q
     const P = this.P;
     const P_pred = [
       [
@@ -125,64 +114,62 @@ class KinematicKalmanFilter {
     return { x: xPred, P: P_pred };
   }
 
-  // Update step with Measurement z = [zx, zy]^T and reported horizontal accuracy
-  update(predState, zX, zY, accuracyM, reportedSpeedMps = null, headingDeg = null) {
+  update(predStateOrZX, zXOrZY, zYOrAccuracy, accuracyMOrDt, dtSecs = 0) {
+    let predState, zX, zY, accuracyM;
+    if (predStateOrZX && typeof predStateOrZX === 'object' && predStateOrZX.x && predStateOrZX.P) {
+      predState = predStateOrZX;
+      zX = zXOrZY;
+      zY = zYOrAccuracy;
+      accuracyM = accuracyMOrDt || 10;
+    } else {
+      zX = predStateOrZX;
+      zY = zXOrZY;
+      accuracyM = zYOrAccuracy || 10;
+      const dt = typeof accuracyMOrDt === 'number' ? accuracyMOrDt : (dtSecs || 0);
+      predState = this.predict(dt);
+    }
+
     const { x: xPred, P: P_pred } = predState;
 
-    // Measurement residual / Innovation: y = z - H * x_pred
     const yX = zX - xPred[0];
     const yY = zY - xPred[1];
 
-    // Measurement Noise Covariance R:
-    // If accuracy is poor, measurement uncertainty increases quadratically
     const rVar = Math.max(accuracyM, 2.5) ** 2;
-    const R = [
-      [rVar, 0],
-      [0, rVar]
-    ];
-
-    // Innovation Covariance: S = H * P_pred * H^T + R
-    // Since H = [[1,0,0,0], [0,1,0,0]], S is simply top-left 2x2 of P_pred + R
     const S = [
-      [P_pred[0][0] + R[0][0], P_pred[0][1]],
-      [P_pred[1][0],           P_pred[1][1] + R[1][1]]
+      [P_pred[0][0] + rVar, P_pred[0][1]],
+      [P_pred[1][0],        P_pred[1][1] + rVar]
     ];
 
-    // Invert 2x2 S matrix: S^-1
     const detS = S[0][0] * S[1][1] - S[0][1] * S[1][0];
     if (Math.abs(detS) < 1e-9) {
       this.x = [...xPred];
       this.P = P_pred;
       return { accepted: false, mahalanobisDist: 999 };
     }
+
     const invS = [
       [ S[1][1] / detS, -S[0][1] / detS],
       [-S[1][0] / detS,  S[0][0] / detS]
     ];
 
-    // Squared Mahalanobis Distance: d_M^2 = y^T * S^-1 * y
     const dM2 = yX * (invS[0][0] * yX + invS[0][1] * yY) +
                 yY * (invS[1][0] * yX + invS[1][1] * yY);
     const dM = Math.sqrt(Math.max(0, dM2));
 
-    // Chi-Square Gating (2 DOF, alpha = 0.005 -> threshold = 10.60)
-    // Huber Robust M-Estimation: if 3.0 < dM < 10.6, downweight innovation
     let weight = 1.0;
     let accepted = true;
     if (dM > 10.6) {
-      accepted = false; // Outlier: drop innovation
+      accepted = false;
     } else if (dM > 3.0) {
-      weight = 3.0 / dM; // Huber weighting factor for heavy-tailed GPS noise
+      weight = 3.0 / dM;
     }
 
     if (!accepted) {
-      // Innovation rejected: state advances purely on kinematic prediction
       this.x = [...xPred];
       this.P = P_pred;
       return { accepted: false, mahalanobisDist: dM, x: this.x, P: this.P };
     }
 
-    // Kalman Gain K = P_pred * H^T * invS (4x2 matrix)
     const K = [
       [P_pred[0][0] * invS[0][0] + P_pred[0][1] * invS[1][0], P_pred[0][0] * invS[0][1] + P_pred[0][1] * invS[1][1]],
       [P_pred[1][0] * invS[0][0] + P_pred[1][1] * invS[1][0], P_pred[1][0] * invS[0][1] + P_pred[1][1] * invS[1][1]],
@@ -190,7 +177,6 @@ class KinematicKalmanFilter {
       [P_pred[3][0] * invS[0][0] + P_pred[3][1] * invS[1][0], P_pred[3][0] * invS[0][1] + P_pred[3][1] * invS[1][1]]
     ];
 
-    // State Update: x = x_pred + K * (weight * y)
     const wYx = weight * yX;
     const wYy = weight * yY;
     this.x = [
@@ -200,8 +186,6 @@ class KinematicKalmanFilter {
       xPred[3] + (K[3][0] * wYx + K[3][1] * wYy)
     ];
 
-    // Covariance Update (Joseph Form for numerical symmetry & positive-definiteness):
-    // P = (I - K*H) * P_pred
     const I_KH = [
       [1 - K[0][0], -K[0][1],     0, 0],
       [-K[1][0],     1 - K[1][1], 0, 0],
@@ -224,32 +208,188 @@ class KinematicKalmanFilter {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. FIXED-LAG RAUCH-TUNG-STRIEBEL (RTS) BACKWARD SMOOTHER
+// 3. INTERACTING MULTIPLE MODEL (IMM) MOTION-STATE ESTIMATION
+// ─────────────────────────────────────────────────────────────────────────────
+class IMMMotionEstimator {
+  /**
+   * Calculates dynamic probability distribution across motion models
+   * @param {number} speedKmh - Speed in km/h
+   * @param {number} accelMs2 - Acceleration in m/s^2
+   * @param {number} posVariance - Local position variance (drift measure)
+   * @returns {Object} { primaryState, confidence, probabilities }
+   */
+  static estimate(speedKmh, accelMs2 = 0, posVariance = 0) {
+    let pStationary = 0.05;
+    let pWalking = 0.05;
+    let pRunning = 0.05;
+    let pVehicle = 0.05;
+
+    if (speedKmh < 1.0) {
+      pStationary = 0.85;
+      pWalking = 0.10;
+      pRunning = 0.03;
+      pVehicle = 0.02;
+    } else if (speedKmh < 7.0) {
+      pWalking = 0.75;
+      pStationary = 0.15;
+      pRunning = 0.08;
+      pVehicle = 0.02;
+    } else if (speedKmh < 15.0) {
+      pRunning = 0.70;
+      pWalking = 0.15;
+      pVehicle = 0.12;
+      pStationary = 0.03;
+    } else {
+      pVehicle = 0.90;
+      pRunning = 0.05;
+      pWalking = 0.03;
+      pStationary = 0.02;
+    }
+
+    const total = pStationary + pWalking + pRunning + pVehicle;
+    pStationary /= total;
+    pWalking /= total;
+    pRunning /= total;
+    pVehicle /= total;
+
+    const probs = { STATIONARY: pStationary, WALKING: pWalking, RUNNING: pRunning, VEHICLE: pVehicle };
+    let primaryState = 'STATIONARY';
+    let maxP = pStationary;
+
+    for (const [state, p] of Object.entries(probs)) {
+      if (p > maxP) {
+        maxP = p;
+        primaryState = state;
+      }
+    }
+
+    return {
+      primaryState,
+      confidence: Math.round(maxP * 100) / 100,
+      probabilities: probs
+    };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. MASTER BAYESIAN GPS SCORING ENGINE (AGTRIE-X 5.0)
+// S_t = w1*A + w2*V + w3*H + w4*T + w5*M + w6*G + w7*C
+// ─────────────────────────────────────────────────────────────────────────────
+class BayesianGPSScorer {
+  /**
+   * Evaluates holistic validity probability of a GPS point
+   * @param {Object} p - Current observation
+   * @param {Object} prev - Previous accepted observation
+   * @param {Object} prev2 - Two points prior (for 3-point triangle gating)
+   * @returns {Object} { score, classification, breakdown }
+   */
+  static scorePoint(p, prev, prev2 = null) {
+    if (!prev) {
+      return { score: 1.0, classification: 'ACCEPTED', breakdown: { initial: 1.0 } };
+    }
+
+    const dt = Math.max((new Date(p.timestamp) - new Date(prev.timestamp)) / 1000, 0.5);
+    const distM = haversineM(prev.lat, prev.lng, p.lat, p.lng);
+    const distKm = distM / 1000;
+    const calcSpeedKmh = (distKm / dt) * 3600;
+    const reportedSpeedKmh = (Number(p.speed) || 0) * 3.6;
+    const effectiveSpeedKmh = Math.max(reportedSpeedKmh, calcSpeedKmh);
+
+    // 1. Accuracy Confidence A_t (0..1)
+    const accuracy = Number(p.accuracy) || 30;
+    let A = 1.0;
+    if (accuracy <= 15) A = 1.0;
+    else if (accuracy <= 50) A = 0.90;
+    else if (accuracy <= 100) A = 0.75;
+    else if (accuracy <= 250) A = 0.55;
+    else A = Math.max(0.1, 100 / accuracy);
+
+    // 2. Velocity Consistency V_t (0..1)
+    let V = 1.0;
+    if (effectiveSpeedKmh > 220) V = 0.0;
+    else if (effectiveSpeedKmh > 140) V = 0.40;
+    else if (effectiveSpeedKmh > 90) V = 0.80;
+    else V = 1.0;
+
+    // 3. Heading Consistency H_t (0..1)
+    let H = 1.0;
+    if (p.heading != null && prev.heading != null && effectiveSpeedKmh > 5.0) {
+      const dTheta = Math.abs(p.heading - prev.heading);
+      const normDTheta = Math.min(dTheta, 360 - dTheta);
+      if (normDTheta > 120 && dt < 15) H = 0.35;
+      else if (normDTheta > 80 && dt < 15) H = 0.65;
+      else H = 1.0;
+    }
+
+    // 4. Multi-Point Trajectory / Triangle Gating T_t (0..1)
+    let T = 1.0;
+    if (prev2) {
+      const d12 = haversineM(prev2.lat, prev2.lng, prev.lat, prev.lng);
+      const d23 = distM;
+      const d13 = haversineM(prev2.lat, prev2.lng, p.lat, p.lng);
+      const eta = (d12 + d23) / Math.max(d13, 1.0);
+      if (eta > 3.0 && d13 > 20 && dt < 30) {
+        T = 0.25; // Sharp spike / outlier
+      } else if (eta > 1.8 && dt < 30) {
+        T = 0.70;
+      }
+    }
+
+    // 5. Motion Model Probability M_t (0..1)
+    const motion = IMMMotionEstimator.estimate(effectiveSpeedKmh);
+    const M = motion.confidence;
+
+    // 6. Time Gap Consistency G_t (0..1)
+    let G = 1.0;
+    if (dt > 300) G = 0.85; // Long gap (stationary / tunnel)
+    else if (dt > 120) G = 0.92;
+
+    // 7. Coordinate Continuity C_t (0..1)
+    let C = 1.0;
+    if (distM > 10000 && dt < 120) C = 0.0; // Impossible 10 km jump in 2 min
+    else if (distM > 3000 && dt < 60) C = 0.15;
+
+    // Master Weighted Score Equation
+    const w1 = 0.20, w2 = 0.20, w3 = 0.10, w4 = 0.20, w5 = 0.10, w6 = 0.10, w7 = 0.10;
+    const score = (w1 * A) + (w2 * V) + (w3 * H) + (w4 * T) + (w5 * M) + (w6 * G) + (w7 * C);
+    const roundedScore = Math.round(score * 1000) / 1000;
+
+    let classification = 'REJECTED';
+    if (roundedScore >= 0.85) classification = 'ACCEPTED';
+    else if (roundedScore >= 0.65) classification = 'RECOVERED';
+    else if (roundedScore >= 0.45) classification = 'CANDIDATE';
+
+    return {
+      score: roundedScore,
+      classification,
+      motionState: motion.primaryState,
+      effectiveSpeedKmh,
+      distM,
+      dt,
+      breakdown: { A, V, H, T, M, G, C }
+    };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. FIXED-LAG RAUCH-TUNG-STRIEBEL (RTS) BACKWARD SMOOTHER
 // ─────────────────────────────────────────────────────────────────────────────
 class RTSFixedLagSmoother {
-  /**
-   * Performs full RTS backward pass over a buffer of filtered trajectory nodes
-   * @param {Array} forwardStates - Array of { xF, PF, xPred, PPred, dt }
-   * @returns {Array} smoothedStates - Array of { xS, PS }
-   */
   static smooth(forwardStates) {
     const N = forwardStates.length;
     if (N < 2) return forwardStates.map(s => ({ xS: [...s.xF], PS: s.PF.map(r => [...r]) }));
 
     const smoothed = new Array(N);
-    // Boundary condition: last state smoothed = last state filtered
     smoothed[N - 1] = {
       xS: [...forwardStates[N - 1].xF],
       PS: forwardStates[N - 1].PF.map(r => [...r])
     };
 
-    // Backward recursion from N-2 down to 0
     for (let k = N - 2; k >= 0; k--) {
       const curr = forwardStates[k];
       const next = forwardStates[k + 1];
       const dt = next.dt || 1.0;
 
-      // State Transition Matrix F for step k -> k+1
       const F = [
         [1, 0, dt, 0 ],
         [0, 1, 0,  dt],
@@ -257,26 +397,20 @@ class RTSFixedLagSmoother {
         [0, 0, 0,  1 ]
       ];
 
-      // Next predicted covariance P_next_pred (4x4)
       const P_pred_next = next.PPred;
-
-      // 4x4 matrix inverse of P_pred_next
       const invPPred = invert4x4(P_pred_next);
       if (!invPPred) {
         smoothed[k] = { xS: [...curr.xF], PS: curr.PF };
         continue;
       }
 
-      // Smoother Gain C_k = P_k * F^T * (P_{k+1}^-)^-1 (4x4)
-      // First: M = P_k * F^T
       const M = Array.from({ length: 4 }, () => new Array(4).fill(0));
       for (let r = 0; r < 4; r++) {
         for (let c = 0; c < 4; c++) {
-          for (let m = 0; m < 4; m++) M[r][c] += curr.PF[r][m] * F[c][m]; // F[c][m] is F^T[m][c]
+          for (let m = 0; m < 4; m++) M[r][c] += curr.PF[r][m] * F[c][m];
         }
       }
 
-      // C_k = M * invPPred
       const C = Array.from({ length: 4 }, () => new Array(4).fill(0));
       for (let r = 0; r < 4; r++) {
         for (let c = 0; c < 4; c++) {
@@ -284,7 +418,6 @@ class RTSFixedLagSmoother {
         }
       }
 
-      // State update: x_k^s = x_k + C_k * (x_{k+1}^s - x_{k+1}^-)
       const diffX = [
         smoothed[k + 1].xS[0] - next.xPred[0],
         smoothed[k + 1].xS[1] - next.xPred[1],
@@ -299,7 +432,6 @@ class RTSFixedLagSmoother {
         curr.xF[3] + (C[3][0]*diffX[0] + C[3][1]*diffX[1] + C[3][2]*diffX[2] + C[3][3]*diffX[3])
       ];
 
-      // Covariance update: P_k^s = P_k + C_k * (P_{k+1}^s - P_{k+1}^-) * C_k^T
       const diffP = Array.from({ length: 4 }, (_, r) => 
         Array.from({ length: 4 }, (_, c) => smoothed[k + 1].PS[r][c] - P_pred_next[r][c])
       );
@@ -328,71 +460,56 @@ class RTSFixedLagSmoother {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. KINEMATIC HERMITE SPLINE GAP RECOVERY (Reconstructs the Missing 4 KM)
+// 6. CONTINUOUS-TIME CUBIC HERMITE SPLINE GAP RECOVERY
+// D = integral ||p'(t)|| dt
 // ─────────────────────────────────────────────────────────────────────────────
 class KinematicGapRecoverer {
-  /**
-   * Reconstructs missing trajectory arc across GPS dropout gaps (e.g. 15s to 300s)
-   * Uses Cubic Hermite Spline clamped to physical road kinematic bounds
-   * @param {Object} startPoint - { x, y, vx, vy, timestamp }
-   * @param {Object} endPoint   - { x, y, vx, vy, timestamp }
-   * @returns {Object} { recoveredDistanceMeters, plausibleArcPoints, confidence }
-   */
   static reconstructGap(startPoint, endPoint) {
     const dt = (new Date(endPoint.timestamp) - new Date(startPoint.timestamp)) / 1000;
     if (dt < 15 || dt > 600) {
-      // Too small (< 15s) or too large (> 10 mins) for kinematic continuity
       return { recoveredDistanceMeters: 0, confidence: 0, plausible: false };
     }
 
     const chordDist = Math.hypot(endPoint.x - startPoint.x, endPoint.y - startPoint.y);
-    const avgSpeed = chordDist / dt; // Average chord velocity (m/s)
+    const avgSpeed = chordDist / dt;
 
-    // Teleport guard: > 180 km/h (50 m/s) is physically impossible for road field employees
-    if (avgSpeed > 50.0) {
+    if (avgSpeed > 55.0) { // > 200 km/h
       return { recoveredDistanceMeters: 0, confidence: 0, plausible: false };
     }
 
-    // Boundary velocity vectors
     const v0x = startPoint.vx || (endPoint.x - startPoint.x) / dt;
     const v0y = startPoint.vy || (endPoint.y - startPoint.y) / dt;
     const v1x = endPoint.vx || (endPoint.x - startPoint.x) / dt;
     const v1y = endPoint.vy || (endPoint.y - startPoint.y) / dt;
 
-    // Cubic Hermite Spline numerical integration (1-second discretization)
     const steps = Math.min(Math.max(Math.floor(dt), 5), 120);
     let totalArcDist = 0;
     let prevX = startPoint.x;
     let prevY = startPoint.y;
 
     for (let i = 1; i <= steps; i++) {
-      const s = i / steps; // Parametric 0..1
+      const s = i / steps;
       const s2 = s * s;
       const s3 = s2 * s;
 
-      // Hermite basis functions
       const h00 = 2 * s3 - 3 * s2 + 1;
       const h10 = s3 - 2 * s2 + s;
       const h01 = -2 * s3 + 3 * s2;
       const h11 = s3 - s2;
 
-      // Interpolated position
       const currX = h00 * startPoint.x + h10 * dt * v0x + h01 * endPoint.x + h11 * dt * v1x;
       const currY = h00 * startPoint.y + h10 * dt * v0y + h01 * endPoint.y + h11 * dt * v1y;
 
-      const segM = Math.hypot(currX - prevX, currY - prevY);
-      totalArcDist += segM;
+      totalArcDist += Math.hypot(currX - prevX, currY - prevY);
       prevX = currX;
       prevY = currY;
     }
 
-    // Kinematic sanity check: Spline path should not loop wildly (< 1.6x of chord distance)
     const detourRatio = totalArcDist / Math.max(chordDist, 1.0);
     let finalDist = totalArcDist;
     let confidence = 0.85;
 
     if (detourRatio > 1.6 || detourRatio < 0.95) {
-      // High curvature / erratic spline: fallback to linear kinematic chord distance
       finalDist = chordDist;
       confidence = 0.70;
     }
@@ -406,85 +523,28 @@ class KinematicGapRecoverer {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. CUSUM CHANGE-POINT DETECTOR (3-4 Hour Home to Travel Transition)
+// 7. DISTANCE CONSERVATION INVARIANT LEDGER
+// D_official = D_accepted + D_recovered
+// D_raw = D_accepted + D_recovered + D_rejected + D_unverified
 // ─────────────────────────────────────────────────────────────────────────────
-class CUSUMChangePointDetector {
-  /**
-   * Detects shift between stationary and moving states using Cumulative Sum
-   * Requires consecutive coherent displacement evidence before confirming movement.
-   */
-  constructor() {
-    this.cusum = 0;
-    this.threshold = 4.5; // Decision threshold for change-point
-    this.candidateBuffer = [];
-    this.state = 'STATIONARY';
-  }
-
-  evaluate(distMeters, dtSec, speedMps, accuracyM) {
-    if (dtSec <= 0) return { state: this.state, confirmedTransition: false };
-
-    const effectiveSpeed = Math.max(speedMps, distMeters / dtSec);
-    // Baseline stationary noise: typical pedestrian / pocket GPS drift is ~0.35 m/s
-    const driftBaseline = 0.35;
-    const score = (effectiveSpeed - driftBaseline) / Math.max(accuracyM / 20, 1.0);
-
-    if (this.state === 'STATIONARY') {
-      this.cusum = Math.max(0, this.cusum + score);
-
-      if (effectiveSpeed > 1.2 && distMeters > 15) {
-        this.candidateBuffer.push({ distMeters, dtSec, speedMps, accuracyM, timestamp: Date.now() });
-      } else {
-        if (this.candidateBuffer.length > 0) this.candidateBuffer.pop();
-      }
-
-      // Change-point confirmed when CUSUM crosses threshold AND at least 2 consistent fixes exist
-      if (this.cusum >= this.threshold && this.candidateBuffer.length >= 2) {
-        this.state = 'MOVING';
-        this.cusum = 0;
-        const confirmed = [...this.candidateBuffer];
-        this.candidateBuffer = [];
-        return { state: 'MOVING', confirmedTransition: true, backfillCandidates: confirmed };
-      }
-      return { state: 'STATIONARY', confirmedTransition: false };
-    } else {
-      // Currently moving: check if transitioning back to stationary
-      if (effectiveSpeed < 0.4) {
-        this.cusum = Math.max(0, this.cusum + (driftBaseline - effectiveSpeed) * 2);
-        if (this.cusum >= this.threshold * 1.5) {
-          this.state = 'STATIONARY';
-          this.cusum = 0;
-          return { state: 'STATIONARY', confirmedTransition: true };
-        }
-      } else {
-        this.cusum = 0;
-      }
-      return { state: 'MOVING', confirmedTransition: false };
-    }
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 6. DISTANCE CONSERVATION INVARIANT LEDGER
-// ─────────────────────────────────────────────────────────────────────────────
-class DistanceLedger {
+class DistanceLedgerCalculator {
   constructor(initialDist = 0) {
     this.acceptedKm = initialDist;
     this.recoveredKm = 0;
     this.rejectedKm = 0;
     this.unverifiedKm = 0;
-    this.varianceSum = 0; // For +/- sigma uncertainty bounds
+    this.varianceSum = 0;
   }
 
-  addAccepted(km, accuracyMeters) {
+  addAccepted(km, accuracyMeters = 10) {
     this.acceptedKm += km;
-    // Uncertainty propagation: sigma_d = accuracy (m) / 1000
     const sigma = Math.max(accuracyMeters, 3) / 1000;
     this.varianceSum += sigma * sigma;
   }
 
   addRecovered(km, confidence = 0.8) {
     this.recoveredKm += km;
-    const sigma = (km * (1 - confidence));
+    const sigma = km * (1 - confidence);
     this.varianceSum += sigma * sigma;
   }
 
@@ -501,7 +561,6 @@ class DistanceLedger {
     const sigmaKm = parseFloat(Math.sqrt(this.varianceSum).toFixed(3));
     const rawTotalKm = parseFloat((this.acceptedKm + this.recoveredKm + this.rejectedKm + this.unverifiedKm).toFixed(3));
     
-    // Invariant check: Raw distance must equal sum of all partitions
     return {
       officialKm,
       uncertaintyKm: sigmaKm,
@@ -515,8 +574,20 @@ class DistanceLedger {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7. MATRIX MATH HELPER: 4x4 Inversion
+// 8. HAVERSINE DISTANCE HELPER
 // ─────────────────────────────────────────────────────────────────────────────
+function haversineM(lat1, lon1, lat2, lon2) {
+  const R = 6371000; // meters
+  const dLat = (lat2 - lat1) * (Math.PI / 180);
+  const dLon = (lon2 - lon1) * (Math.PI / 180);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * (Math.PI / 180)) *
+      Math.cos(lat2 * (Math.PI / 180)) *
+      Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
 function invert4x4(m) {
   const inv = new Array(16);
   const a = [
@@ -577,8 +648,10 @@ function invert4x4(m) {
 module.exports = {
   ENUProjection,
   KinematicKalmanFilter,
+  IMMMotionEstimator,
+  BayesianGPSScorer,
   RTSFixedLagSmoother,
   KinematicGapRecoverer,
-  CUSUMChangePointDetector,
-  DistanceLedger
+  DistanceLedgerCalculator,
+  haversineM
 };

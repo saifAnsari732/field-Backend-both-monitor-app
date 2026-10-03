@@ -86,8 +86,8 @@ exports.getDashboardStats = async (req, res) => {
     const [
       totalEmployees, activeEmployees, trackingNow,
       totalMeetings, todayMeetings, pendingExpenses,
-      totalExpenses, todayAttendance, totalKmData,
-      totalLeads, totalLeaves, totalTasks
+      totalExpenses, presentCount, lateCount, halfDayCount,
+      totalKmData, totalLeads, totalLeaves, totalTasks
     ] = await Promise.all([
       User.countDocuments({ role: { $nin: ['SUPER_ADMIN', 'SUPERADMIN'] }, isApproved: true, ...userFilter }),
       User.countDocuments({ role: { $nin: ['SUPER_ADMIN', 'SUPERADMIN'] }, isOnline: true, ...userFilter }),
@@ -99,7 +99,9 @@ exports.getDashboardStats = async (req, res) => {
         ...(isSuperAdmin ? [] : [{ $match: { employee: { $in: empIds } } }]),
         { $group: { _id: null, total: { $sum: '$amount' } } }
       ]),
-      Attendance.countDocuments(isSuperAdmin ? { date: today, status: 'present' } : { employee: { $in: empIds }, date: today, status: 'present' }),
+      Attendance.countDocuments(isSuperAdmin ? { date: today, status: { $in: ['present', 'late', 'half-day'] } } : { employee: { $in: empIds }, date: today, status: { $in: ['present', 'late', 'half-day'] } }),
+      Attendance.countDocuments(isSuperAdmin ? { date: today, status: 'late' } : { employee: { $in: empIds }, date: today, status: 'late' }),
+      Attendance.countDocuments(isSuperAdmin ? { date: today, status: 'half-day' } : { employee: { $in: empIds }, date: today, status: 'half-day' }),
       LiveLocation.aggregate([
         { $match: { date: today, ...(isSuperAdmin ? {} : { employee: { $in: empIds } }) } },
         { $group: { _id: null, total: { $sum: '$totalDistance' } } }
@@ -108,6 +110,9 @@ exports.getDashboardStats = async (req, res) => {
       Leave.countDocuments(isSuperAdmin ? {} : { employee: { $in: empIds } }),
       Task.countDocuments(isSuperAdmin ? {} : { employee: { $in: empIds } }),
     ]);
+
+    const absentCount = Math.max(0, totalEmployees - presentCount);
+    const attendanceRate = totalEmployees > 0 ? Math.round((presentCount / totalEmployees) * 100) : 0;
 
     const monthlyMeetings = await Meeting.aggregate([
       ...(isSuperAdmin ? [] : [{ $match: { employee: { $in: empIds } } }]),
@@ -121,15 +126,25 @@ exports.getDashboardStats = async (req, res) => {
     ]);
 
     const stats = {
-      totalEmployees, activeEmployees, trackingNow,
-      totalMeetings, todayMeetings, pendingExpenses,
+      totalEmployees,
+      activeEmployees,
+      trackingNow,
+      todayAttendance: presentCount,
+      presentEmployees: presentCount,
+      absentEmployees: absentCount,
+      lateEmployees: lateCount,
+      halfDayEmployees: halfDayCount,
+      attendanceRate,
+      totalMeetings,
+      todayMeetings,
+      pendingExpenses,
       totalExpenses: totalExpenses[0]?.total || 0,
-      todayAttendance,
       totalKm: totalKmData[0]?.total || 0,
       totalLeads: totalLeads || 0,
       totalLeaves: totalLeaves || 0,
       totalTasks: totalTasks || 0,
-      monthlyMeetings, expenseByCategory,
+      monthlyMeetings,
+      expenseByCategory,
     };
 
     await liveCache.set(cacheKey, stats, 30);
@@ -216,7 +231,16 @@ exports.toggleBlock = async (req, res) => {
 
 exports.updateEmployee = async (req, res) => {
   try {
-    const employee = await User.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    const updateData = { ...req.body };
+    if (updateData.emp_profile_pic) {
+      updateData.avatar = updateData.emp_profile_pic;
+    } else if (updateData.managerPro_pic) {
+      updateData.avatar = updateData.managerPro_pic;
+    } else if (updateData.avatar) {
+      updateData.emp_profile_pic = updateData.avatar;
+      updateData.managerPro_pic = updateData.avatar;
+    }
+    const employee = await User.findByIdAndUpdate(req.params.id, updateData, { new: true });
     res.json({ success: true, employee });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
@@ -423,14 +447,20 @@ exports.updateOrganizationSettings = async (req, res) => {
       if (existing) orgId = existing._id;
     }
     if (!orgId) return res.status(404).json({ success: false, message: 'Organization record not found' });
-    const { name, phone, email, address, settings, logo } = req.body;
+    const { name, phone, email, address, settings, logo, Org_logo, companyLogo } = req.body;
     const updateData = {};
     if (name) updateData.name = name;
     if (phone) updateData.phone = phone;
     if (email) updateData.email = email;
     if (address) updateData.address = address;
     if (settings) updateData.settings = settings;
-    if (logo !== undefined) updateData.logo = logo;
+
+    const chosenLogo = Org_logo !== undefined ? Org_logo : (companyLogo !== undefined ? companyLogo : logo);
+    if (chosenLogo !== undefined) {
+      updateData.logo = chosenLogo;
+      updateData.Org_logo = chosenLogo;
+      updateData.companyLogo = chosenLogo;
+    }
 
     const organization = await Organization.findByIdAndUpdate(
       orgId,

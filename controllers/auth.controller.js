@@ -87,19 +87,30 @@ exports.getMe = async (req, res) => {
 };
 
 // @desc Update profile
-exports. updateProfile = async (req, res) => {
+exports.updateProfile = async (req, res) => {
   try {
-    const allowed = ['name', 'phone', 'avatar', 'emergencyContact', 'fcmToken', 'daReceipt', 'DA'];
+    const allowed = ['name', 'phone', 'avatar', 'emp_profile_pic', 'managerPro_pic', 'emergencyContact', 'fcmToken', 'daReceipt', 'DA'];
 
-    // DA mode: har upload par DA add hona chahiye (replace nahi)
-    // payload.DA ko increment samjha jayega
     const updates = {};
     allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
 
-    const updateDoc = {};
+    // Sync avatar & role-specific profile pic
+    const userRole = (req.user.role || '').toUpperCase();
+    if (updates.emp_profile_pic) {
+      updates.avatar = updates.emp_profile_pic;
+    }
+    if (updates.managerPro_pic) {
+      updates.avatar = updates.managerPro_pic;
+    }
+    if (updates.avatar && !updates.emp_profile_pic && !updates.managerPro_pic) {
+      if (userRole === 'MANAGER') {
+        updates.managerPro_pic = updates.avatar;
+      } else {
+        updates.emp_profile_pic = updates.avatar;
+      }
+    }
 
-    // DEBUG: DA payload aur updateDoc kya banta hai
-    // console.log('updateProfile req.body:', req.body);
+    const updateDoc = {};
 
     // DA increment (total)
     if (updates.DA !== undefined) {
@@ -109,7 +120,6 @@ exports. updateProfile = async (req, res) => {
     }
 
     // DA history: har upload ke saath daReceipt aata hai
-    // (frontend payload me DA increment aur daReceipt url dono bhejta hai)
     if (req.body.DA !== undefined || req.body.daReceipt !== undefined) {
       const amt = Number(req.body.DA);
       const safeAmt = Number.isNaN(amt) ? 0 : amt;
@@ -126,9 +136,6 @@ exports. updateProfile = async (req, res) => {
     }
 
     Object.assign(updateDoc, updates);
-
-    console.log('updateProfile req.body:', req.body);
-    console.log('updateProfile updateDoc:', updateDoc);
 
     const user = await User.findByIdAndUpdate(req.user._id, updateDoc, { new: true, runValidators: true });
     return res.json({ success: true, user });

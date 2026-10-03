@@ -7,14 +7,15 @@ const { autoStopInactiveSessions } = require('../controllers/tracking.controller
  * @param {Object} io - Socket.io instance for emitting real-time events
  */
 const initCronJobs = (io) => {
-  // Run every five minutes so a stale shift is closed shortly after its 3-hour deadline.
-  cron.schedule('*/5 * * * *', async () => {
-    try {
-      await autoStopInactiveSessions(io);
-    } catch (error) {
-      console.error('❌ [CRON] Error auto-stopping inactive tracking:', error.message);
-    }
-  });
+  // [PERMANENT ZERO DATA LOSS POLICY]: Auto-stop cron is disabled.
+  // Sessions remain active indefinitely until explicit Punch Out or Admin Force Close.
+  // cron.schedule('*/5 * * * *', async () => {
+  //   try {
+  //     await autoStopInactiveSessions(io);
+  //   } catch (error) {
+  //     console.error('❌ [CRON] Error auto-stopping inactive tracking:', error.message);
+  //   }
+  // });
 
   // Run at minute 0 past every hour: '0 * * * *'
   cron.schedule('0 * * * *', async () => {
