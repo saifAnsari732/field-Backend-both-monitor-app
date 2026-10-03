@@ -201,6 +201,8 @@ exports.updateLocation = async (req, res) => {
       y: kf.x[1],
       vx: kf.x[2],
       vy: kf.x[3],
+      lat: sessionState.lastLat || originLat,
+      lng: sessionState.lastLng || originLng,
       timestamp: sessionState.lastTs || new Date().toISOString()
     };
 
@@ -229,15 +231,17 @@ exports.updateLocation = async (req, res) => {
       const dt = prevTimestamp ? Math.max((tMs - prevTimestamp) / 1000, 0.1) : 1.0;
       prevTimestamp = tMs;
 
-      // Kinematic Gap Detection (e.g. flyover / tunnel dropout: 15s to 600s)
+      let gapCurveKm = 0;
+      let gapConfidence = 0.85;
       if (dt >= 15 && dt <= 600) {
         gaps++;
         const currEnu = proj.toENU(lat, lng);
         const currAnchorPoint = { x: currEnu.x, y: currEnu.y, vx: kf.x[2], vy: kf.x[3], timestamp: timestamp.toISOString() };
         const gapRecovery = KinematicGapRecoverer.reconstructGap(prevAnchorPoint, currAnchorPoint);
         if (gapRecovery.plausible && gapRecovery.recoveredDistanceMeters > 0) {
-          const recKm = gapRecovery.recoveredDistanceMeters / 1000;
-          ledger.addRecovered(recKm, gapRecovery.confidence);
+          const splineKm = gapRecovery.recoveredDistanceMeters / 1000;
+          gapCurveKm = splineKm; // Store for curve integration after stepDistKm
+          gapConfidence = gapRecovery.confidence;
           recoveredPoints++;
         }
       }
@@ -284,6 +288,12 @@ exports.updateLocation = async (req, res) => {
       } else {
         // Unverified high-noise GPS (> 250m accuracy)
         ledger.addUnverified(stepDistKm);
+      }
+
+      // If a gap spline was computed across dropout, add ONLY the extra road curvature beyond chord
+      if (gapCurveKm > stepDistKm) {
+        const extraCurveKm = gapCurveKm - stepDistKm;
+        ledger.addRecovered(extraCurveKm, gapConfidence);
       }
 
       // Save state for backward RTS smoother
@@ -461,6 +471,7 @@ exports.stopTracking = async (req, res) => {
       session.endAddress = session.coordinates[session.coordinates.length - 1].address;
     }
 
+    session.officialDistance = session.totalDistance;
     await session.save();
 
     // Clear Redis session state — shift is over
@@ -468,12 +479,13 @@ exports.stopTracking = async (req, res) => {
 
     await User.findByIdAndUpdate(req.user._id, { isTracking: false });
 
-    const today = new Date().toISOString().slice(0, 10);
-    const allSessions = await LiveLocation.find({ employee: req.user._id, date: today });
+    // Use session.date so shifts spanning midnight attribute distance to correct attendance day
+    const targetDate = session.date || new Date().toISOString().slice(0, 10);
+    const allSessions = await LiveLocation.find({ employee: req.user._id, date: targetDate });
     const totalDist = allSessions.reduce((acc, s) => acc + (s.totalDistance || 0), 0);
 
     await Attendance.findOneAndUpdate(
-      { employee: req.user._id, date: today },
+      { employee: req.user._id, date: targetDate },
       { checkOut: new Date(), totalDistanceTraveled: totalDist }
     );
 
