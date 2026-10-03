@@ -151,6 +151,8 @@ exports.updateLocation = async (req, res) => {
       const lastCoordDb = dbSession.coordinates[dbSession.coordinates.length - 1] || {};
       sessionState = {
         totalDistance: dbSession.totalDistance || 0,
+        manualDistanceAdded: dbSession.manualDistanceAdded || 0,
+        date: dbSession.date,
         lastLat: lastCoordDb.lat || 0,
         lastLng: lastCoordDb.lng || 0,
         lastTs: lastCoordDb.timestamp || new Date().toISOString(),
@@ -204,7 +206,25 @@ exports.updateLocation = async (req, res) => {
     let filterPLat = Number(sessionState.pLat) || 0.00000001;
     let filterPLng = Number(sessionState.pLng) || 0.00000001;
 
+    // Reconcile any Admin Manual Adjustment from MongoDB in real-time
+    const dbLiveDoc = await LiveLocation.findOne(
+      { sessionId, employee: req.user._id, isActive: true },
+      { totalDistance: 1, manualDistanceAdded: 1, date: 1 }
+    ).lean();
+
+    const dbManualAdded = Number(dbLiveDoc?.manualDistanceAdded) || 0;
+    const cachedManualAdded = Number(sessionState.manualDistanceAdded) || 0;
+
     let currentTotalDistance = Number(sessionState.totalDistance) || 0;
+
+    // If an Admin credited or adjusted KM from the Web Monitoring portal during this active shift, apply the delta
+    if (Math.abs(dbManualAdded - cachedManualAdded) > 0.001) {
+      const manualDelta = dbManualAdded - cachedManualAdded;
+      currentTotalDistance = Math.max(0, currentTotalDistance + manualDelta);
+      sessionState.manualDistanceAdded = dbManualAdded;
+      sessionState.totalDistance = currentTotalDistance;
+    }
+
     let prevTimestamp = sessionState.lastTs ? new Date(sessionState.lastTs).getTime() : 0;
     let lastValidLat = filterLat;
     let lastValidLng = filterLng;
@@ -344,6 +364,8 @@ exports.updateLocation = async (req, res) => {
     // Persist Authoritative State to Redis
     await saveSessionState(sessionId, {
       totalDistance: currentTotalDistance,
+      manualDistanceAdded: dbManualAdded,
+      date: sessionState.date || dbLiveDoc?.date,
       lastLat: lastValidLat,
       lastLng: lastValidLng,
       lastTs: new Date(prevTimestamp || Date.now()).toISOString(),
@@ -369,14 +391,15 @@ exports.updateLocation = async (req, res) => {
             rejectedPointCount: rejectedPoints,
           },
           $max: {
-            totalDistance: currentTotalDistance,
-            officialDistance: currentTotalDistance,
-            acceptedDistance: currentTotalDistance,
-            rawGpsDistance: currentTotalDistance,
             worstAccuracy: batchWorstAccuracy,
             maxSpeed: batchMaxSpeed,
           },
           $set: {
+            totalDistance: currentTotalDistance,
+            officialDistance: currentTotalDistance,
+            acceptedDistance: currentTotalDistance,
+            rawGpsDistance: currentTotalDistance,
+            manualDistanceAdded: dbManualAdded,
             lastActivity: new Date(),
             motionState: currentMotionState,
             averageAccuracy: runningAvgAccuracy,
@@ -399,13 +422,20 @@ exports.updateLocation = async (req, res) => {
     } else {
       await LiveLocation.findOneAndUpdate(
         { sessionId, employee: req.user._id, isActive: true },
-        { $max: { totalDistance: currentTotalDistance, officialDistance: currentTotalDistance } },
+        {
+          $set: {
+            totalDistance: currentTotalDistance,
+            officialDistance: currentTotalDistance,
+            manualDistanceAdded: dbManualAdded,
+            lastActivity: new Date(),
+          }
+        },
         { runValidators: true }
       ).catch(() => {});
     }
 
     // Reconcile and update Attendance.totalDistanceTraveled for today in real-time
-    const targetDate = sessionState.date || new Date().toISOString().slice(0, 10);
+    const targetDate = sessionState.date || dbLiveDoc?.date || new Date().toISOString().slice(0, 10);
     const todaySessions = await LiveLocation.find(
       { employee: req.user._id, date: targetDate },
       { sessionId: 1, totalDistance: 1 }
@@ -655,15 +685,15 @@ exports.getTodaySessions = async (req, res) => {
 
     let totalDistanceToday = 0;
     for (const s of sessions) {
+      let sessionDist = Number(s.totalDistance) || 0;
       if (s.isActive) {
         const state = await getSessionState(s.sessionId);
         if (state && typeof state.totalDistance === 'number') {
-          totalDistanceToday += state.totalDistance;
-          s.totalDistance = Math.max(s.totalDistance || 0, state.totalDistance);
-          continue;
+          sessionDist = Math.max(sessionDist, state.totalDistance);
+          s.totalDistance = sessionDist;
         }
       }
-      totalDistanceToday += (Number(s.totalDistance) || 0);
+      totalDistanceToday += sessionDist;
     }
     totalDistanceToday = Math.round(totalDistanceToday * 100) / 100;
 

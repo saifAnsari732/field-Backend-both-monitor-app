@@ -28,6 +28,7 @@ const liveLocationSchema = new mongoose.Schema({
   selfieUrl:           { type: String, default: null },
   totalDistance:       { type: Number, default: 0 },     // km, written with $max (never decreases)
   manualDistanceAdded: { type: Number, default: 0 },     // admin KM credit
+  manualAdjustmentReason: { type: String, default: null }, // audit note for adjustment
   // ─── AGTRIE-X v7 Session Audit Ledger ───────────
   unverifiedDistance:  { type: Number, default: 0 },     // Distance from poor GPS that couldn't be verified
   officialDistance:    { type: Number, default: 0 },     // Final authoritative KM = accepted + recovered
