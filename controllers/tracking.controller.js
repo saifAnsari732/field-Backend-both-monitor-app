@@ -129,6 +129,7 @@ exports.updateLocation = async (req, res) => {
     }
 
     // ── Step 2: Batch eventId deduplication (1 query for full batch instead of N queries) ──
+    const orderedCoordinates = [...coordinates].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
     const incomingEventIds = orderedCoordinates.map(c => c?.eventId).filter(Boolean);
     const existingEventIdSet = new Set();
     if (incomingEventIds.length > 0) {
