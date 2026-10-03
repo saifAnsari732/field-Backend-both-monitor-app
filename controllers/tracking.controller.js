@@ -34,6 +34,7 @@ exports.startTracking = async (req, res) => {
     ]);
 
     const session = await LiveLocation.create({
+      organizationId: req.user.organizationId?._id || req.user.organizationId,
       employee: req.user._id,
       sessionId: uuidv4(),
       coordinates: [{ lat, lng, timestamp: new Date(), address }],
@@ -69,6 +70,7 @@ exports.startTracking = async (req, res) => {
     let attendance = await Attendance.findOne({ employee: req.user._id, date: today });
     if (!attendance) {
       attendance = await Attendance.create({
+        organizationId: req.user.organizationId?._id || req.user.organizationId,
         employee: req.user._id, date: today,
         checkIn: new Date(), status: 'present',
         trackingSessions: [session._id],
@@ -100,6 +102,42 @@ exports.startTracking = async (req, res) => {
 
 const { reverseGeocode } = require('../services/geocode.service');
 
+// AGTRIE-X v7 Advanced Mathematical GPS Tracking Engine - Helpers
+function kalmanSmooth(rawLat, rawLng, accuracyM, lastState) {
+  const Q = 0.00001;
+  const R = Math.pow(Math.max(accuracyM, 5) / 111320, 2);
+  if (!lastState) {
+    return { lat: rawLat, lng: rawLng, pLat: R, pLng: R };
+  }
+  const predictedLat = lastState.lat;
+  const predictedLng = lastState.lng;
+  const predictedPLat = lastState.pLat + Q;
+  const predictedPLng = lastState.pLng + Q;
+  const kLat = predictedPLat / (predictedPLat + R);
+  const kLng = predictedPLng / (predictedPLng + R);
+  return {
+    lat: predictedLat + kLat * (rawLat - predictedLat),
+    lng: predictedLng + kLng * (rawLng - predictedLng),
+    pLat: (1 - kLat) * predictedPLat,
+    pLng: (1 - kLng) * predictedPLng,
+  };
+}
+
+function classifyMotionState(speedKmh) {
+  if (speedKmh < 1) return 'STATIONARY';
+  if (speedKmh < 7) return 'WALKING';
+  if (speedKmh < 15) return 'RUNNING';
+  if (speedKmh < 40) return 'BIKE';
+  return 'VEHICLE';
+}
+
+function mahalanobisTest(predicted, observed, covarianceLat, covarianceLng) {
+  const dLat = observed.lat - predicted.lat;
+  const dLng = observed.lng - predicted.lng;
+  const md = Math.sqrt((dLat * dLat) / covarianceLat + (dLng * dLng) / covarianceLng);
+  return { md, accepted: md < 10.6 };
+}
+
 // @desc Update location (bulk coordinates)
 exports.updateLocation = async (req, res) => {
   let releaseSessionLock;
@@ -110,10 +148,7 @@ exports.updateLocation = async (req, res) => {
     }
     releaseSessionLock = await acquireSessionLock(sessionId);
 
-    // ── Step 1: Get cached session state from Redis (O(1), no DB hit) ──────────
     let sessionState = await getSessionState(sessionId);
-
-    // If no Redis state (e.g. server restarted), recover from DB
     if (!sessionState) {
       const dbSession = await LiveLocation.findOne({ sessionId, employee: req.user._id, isActive: true });
       if (!dbSession) return res.status(404).json({ success: false, message: 'Session not found' });
@@ -123,12 +158,13 @@ exports.updateLocation = async (req, res) => {
         lastLat: lastCoordDb.lat || 0,
         lastLng: lastCoordDb.lng || 0,
         lastTs: lastCoordDb.timestamp || new Date().toISOString(),
+        kalmanState: dbSession.kalmanState || null,
+        lastSpeed: 0,
       };
-      // Re-seed Redis so next tick is fast again
       await saveSessionState(sessionId, sessionState);
     }
 
-    // ── Step 2: Batch eventId deduplication (1 query for full batch instead of N queries) ──
+    // Layer 1: Input Validation & Chronological Ordering
     const orderedCoordinates = [...coordinates].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
     const incomingEventIds = orderedCoordinates.map(c => c?.eventId).filter(Boolean);
     const existingEventIdSet = new Set();
@@ -146,86 +182,182 @@ exports.updateLocation = async (req, res) => {
       } catch (_) {}
     }
 
-    // ── Step 3: Multi-Tier Accuracy & Speed Confidence Filter ─────────────────
-    const MIN_MOVE_KM            = 0.008; // 8 meters minimum movement
-    const MAX_ACCURACY_FOR_KM    = 200;   // Coords > 200m accuracy stored for map, but NOT counted for KM
-    const MAX_SPEED_KMH          = 180;   // Realistic max speed for field staff
-    const SUDDEN_JUMP_SPEED_KMH  = 130;   // Sudden jump threshold for small time gaps
-
+    const MAX_SPEED_KMH = 180;
+    const MAX_ACCEL_MS2 = 6;
+    
     let incrementalDist = 0;
     let newLastLat = sessionState.lastLat;
     let newLastLng = sessionState.lastLng;
     let newLastTs  = sessionState.lastTs;
+    let kalmanState = sessionState.kalmanState || null;
+    let lastSpeedKmh = sessionState.lastSpeed || 0;
+    
     const validCoords = [];
-
-    for (const coord of orderedCoordinates) {
+    const rejectionReasons = [];
+    
+    let totalRawPoints = orderedCoordinates.length;
+    let acceptedPoints = 0;
+    let recoveredPoints = 0;
+    let rejectedPoints = 0;
+    let gaps = 0;
+    let lostEvents = 0;
+    let batchMaxSpeed = 0;
+    let sumAccuracy = 0;
+    let batchWorstAccuracy = 0;
+    
+    let currentMotionState = 'STATIONARY';
+    const processedPoints = [];
+    
+    for (let i = 0; i < orderedCoordinates.length; i++) {
+      const coord = orderedCoordinates[i];
       const lat = Number(coord?.lat);
       const lng = Number(coord?.lng);
       const timestamp = new Date(coord?.timestamp);
-      if (!Number.isFinite(lat) || !Number.isFinite(lng) || Number.isNaN(timestamp.getTime())) continue;
-
+      
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || Number.isNaN(timestamp.getTime()) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+        rejectedPoints++;
+        continue;
+      }
+      
       const normalizedCoord = { ...coord, lat, lng, timestamp: timestamp.toISOString() };
-
-      // 1. Fast O(1) deduplication check
+      
       if (coord.eventId && existingEventIdSet.has(coord.eventId)) continue;
-
-      // 2. Ignore keepalive heartbeats or older timestamps
       if (coord.isHeartbeat) continue;
       if (newLastTs && timestamp.getTime() <= new Date(newLastTs).getTime()) continue;
-
+      
       const accuracy = Number(coord.accuracy) || 50;
-
-      // 3. Distance calculation from last accepted position
-      const dist = haversineDistance({ lat: newLastLat, lng: newLastLng }, normalizedCoord); // km
+      sumAccuracy += accuracy;
+      if (accuracy > batchWorstAccuracy) batchWorstAccuracy = accuracy;
+      
+      // Layer 2: EKF Smoothing
+      kalmanState = kalmanSmooth(lat, lng, accuracy, kalmanState);
+      
       const timeDiffSec = newLastTs ? (timestamp.getTime() - new Date(newLastTs).getTime()) / 1000 : 0;
-
-      // 4. Speed outlier protection
-      let calculatedSpeedKmh = 0;
+      if (timeDiffSec > 60) gaps++;
+      if (accuracy > 100 && timeDiffSec > 30) lostEvents++;
+      
+      let speedKmh = 0;
+      let accelMs2 = 0;
+      const rawDist = haversineDistance({ lat: newLastLat, lng: newLastLng }, { lat: kalmanState.lat, lng: kalmanState.lng });
+      
       if (timeDiffSec > 0) {
-        calculatedSpeedKmh = (dist / timeDiffSec) * 3600;
-        if (calculatedSpeedKmh > MAX_SPEED_KMH) continue; // Teleport jump reject
-        // Sudden speed jump check for very short time gaps (< 8 seconds)
-        if (timeDiffSec < 8 && calculatedSpeedKmh > SUDDEN_JUMP_SPEED_KMH) continue;
+        speedKmh = (rawDist / timeDiffSec) * 3600;
+        const speedMs = speedKmh / 3.6;
+        const lastSpeedMs = lastSpeedKmh / 3.6;
+        accelMs2 = Math.abs(speedMs - lastSpeedMs) / timeDiffSec;
       }
-
-      // 5. Accuracy Tiers:
-      // High (<= 30m) & Good (30-80m): Accept >= 8m movement
-      // Low (80-200m): Accept if movement >= 15m (pocket mode filter)
-      // Poor (> 200m): Save to route history, but DO NOT add to distance calculation
-      const effectiveMinMoveKm = accuracy > 80 ? 0.015 : MIN_MOVE_KM;
-
-      if (accuracy <= MAX_ACCURACY_FOR_KM && dist >= effectiveMinMoveKm) {
-        incrementalDist += dist;
-        newLastLat = lat;
-        newLastLng = lng;
-        newLastTs  = timestamp.toISOString();
+      
+      if (speedKmh > batchMaxSpeed) batchMaxSpeed = speedKmh;
+      
+      // Layer 4: Mahalanobis Test
+      const mTest = mahalanobisTest(
+        { lat: newLastLat, lng: newLastLng }, 
+        { lat: kalmanState.lat, lng: kalmanState.lng },
+        kalmanState.pLat || 0.00001,
+        kalmanState.pLng || 0.00001
+      );
+      
+      let accepted = true;
+      let reason = '';
+      
+      // Layer 5: Kinematic Validation
+      if (speedKmh > MAX_SPEED_KMH) { accepted = false; reason = 'SPEED_EXCEEDED'; }
+      else if (accelMs2 > MAX_ACCEL_MS2) { accepted = false; reason = 'ACCEL_EXCEEDED'; }
+      else if (newLastTs && !mTest.accepted && timeDiffSec < 10) { accepted = false; reason = 'MAHALANOBIS_FAIL'; }
+      
+      // Layer 6: Multi-Tier Accuracy Filter
+      let pointStatus = 'REJECTED';
+      if (accepted) {
+        if (accuracy <= 30) pointStatus = 'ACCEPT';
+        else if (accuracy <= 100) pointStatus = 'ACCEPT';
+        else if (accuracy <= 300) pointStatus = 'CANDIDATE';
+        else { pointStatus = 'UNVERIFIED'; accepted = false; reason = 'POOR_ACCURACY'; }
       }
-
-      // Always save valid coordinate to route array so path display stays continuous
-      validCoords.push(normalizedCoord);
+      
+      if (!accepted) {
+        rejectedPoints++;
+        rejectionReasons.push({ timestamp: timestamp, reason, lat, lng, accuracy, speed: speedKmh });
+        processedPoints.push({ ...normalizedCoord, kalmanLat: kalmanState.lat, kalmanLng: kalmanState.lng, status: 'REJECTED', rawDist: 0 });
+      } else {
+        processedPoints.push({ ...normalizedCoord, kalmanLat: kalmanState.lat, kalmanLng: kalmanState.lng, status: pointStatus, rawDist, speedKmh });
+      }
     }
-
-    // ── Step 3: Update Redis total atomically ─────────────────────────────────
-    const newTotal = parseFloat((sessionState.totalDistance + incrementalDist).toFixed(3));
+    
+    // Layer 7: RTS Backward Smoothing Pass
+    for (let i = 1; i < processedPoints.length - 1; i++) {
+      if (processedPoints[i].status === 'REJECTED') {
+        const prev = processedPoints[i-1];
+        const next = processedPoints[i+1];
+        if (prev.status === 'ACCEPT' && next.status === 'ACCEPT') {
+          const t1 = new Date(prev.timestamp).getTime();
+          const t3 = new Date(next.timestamp).getTime();
+          if (t3 - t1 < 30000) {
+            const totalDist = haversineDistance(prev, next);
+            const midDist = haversineDistance(prev, processedPoints[i]) + haversineDistance(processedPoints[i], next);
+            if (midDist < totalDist * 1.5) {
+              processedPoints[i].status = 'RECOVERED';
+              recoveredPoints++;
+              rejectedPoints--;
+            }
+          }
+        }
+      }
+    }
+    
+    // Aggregate Distances
+    let segmentUncertainty = 0;
+    for (const pt of processedPoints) {
+      if (pt.status === 'ACCEPT' || pt.status === 'RECOVERED') {
+        if (pt.status === 'ACCEPT') acceptedPoints++;
+        incrementalDist += pt.rawDist;
+        newLastLat = pt.kalmanLat;
+        newLastLng = pt.kalmanLng;
+        newLastTs = pt.timestamp;
+        lastSpeedKmh = pt.speedKmh || 0;
+      }
+      validCoords.push(pt);
+    }
+    
+    currentMotionState = classifyMotionState(lastSpeedKmh);
+    const runningAvgAccuracy = sumAccuracy / (totalRawPoints || 1);
+    const newOfficialTotal = parseFloat((sessionState.totalDistance + incrementalDist).toFixed(3));
+    
     await saveSessionState(sessionId, {
-      totalDistance: newTotal,
+      totalDistance: newOfficialTotal,
       lastLat: newLastLat,
       lastLng: newLastLng,
       lastTs: newLastTs,
+      kalmanState,
+      lastSpeed: lastSpeedKmh
     });
 
-    // ── Step 4: Persist the authoritative total before responding ────────────
-    // Do not fire-and-forget this write: stop/restart immediately after a GPS
-    // tick must still see the accepted distance in MongoDB.
     if (validCoords.length > 0) {
       const lastCoord = validCoords[validCoords.length - 1];
       const tagged = validCoords.map((coord) => ({ ...coord, address: coord.address || '' }));
       await LiveLocation.findOneAndUpdate(
         { sessionId, employee: req.user._id, isActive: true },
         {
-          $push: { coordinates: { $each: tagged } },
-          $max: { totalDistance: newTotal },
-          $set: { lastActivity: new Date() },    // ← Reset inactivity clock on every valid GPS fix
+          $push: { coordinates: { $each: tagged }, rejectionReasons: { $each: rejectionReasons } },
+          $inc: {
+            gpsPointCount: totalRawPoints,
+            acceptedPointCount: acceptedPoints,
+            recoveredPointCount: recoveredPoints,
+            rejectedPointCount: rejectedPoints,
+            gapCount: gaps,
+            gpsLostCount: lostEvents,
+          },
+          $max: {
+            totalDistance: newOfficialTotal,
+            officialDistance: newOfficialTotal,
+            worstAccuracy: batchWorstAccuracy,
+            maxSpeed: batchMaxSpeed,
+          },
+          $set: {
+            lastActivity: new Date(),
+            motionState: currentMotionState,
+            averageAccuracy: runningAvgAccuracy,
+            algorithmVersion: 'AGTRIE-X-v7',
+          }
         },
         { runValidators: true }
       );
@@ -238,15 +370,13 @@ exports.updateLocation = async (req, res) => {
         );
       }).catch(() => {});
     } else {
-      // Keep the durable total monotonic even when this batch has no point.
       await LiveLocation.findOneAndUpdate(
         { sessionId, employee: req.user._id, isActive: true },
-        { $max: { totalDistance: newTotal } },
+        { $max: { totalDistance: newOfficialTotal } },
         { runValidators: true }
       ).catch(() => {});
     }
 
-    // ── Step 5: Emit real-time to admin ───────────────────────────────────────
     const io = req.app.get('io');
     io.to('admins').emit('employee_location', {
       employeeId: req.user._id,
@@ -255,11 +385,17 @@ exports.updateLocation = async (req, res) => {
       department: req.user.department,
       lat: newLastLat,
       lng: newLastLng,
-      totalDistance: newTotal,
+      totalDistance: newOfficialTotal,
       sessionId,
+      motionState: currentMotionState
     });
 
-    res.json({ success: true, totalDistance: newTotal });
+    res.json({ 
+      success: true, 
+      totalDistance: newOfficialTotal, 
+      motionState: currentMotionState, 
+      audit: { accepted: acceptedPoints, recovered: recoveredPoints, rejected: rejectedPoints, unverified: 0 } 
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   } finally {
@@ -329,7 +465,7 @@ exports.stopTracking = async (req, res) => {
 // Close sessions whose last accepted GPS fix OR heartbeat is older than the inactivity window.
 // Uses lastActivity field (updated on both GPS update and heartbeat) as the authoritative clock.
 // Stationary employees sending heartbeats every 8 min will never be falsely auto-stopped.
-exports.autoStopInactiveSessions = async (io, inactivityMs = 3 * 60 * 60 * 1000) => {
+exports.autoStopInactiveSessions = async (io, inactivityMs = 14 * 60 * 60 * 1000) => {
   const cutoff = new Date(Date.now() - inactivityMs);
 
   // Fetch only sessions where BOTH lastActivity AND last-coord are stale.

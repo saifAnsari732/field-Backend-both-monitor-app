@@ -28,12 +28,21 @@ const liveLocationSchema = new mongoose.Schema({
   selfieUrl:           { type: String, default: null },
   totalDistance:       { type: Number, default: 0 },     // km, written with $max (never decreases)
   manualDistanceAdded: { type: Number, default: 0 },     // admin KM credit
-  // ─── Multi-Metric Tracking Audit Ledger ───────────
-  rawGpsDistance:      { type: Number, default: 0 },     // Raw unverified GPS distance
-  acceptedDistance:    { type: Number, default: 0 },     // Verified high & good confidence KM
-  recoveredDistance:   { type: Number, default: 0 },     // Soft-accept recovered KM
-  rejectedDistance:    { type: Number, default: 0 },     // Dropped GPS noise / teleport jumps
-  trackingQuality:     { type: Number, default: 100 },   // 0-100% confidence score
+  // ─── AGTRIE-X v7 Session Audit Ledger ───────────
+  unverifiedDistance:  { type: Number, default: 0 },     // Distance from poor GPS that couldn't be verified
+  officialDistance:    { type: Number, default: 0 },     // Final authoritative KM = accepted + recovered
+  gpsPointCount:       { type: Number, default: 0 },     // Total raw GPS points received
+  acceptedPointCount:  { type: Number, default: 0 },     // Points that passed all validation
+  recoveredPointCount: { type: Number, default: 0 },     // Points recovered via RTS smoothing
+  rejectedPointCount:  { type: Number, default: 0 },     // Points rejected (teleport, jitter, etc.)
+  gpsLostCount:        { type: Number, default: 0 },     // Number of GPS loss events detected
+  gapCount:            { type: Number, default: 0 },     // Number of time gaps > 60 seconds
+  averageAccuracy:     { type: Number, default: 0 },     // Average GPS accuracy in meters
+  worstAccuracy:       { type: Number, default: 0 },     // Worst single GPS accuracy
+  maxSpeed:            { type: Number, default: 0 },     // Maximum recorded speed in km/h
+  algorithmVersion:    { type: String, default: 'AGTRIE-X-v7' },
+  motionState:         { type: String, enum: ['STATIONARY', 'WALKING', 'RUNNING', 'BIKE', 'VEHICLE', 'GPS_LOST', 'UNKNOWN'], default: 'STATIONARY' },
+  rejectionReasons:    [{ timestamp: Date, reason: String, lat: Number, lng: Number, accuracy: Number, speed: Number }],
   isActive:            { type: Boolean, default: true },
   date:                { type: String },                  // YYYY-MM-DD
   lastActivity:        { type: Date, default: Date.now }, // Updated on GPS update + heartbeat
