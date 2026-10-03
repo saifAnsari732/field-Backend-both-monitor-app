@@ -55,7 +55,8 @@ const formatAddress = (result) => {
 };
 
 const reverseGeocode = async (lat, lng) => {
-  const cacheKey = `geo:${parseFloat(lat).toFixed(5)},${parseFloat(lng).toFixed(5)}`;
+  // 3 decimal places (~110m resolution) is ideal for address geocoding and maximizes cache hits
+  const cacheKey = `geo:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
   
   const cachedValue = await geocodeCache.get(cacheKey);
   if (cachedValue) return cachedValue;
@@ -68,9 +69,6 @@ const reverseGeocode = async (lat, lng) => {
 
   try {
     const url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${cleanLat},${cleanLng}&key=${apiKey}&language=en`;
-    
-    // Log the request for debugging (mask the key)
-    console.log(`🌐 Geocoding Request: ${url.replace(apiKey, 'AIza...XXXX')}`);
 
     const response = await fetch(url);
     const data = await response.json();
@@ -83,8 +81,6 @@ const reverseGeocode = async (lat, lng) => {
     }
 
     if (data.results && data.results.length > 0) {
-      console.log('📡 Google returned', data.results.length, 'results');
-      
       // Aggressively prioritize the most specific landmarks/buildings
       const bestResult = data.results.sort((a, b) => {
         const getScore = (res) => {
@@ -112,7 +108,6 @@ const reverseGeocode = async (lat, lng) => {
       })[0];
 
       const result = formatAddress(bestResult);
-      console.log('🎯 SELECTED BEST (Formatted):', result);
       await geocodeCache.set(cacheKey, result);
       return result;
     }

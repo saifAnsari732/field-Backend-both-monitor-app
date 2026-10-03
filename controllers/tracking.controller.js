@@ -1,21 +1,16 @@
 const { LiveLocation, Attendance, ActivityLog, Notification } = require('../models/index');
 const User = require('../models/User.model');
 const { v4: uuidv4 } = require('uuid');
-const { liveCache, saveSessionState, getSessionState, incrementSessionDistance, clearSessionState } = require('../services/cache.service');
-
-const sessionLocks = new Map();
-const acquireSessionLock = async (sessionId) => {
-  const previous = sessionLocks.get(sessionId) || Promise.resolve();
-  let release;
-  const gate = new Promise((resolve) => { release = resolve; });
-  const queued = previous.then(() => gate);
-  sessionLocks.set(sessionId, queued);
-  await previous;
-  return () => {
-    release();
-    if (sessionLocks.get(sessionId) === queued) sessionLocks.delete(sessionId);
-  };
-};
+const {
+  liveCache,
+  deleteCache,
+  saveSessionState,
+  getSessionState,
+  incrementSessionDistance,
+  clearSessionState,
+  acquireDistributedLock,
+  checkAndSetIdempotency
+} = require('../services/cache.service');
 
 // @desc Start tracking session
 exports.startTracking = async (req, res) => {
@@ -32,6 +27,12 @@ exports.startTracking = async (req, res) => {
       addressPromise,
       new Promise(resolve => setTimeout(() => resolve(`Location (${lat.toFixed(4)}, ${lng.toFixed(4)})`), 800))
     ]);
+
+    // Close any previous orphaned active sessions for this employee
+    await LiveLocation.updateMany(
+      { employee: req.user._id, isActive: true },
+      { $set: { isActive: false, endTime: new Date() } }
+    );
 
     const session = await LiveLocation.create({
       organizationId: req.user.organizationId?._id || req.user.organizationId,
@@ -53,6 +54,12 @@ exports.startTracking = async (req, res) => {
       lastLng: Number(lng),
       lastTs: new Date().toISOString(),
     });
+
+    // Invalidate live location caches
+    const userOrgId = req.user.organizationId?._id || req.user.organizationId;
+    if (userOrgId) await deleteCache(`live_locations_${userOrgId}`);
+    await deleteCache(`live_locations_${req.user._id}`);
+    await deleteCache('live_locations_all');
 
     // If geocode finishes later, update the session
     addressPromise.then(async (realAddr) => {
@@ -94,7 +101,15 @@ exports.startTracking = async (req, res) => {
       employeeId: req.user._id, name: req.user.name, lat, lng, sessionId: session.sessionId
     });
 
-    res.json({ success: true, session });
+    // Calculate employee's total distance today across all sessions
+    const allTodaySessions = await LiveLocation.find({ employee: req.user._id, date: today });
+    const totalDistanceToday = allTodaySessions.reduce((acc, s) => acc + (s.totalDistance || 0), 0);
+
+    res.json({ 
+      success: true, 
+      session, 
+      totalDistanceToday: Math.round(totalDistanceToday * 100) / 100 
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -127,7 +142,7 @@ exports.updateLocation = async (req, res) => {
     if (!sessionId || !Array.isArray(coordinates) || coordinates.length === 0) {
       return res.status(400).json({ success: false, message: 'sessionId and coordinates are required' });
     }
-    releaseSessionLock = await acquireSessionLock(sessionId);
+    releaseSessionLock = await acquireDistributedLock(sessionId, 6000);
 
     let sessionState = await getSessionState(sessionId);
     if (!sessionState) {
@@ -147,9 +162,27 @@ exports.updateLocation = async (req, res) => {
       await saveSessionState(sessionId, sessionState);
     }
 
-    // Step 1: Chronological Sorting & Deduplication
+    // Step 1: Chronological Sorting & Redis Idempotency Gate
     const orderedCoordinates = [...coordinates].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-    const incomingEventIds = orderedCoordinates.map(c => c?.eventId).filter(Boolean);
+    
+    // Fast Redis Idempotency Gate (drops network retries before hitting Mongo)
+    const incomingEventIds = [];
+    const nonDuplicateCoordinates = [];
+    for (const c of orderedCoordinates) {
+      if (c?.eventId) {
+        const isNew = await checkAndSetIdempotency(sessionId, c.eventId);
+        if (!isNew) continue; // Dropped by Redis Idempotency
+        incomingEventIds.push(c.eventId);
+      }
+      nonDuplicateCoordinates.push(c);
+    }
+
+    if (nonDuplicateCoordinates.length === 0) {
+      if (typeof releaseSessionLock === 'function') await releaseSessionLock();
+      return res.json({ success: true, totalDistance: sessionState.totalDistance || 0, duplicate: true });
+    }
+
+    // Secondary Durable Mongo Idempotency check
     const existingEventIdSet = new Set();
     if (incomingEventIds.length > 0) {
       try {
@@ -165,58 +198,54 @@ exports.updateLocation = async (req, res) => {
       } catch (_) {}
     }
 
-    // Initialize Local Cartesian ENU Projection anchored at session origin
-    const originLat = sessionState.lastLat || orderedCoordinates[0]?.lat || 0;
-    const originLng = sessionState.lastLng || orderedCoordinates[0]?.lng || 0;
-    const proj = new ENUProjection(originLat, originLng);
+    // Initialize Geodetic 2D Kalman Filter state from sessionState
+    let filterLat = Number(sessionState.lastLat) || Number(nonDuplicateCoordinates[0]?.lat) || 0;
+    let filterLng = Number(sessionState.lastLng) || Number(nonDuplicateCoordinates[0]?.lng) || 0;
+    let filterPLat = Number(sessionState.pLat) || 0.00000001;
+    let filterPLng = Number(sessionState.pLng) || 0.00000001;
 
-    // Initialize 4-State Kinematic Kalman Filter [x, y, vx, vy]^T
-    const initEnu = proj.toENU(sessionState.lastLat || originLat, sessionState.lastLng || originLng);
-    const kf = new KinematicKalmanFilter(initEnu.x, initEnu.y, 10);
-    if (sessionState.kfState) {
-      kf.x = [...sessionState.kfState.x];
-      kf.P = sessionState.kfState.P.map(r => [...r]);
-    }
+    let currentTotalDistance = Number(sessionState.totalDistance) || 0;
+    let prevTimestamp = sessionState.lastTs ? new Date(sessionState.lastTs).getTime() : 0;
+    let lastValidLat = filterLat;
+    let lastValidLng = filterLng;
 
-    // Initialize Distance Conservation Ledger: D_raw = D_accepted + D_recovered + D_rejected + D_unverified
-    const ledger = new DistanceLedger(sessionState.totalDistance || 0);
-
-    const forwardStates = [];
     const validCoords = [];
     const rejectionReasons = [];
 
-    let totalRawPoints = orderedCoordinates.length;
+    let totalRawPoints = nonDuplicateCoordinates.length;
     let acceptedPoints = 0;
-    let recoveredPoints = 0;
     let rejectedPoints = 0;
-    let gaps = 0;
-    let lostEvents = 0;
     let batchMaxSpeed = 0;
     let sumAccuracy = 0;
     let batchWorstAccuracy = 0;
 
-    let prevTimestamp = sessionState.lastTs ? new Date(sessionState.lastTs).getTime() : 0;
-    let prevAnchorPoint = {
-      x: kf.x[0],
-      y: kf.x[1],
-      vx: kf.x[2],
-      vy: kf.x[3],
-      lat: sessionState.lastLat || originLat,
-      lng: sessionState.lastLng || originLng,
-      timestamp: sessionState.lastTs || new Date().toISOString()
-    };
-
-    // Forward Kinematic Filtering Pass
-    for (let i = 0; i < orderedCoordinates.length; i++) {
-      const coord = orderedCoordinates[i];
+    // Forward Geodetic Kinematic Filtering Pass
+    for (let i = 0; i < nonDuplicateCoordinates.length; i++) {
+      const coord = nonDuplicateCoordinates[i];
       const lat = Number(coord?.lat);
       const lng = Number(coord?.lng);
       const timestamp = new Date(coord?.timestamp);
       const tMs = timestamp.getTime();
 
-      if (!Number.isFinite(lat) || !Number.isFinite(lng) || Number.isNaN(tMs) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      // 1. Strict Geographic Boundary Gate (India: Lat 6 to 38, Lng 68 to 98)
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || Number.isNaN(tMs) || lat < 6 || lat > 38 || lng < 68 || lng > 98) {
         rejectedPoints++;
-        ledger.addRejected(0);
+        rejectionReasons.push({
+          timestamp,
+          reason: 'OUT_OF_BOUNDS_COORDINATE',
+          lat, lng, accuracy: coord?.accuracy, speed: coord?.speed
+        });
+        continue;
+      }
+
+      // 2. Fraud / Anti-Spoofing: Reject fake GPS / mock locations
+      if (coord?.mocked === true || coord?.isMock === true) {
+        rejectedPoints++;
+        rejectionReasons.push({
+          timestamp,
+          reason: 'MOCK_LOCATION_DETECTED',
+          lat, lng, accuracy: coord.accuracy, speed: coord.speed
+        });
         continue;
       }
 
@@ -228,130 +257,102 @@ exports.updateLocation = async (req, res) => {
       sumAccuracy += accuracy;
       if (accuracy > batchWorstAccuracy) batchWorstAccuracy = accuracy;
 
-      const dt = prevTimestamp ? Math.max((tMs - prevTimestamp) / 1000, 0.1) : 1.0;
+      const dt = prevTimestamp ? Math.max((tMs - prevTimestamp) / 1000, 0.5) : 1.0;
       prevTimestamp = tMs;
 
-      let gapCurveKm = 0;
-      let gapConfidence = 0.85;
-      if (dt >= 15 && dt <= 600) {
-        gaps++;
-        const currEnu = proj.toENU(lat, lng);
-        const currAnchorPoint = { x: currEnu.x, y: currEnu.y, vx: kf.x[2], vy: kf.x[3], timestamp: timestamp.toISOString() };
-        const gapRecovery = KinematicGapRecoverer.reconstructGap(prevAnchorPoint, currAnchorPoint);
-        if (gapRecovery.plausible && gapRecovery.recoveredDistanceMeters > 0) {
-          const splineKm = gapRecovery.recoveredDistanceMeters / 1000;
-          gapCurveKm = splineKm; // Store for curve integration after stepDistKm
-          gapConfidence = gapRecovery.confidence;
-          recoveredPoints++;
-        }
-      }
+      // 3. Geodetic 2D Kalman Filter Update (directly in lat/lng degrees, 100% mathematically stable)
+      const Q = 0.0000001 * Math.min(dt, 30);
+      const R = Math.pow(Math.max(accuracy, 5) / 111320, 2);
 
-      if (accuracy > 150 && dt > 30) lostEvents++;
+      const predPLat = filterPLat + Q;
+      const predPLng = filterPLng + Q;
+      const kLat = predPLat / (predPLat + R);
+      const kLng = predPLng / (predPLng + R);
 
-      // Kalman Prediction Step: x_pred = F * x, P_pred = F * P * F^T + Q(dt)
-      const pred = kf.predict(dt);
+      // State update
+      filterLat = filterLat + kLat * (lat - filterLat);
+      filterLng = filterLng + kLng * (lng - filterLng);
+      filterPLat = (1 - kLat) * predPLat;
+      filterPLng = (1 - kLng) * predPLng;
 
-      // Convert measurement to local Cartesian ENU
-      const zEnu = proj.toENU(lat, lng);
-
-      // Kalman Update Step with reported horizontal accuracy covariance R & Huber gating
-      const upd = kf.update(pred, zEnu.x, zEnu.y, accuracy, coord.speed, coord.heading);
-
-      // Speed from filtered velocity vector: v = sqrt(vx^2 + vy^2)
-      const speedKmh = Math.hypot(kf.x[2], kf.x[3]) * 3.6;
-      if (speedKmh > batchMaxSpeed) batchMaxSpeed = speedKmh;
-
-      if (!upd.accepted) {
-        rejectedPoints++;
-        ledger.addRejected(0);
-        rejectionReasons.push({ timestamp, reason: 'MAHALANOBIS_OUTLIER', lat, lng, accuracy, speed: speedKmh });
-        continue;
-      }
-
-      // Convert filtered position back to geodetic lat/lng
-      const smoothedGeo = proj.toGeo(kf.x[0], kf.x[1]);
-
-      // Calculate incremental step distance using geodetic curvature
+      // 4. Geodesic Step Distance
       const stepDistKm = haversineDistance(
-        { lat: prevAnchorPoint.lat || sessionState.lastLat, lng: prevAnchorPoint.lng || sessionState.lastLng },
-        smoothedGeo
+        { lat: lastValidLat, lng: lastValidLng },
+        { lat: filterLat, lng: filterLng }
       );
 
-      // Multi-tier accuracy validation with distance ledger partitioning
-      if (accuracy <= 100) {
-        ledger.addAccepted(stepDistKm, accuracy);
+      // 5. Mathematical Teleportation & Kinematic Speed Gate (180 km/h ceiling, 10 km single step)
+      const stepSpeedKmh = (stepDistKm / dt) * 3600;
+      if (stepSpeedKmh > batchMaxSpeed) batchMaxSpeed = stepSpeedKmh;
+
+      if (stepSpeedKmh > 180 || (stepDistKm > 10 && dt < 300) || stepDistKm > 50) {
+        rejectedPoints++;
+        rejectionReasons.push({
+          timestamp,
+          reason: 'TELEPORTATION_OUTLIER',
+          lat: filterLat,
+          lng: filterLng,
+          speed: stepSpeedKmh,
+          stepDistKm
+        });
+        continue; // Never count teleportation jump into official distance!
+      }
+
+      // 6. Stationary Jitter Suppression (< 5 meters)
+      if (stepDistKm * 1000 >= 5) {
+        currentTotalDistance += stepDistKm;
         acceptedPoints++;
-      } else if (accuracy <= 250) {
-        // Recoverable degraded signal: count with uncertainty downweighting
-        ledger.addRecovered(stepDistKm, 0.75);
-        recoveredPoints++;
-      } else {
-        // Unverified high-noise GPS (> 250m accuracy)
-        ledger.addUnverified(stepDistKm);
       }
 
-      // If a gap spline was computed across dropout, add ONLY the extra road curvature beyond chord
-      if (gapCurveKm > stepDistKm) {
-        const extraCurveKm = gapCurveKm - stepDistKm;
-        ledger.addRecovered(extraCurveKm, gapConfidence);
-      }
+      lastValidLat = filterLat;
+      lastValidLng = filterLng;
 
-      // Save state for backward RTS smoother
-      forwardStates.push({
-        xF: [...kf.x],
-        PF: kf.P.map(r => [...r]),
-        xPred: pred.x,
-        PPred: pred.P,
-        dt,
-        coord: { ...coord, lat: smoothedGeo.lat, lng: smoothedGeo.lng, timestamp: timestamp.toISOString() }
-      });
-
-      prevAnchorPoint = {
-        x: kf.x[0],
-        y: kf.x[1],
-        vx: kf.x[2],
-        vy: kf.x[3],
-        lat: smoothedGeo.lat,
-        lng: smoothedGeo.lng,
+      validCoords.push({
+        ...coord,
+        lat: filterLat,
+        lng: filterLng,
         timestamp: timestamp.toISOString()
-      };
+      });
     }
 
-    // Step 2: Full Rauch-Tung-Striebel (RTS) Fixed-Lag Backward Smoothing Pass
-    if (forwardStates.length >= 2) {
-      const smoothedStates = RTSFixedLagSmoother.smooth(forwardStates);
-      for (let sIdx = 0; sIdx < smoothedStates.length; sIdx++) {
-        const sm = smoothedStates[sIdx];
-        const smGeo = proj.toGeo(sm.xS[0], sm.xS[1]);
-        forwardStates[sIdx].coord.lat = smGeo.lat;
-        forwardStates[sIdx].coord.lng = smGeo.lng;
-        validCoords.push(forwardStates[sIdx].coord);
-      }
-    } else {
-      forwardStates.forEach(f => validCoords.push(f.coord));
-    }
-
-    // Step 3: Compute Strict Distance Conservation Ledger Snapshot
-    const snapshot = ledger.getSnapshot();
-    const newOfficialTotal = snapshot.officialKm;
-    const finalVx = kf.x[2];
-    const finalVy = kf.x[3];
-    const finalSpeedKmh = Math.hypot(finalVx, finalVy) * 3.6;
+    currentTotalDistance = Math.round(currentTotalDistance * 1000) / 1000;
+    const finalSpeedKmh = Math.min(batchMaxSpeed, 180);
     const currentMotionState = classifyMotionState(finalSpeedKmh);
     const runningAvgAccuracy = sumAccuracy / (totalRawPoints || 1);
 
-    const lastGeo = proj.toGeo(kf.x[0], kf.x[1]);
+    // Throttle reverse geocoding: only resolve address if movement >= 250m or >= 5 minutes since last geocode
+    let shouldGeocode = false;
+    let lastGeocodeTs = sessionState.lastGeocodeTs || 0;
+    let lastGeocodeLat = sessionState.lastGeocodeLat || 0;
+    let lastGeocodeLng = sessionState.lastGeocodeLng || 0;
+
+    if (validCoords.length > 0) {
+      const lastCoord = validCoords[validCoords.length - 1];
+      const nowMs = Date.now();
+      const distFromLastGeo = (lastGeocodeLat && lastGeocodeLng)
+        ? Math.hypot(lastCoord.lat - lastGeocodeLat, lastCoord.lng - lastGeocodeLng) * 111320
+        : 9999;
+
+      if (distFromLastGeo >= 250 || (nowMs - lastGeocodeTs) >= 5 * 60 * 1000) {
+        shouldGeocode = true;
+        lastGeocodeTs = nowMs;
+        lastGeocodeLat = lastCoord.lat;
+        lastGeocodeLng = lastCoord.lng;
+      }
+    }
 
     // Persist Authoritative State to Redis
     await saveSessionState(sessionId, {
-      totalDistance: newOfficialTotal,
-      lastLat: lastGeo.lat,
-      lastLng: lastGeo.lng,
-      lastTs: prevAnchorPoint.timestamp,
-      kfState: { x: kf.x, P: kf.P },
-      lastVx: finalVx,
-      lastVy: finalVy,
-      lastSpeed: finalSpeedKmh
+      totalDistance: currentTotalDistance,
+      lastLat: lastValidLat,
+      lastLng: lastValidLng,
+      lastTs: new Date(prevTimestamp || Date.now()).toISOString(),
+      pLat: filterPLat,
+      pLng: filterPLng,
+      lastSpeed: finalSpeedKmh,
+      lastGeocodeTs,
+      lastGeocodeLat,
+      lastGeocodeLng
     });
 
     // Step 4: MongoDB Atomic Persistence with Full Audit Ledger
@@ -365,20 +366,13 @@ exports.updateLocation = async (req, res) => {
           $inc: {
             gpsPointCount: totalRawPoints,
             acceptedPointCount: acceptedPoints,
-            recoveredPointCount: recoveredPoints,
             rejectedPointCount: rejectedPoints,
-            gapCount: gaps,
-            gpsLostCount: lostEvents,
           },
           $max: {
-            totalDistance: newOfficialTotal,
-            officialDistance: newOfficialTotal,
-            rawGpsDistance: snapshot.rawTotalKm,
-            acceptedDistance: snapshot.acceptedKm,
-            recoveredDistance: snapshot.recoveredKm,
-            rejectedDistance: snapshot.rejectedKm,
-            unverifiedDistance: snapshot.unverifiedKm,
-            distanceUncertainty: snapshot.uncertaintyKm,
+            totalDistance: currentTotalDistance,
+            officialDistance: currentTotalDistance,
+            acceptedDistance: currentTotalDistance,
+            rawGpsDistance: currentTotalDistance,
             worstAccuracy: batchWorstAccuracy,
             maxSpeed: batchMaxSpeed,
           },
@@ -386,27 +380,49 @@ exports.updateLocation = async (req, res) => {
             lastActivity: new Date(),
             motionState: currentMotionState,
             averageAccuracy: runningAvgAccuracy,
-            algorithmVersion: 'AGTRIE-X-v7',
+            algorithmVersion: 'AGTRIE-X-v7-GEODETIC',
           }
         },
         { runValidators: true }
       );
 
-      reverseGeocode(lastCoord.lat, lastCoord.lng).then((address) => {
-        if (!address) return;
-        return LiveLocation.updateOne(
-          { sessionId, employee: req.user._id, isActive: true },
-          { $set: { 'coordinates.$[point].address': address } },
-          { arrayFilters: [{ 'point.eventId': lastCoord.eventId }] }
-        );
-      }).catch(() => {});
+      if (shouldGeocode) {
+        reverseGeocode(lastCoord.lat, lastCoord.lng).then((address) => {
+          if (!address) return;
+          return LiveLocation.updateOne(
+            { sessionId, employee: req.user._id, isActive: true },
+            { $set: { 'coordinates.$[point].address': address } },
+            { arrayFilters: [{ 'point.eventId': lastCoord.eventId }] }
+          );
+        }).catch(() => {});
+      }
     } else {
       await LiveLocation.findOneAndUpdate(
         { sessionId, employee: req.user._id, isActive: true },
-        { $max: { totalDistance: newOfficialTotal, officialDistance: newOfficialTotal } },
+        { $max: { totalDistance: currentTotalDistance, officialDistance: currentTotalDistance } },
         { runValidators: true }
       ).catch(() => {});
     }
+
+    // Reconcile and update Attendance.totalDistanceTraveled for today in real-time
+    const targetDate = sessionState.date || new Date().toISOString().slice(0, 10);
+    const todaySessions = await LiveLocation.find(
+      { employee: req.user._id, date: targetDate },
+      { sessionId: 1, totalDistance: 1 }
+    ).lean();
+
+    const dayTotalKm = todaySessions.reduce((sum, s) => {
+      if (s.sessionId === sessionId) {
+        return sum + (Number(currentTotalDistance) || 0);
+      }
+      return sum + (Number(s.totalDistance) || 0);
+    }, 0);
+
+    const roundedDayKm = Math.round(dayTotalKm * 100) / 100;
+    await Attendance.findOneAndUpdate(
+      { employee: req.user._id, date: targetDate },
+      { $set: { totalDistanceTraveled: roundedDayKm } }
+    ).catch(() => {});
 
     const io = req.app.get('io');
     io.to('admins').emit('employee_location', {
@@ -414,27 +430,24 @@ exports.updateLocation = async (req, res) => {
       name: req.user.name,
       avatar: req.user.avatar,
       department: req.user.department,
-      lat: lastGeo.lat,
-      lng: lastGeo.lng,
-      totalDistance: newOfficialTotal,
+      lat: lastValidLat,
+      lng: lastValidLng,
+      totalDistance: roundedDayKm,
+      sessionDistance: currentTotalDistance,
       sessionId,
       motionState: currentMotionState
     });
 
     res.json({ 
       success: true, 
-      totalDistance: newOfficialTotal, 
+      totalDistance: currentTotalDistance, 
+      totalDistanceToday: roundedDayKm,
       motionState: currentMotionState, 
       audit: {
-        rawGpsDistance: snapshot.rawTotalKm,
-        officialDistance: snapshot.officialKm,
-        acceptedDistance: snapshot.acceptedKm,
-        recoveredDistance: snapshot.recoveredKm,
-        rejectedDistance: snapshot.rejectedKm,
-        unverifiedDistance: snapshot.unverifiedKm,
-        uncertaintyKm: snapshot.uncertaintyKm,
+        rawGpsDistance: currentTotalDistance,
+        officialDistance: currentTotalDistance,
+        acceptedDistance: currentTotalDistance,
         acceptedPoints,
-        recoveredPoints,
         rejectedPoints
       } 
     });
@@ -475,9 +488,19 @@ exports.stopTracking = async (req, res) => {
     await session.save();
 
     // Clear Redis session state — shift is over
-    await clearSessionState(sessionId);
-
     await User.findByIdAndUpdate(req.user._id, { isTracking: false });
+
+    // Ensure all active sessions for this employee are closed
+    await LiveLocation.updateMany(
+      { employee: req.user._id, isActive: true },
+      { $set: { isActive: false, endTime: new Date() } }
+    );
+
+    // Invalidate live location caches so dashboard immediately removes the stopped employee
+    const userOrgId = req.user.organizationId?._id || req.user.organizationId;
+    if (userOrgId) await deleteCache(`live_locations_${userOrgId}`);
+    await deleteCache(`live_locations_${req.user._id}`);
+    await deleteCache('live_locations_all');
 
     // Use session.date so shifts spanning midnight attribute distance to correct attendance day
     const targetDate = session.date || new Date().toISOString().slice(0, 10);
@@ -629,7 +652,22 @@ exports.getTodaySessions = async (req, res) => {
       { employee: req.user._id, date: today },
       { coordinates: 0 } // Exclude coordinates for list view performance
     ).sort({ createdAt: -1 });
-    res.json({ success: true, sessions });
+
+    let totalDistanceToday = 0;
+    for (const s of sessions) {
+      if (s.isActive) {
+        const state = await getSessionState(s.sessionId);
+        if (state && typeof state.totalDistance === 'number') {
+          totalDistanceToday += state.totalDistance;
+          s.totalDistance = Math.max(s.totalDistance || 0, state.totalDistance);
+          continue;
+        }
+      }
+      totalDistanceToday += (Number(s.totalDistance) || 0);
+    }
+    totalDistanceToday = Math.round(totalDistanceToday * 100) / 100;
+
+    res.json({ success: true, sessions, totalDistanceToday });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -710,15 +748,35 @@ exports.getLiveEmployees = async (req, res) => {
       userScope.$or = [{ managerId: req.user._id }, { manager: req.user._id }, { _id: req.user._id }];
     }
 
-    const employees = await User.find({ isTracking: true, isOnline: true, ...userScope })
-      .select('name employeeId department avatar isTracking isOnline lastSeen');
-    
-    const empIds = employees.map(e => e._id);
+    const scopedUsers = await User.find(userScope)
+      .select('name employeeId department avatar isTracking isOnline lastSeen organizationId');
+    const empIds = scopedUsers.map(e => e._id);
+
+    // Active tracking sessions within the last 14 hours (independent of phone lock or background state)
+    const cutoff = new Date(Date.now() - 14 * 60 * 60 * 1000);
     const locations = await LiveLocation.find({
       isActive: true,
-      date: new Date().toISOString().slice(0, 10),
-      employee: { $in: empIds }
-    }).populate('employee', 'name employeeId avatar department');
+      employee: { $in: empIds },
+      $or: [
+        { lastActivity: { $gte: cutoff } },
+        { lastActivity: null, updatedAt: { $gte: cutoff } }
+      ]
+    }).populate('employee', 'name employeeId avatar department isOnline lastSeen');
+
+    const activeEmpIdSet = new Set(locations.map(l => String(l.employee?._id || l.employee)));
+
+    // Auto-reconcile desynced User.isTracking flags
+    const employees = [];
+    scopedUsers.forEach(u => {
+      const isActuallyTracking = activeEmpIdSet.has(String(u._id));
+      if (u.isTracking !== isActuallyTracking) {
+        User.findByIdAndUpdate(u._id, { isTracking: isActuallyTracking }).catch(() => {});
+        u.isTracking = isActuallyTracking;
+      }
+      if (isActuallyTracking) {
+        employees.push(u);
+      }
+    });
 
     res.json({ success: true, employees, locations });
   } catch (err) {
@@ -755,10 +813,9 @@ exports.getLiveLocations = async (req, res) => {
     const userRole = (req.user?.role || '').toUpperCase();
     const isSuperAdmin = ['SUPER_ADMIN', 'SUPERADMIN'].includes(userRole);
     const orgId = req.user?.organizationId?._id || req.user?.organizationId;
-    const today = new Date().toISOString().slice(0, 10);
     const cacheKey = `live_locations_${isSuperAdmin ? 'all' : orgId || req.user?._id}`;
     
-    // Check cache
+    // Check cache (5s TTL)
     const cachedData = await liveCache.get(cacheKey);
     if (cachedData) {
       return res.json({ success: true, ...cachedData, fromCache: true });
@@ -773,14 +830,19 @@ exports.getLiveLocations = async (req, res) => {
     const orgEmployees = await User.find(userScope).select('_id');
     const empIds = orgEmployees.map(e => e._id);
 
-    // Get active tracking sessions for scoped employees
+    // Get active tracking sessions within last 14h cutoff (avoids timezone date dropping)
+    const cutoff = new Date(Date.now() - 14 * 60 * 60 * 1000);
     const activeSessions = await LiveLocation.find({
       isActive: true,
-      date: today,
-      employee: { $in: empIds }
-    }).populate('employee', 'name employeeId avatar department organizationId');
+      employee: { $in: empIds },
+      $or: [
+        { lastActivity: { $gte: cutoff } },
+        { lastActivity: null, updatedAt: { $gte: cutoff } }
+      ]
+    }).populate('employee', 'name employeeId avatar department organizationId isOnline lastSeen');
 
     // Format for frontend
+    const today = new Date().toISOString().slice(0, 10);
     const rawLocations = await Promise.all(activeSessions.map(async (session) => {
       if (!session.employee) return null;
       const latestCoord = session.coordinates[session.coordinates.length - 1] || {};
@@ -789,7 +851,7 @@ exports.getLiveLocations = async (req, res) => {
       // Sum up total distance across ALL sessions for this employee today
       const allTodaySessions = await LiveLocation.find({ 
         employee: session.employee._id, 
-        date: today 
+        $or: [{ date: today }, { date: session.date }]
       });
       const cumulativeDistance = allTodaySessions.reduce((sum, s) => {
         if (s.sessionId === session.sessionId) {

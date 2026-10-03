@@ -30,6 +30,8 @@ const server = http.createServer(app);
 
 // Keep REST and Socket.IO on the same allow-list so browser preflight behaves consistently.
 const allowedOrigins = new Set([
+  'https://kisanteamapp.online',
+  'https://www.kisanteamapp.online',
   'https://tm24news.com',
   'https://www.tm24news.com',
   'https://kisanteamweb.it.com',
@@ -44,17 +46,30 @@ const allowedOrigins = new Set([
   ...(process.env.CORS_ORIGINS || '').split(',').map((origin) => origin.trim()).filter(Boolean),
 ]);
 
-const isAllowedOrigin = (origin) => !origin || allowedOrigins.has(origin);
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true; // Mobile apps (Expo Go, React Native), curl, Postman
+  if (allowedOrigins.has(origin)) return true;
+  if (
+    origin.endsWith('.kisanteamapp.online') ||
+    origin.endsWith('.tm24news.com') ||
+    origin.endsWith('.vercel.app') ||
+    origin.includes('localhost') ||
+    origin.includes('127.0.0.1') ||
+    origin.includes('192.168.')
+  ) {
+    return true;
+  }
+  return false;
+};
 
 // Socket.IO setup
 const io = new Server(server, {
   cors: {
     origin: (origin, callback) => {
-      // Allow requests with no origin (like mobile apps, curl, or postman)
       if (isAllowedOrigin(origin)) {
         callback(null, true);
       } else {
-        callback(new Error('Not allowed by CORS'));
+        callback(null, false);
       }
     },
     methods: ['GET', 'POST'],
@@ -72,7 +87,7 @@ app.use(cors({
     if (isAllowedOrigin(origin)) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      callback(null, false);
     }
   },
   credentials: true,
@@ -82,13 +97,17 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
+// Health check endpoint (placed BEFORE rate limiter so uptime monitors and CI/CD never get blocked)
+app.get('/api/health', (req, res) => res.json({ status: 'NEW OK AWS Working CI-CD Live Test', timestamp: new Date() }));
+
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 500, // limit each IP to 500 requests per windowMs
+  max: 2000, // relaxed limit for multi-device offices and NAT gateways
   message: { success: false, message: 'Too many requests from this IP, please try again after 15 minutes' },
   standardHeaders: true,
-  legacyHeaders: false, 
+  legacyHeaders: false,
+  skip: (req) => req.path === '/health' || req.path.startsWith('/tracking'),
 });
 app.use('/api/', limiter);
 
@@ -154,9 +173,6 @@ app.get('/api/dashboard/stats', protect, async (req, res) => {
 app.use('/api/leads', require('./routes/lead.routes'));
 //  news api
 app.use('/api', require('./routes/newsRouts'));
-
-// Health check
-app.get('/api/health', (req, res) => res.json({ status: 'NEW OK AWS Working CI-CD Live Test', timestamp: new Date() }));
 
 // Gemini Integration (Moved from test-gemini.js)
 app.post('/api/gemini/generate', async (req, res) => {   
