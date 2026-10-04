@@ -220,7 +220,16 @@ exports.updateLocation = async (req, res) => {
     });
 
     if (rawBatch.length > 0) {
-      await TrackingPoint.bulkWrite(rawBatch, { ordered: false }).catch(() => {});
+      try {
+        await TrackingPoint.bulkWrite(rawBatch, { ordered: false });
+      } catch (rawStoreErr) {
+        console.error('❌ [RAW_GPS_STORE_ERROR] Failed to persist raw GPS telemetry:', rawStoreErr.message);
+        return res.status(500).json({ 
+          success: false, 
+          message: 'Raw GPS persistence failed. Request will be retried by mobile offline queue.',
+          retryable: true 
+        });
+      }
     }
 
     releaseSessionLock = await acquireDistributedLock(sessionId, 6000);
@@ -493,9 +502,17 @@ exports.updateLocation = async (req, res) => {
 
     // Persist DistanceLedger segments to MongoDB (Immutable Audit Ledger)
     if (ledgerSegments.length > 0) {
-      await DistanceLedger.insertMany(ledgerSegments, { ordered: false }).catch((err) => {
-        console.error('DistanceLedger insert warning:', err.message);
-      });
+      try {
+        await DistanceLedger.insertMany(ledgerSegments, { ordered: false });
+      } catch (ledgerErr) {
+        console.error('❌ [DISTANCE_LEDGER_ERROR] Failed to persist distance ledger:', ledgerErr.message);
+        if (typeof releaseSessionLock === 'function') await releaseSessionLock();
+        return res.status(500).json({ 
+          success: false, 
+          message: 'Distance Ledger persistence failed.',
+          retryable: true 
+        });
+      }
     }
 
     // Bulk update TrackingPoint statuses
