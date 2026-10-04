@@ -638,21 +638,25 @@ exports.updateLocation = async (req, res) => {
       ).catch(() => {});
     }
 
-    // Reconcile and update Attendance.totalDistanceTraveled for today in real-time
+    // Reconcile and update Attendance.totalDistanceTraveled from authoritative DistanceLedger
     const targetDate = sessionState.date || dbLiveDoc?.date || new Date().toISOString().slice(0, 10);
-    const todaySessions = await LiveLocation.find(
-      { employee: req.user._id, date: targetDate },
-      { sessionId: 1, totalDistance: 1 }
-    ).lean();
+    const ledgerSumResult = await DistanceLedger.aggregate([
+      { 
+        $match: { 
+          employee: req.user._id, 
+          classification: { $in: ['ACCEPTED', 'RECOVERED'] },
+          createdAt: { 
+            $gte: new Date(`${targetDate}T00:00:00.000Z`), 
+            $lte: new Date(`${targetDate}T23:59:59.999Z`) 
+          } 
+        } 
+      },
+      { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
+    ]);
 
-    const dayTotalKm = todaySessions.reduce((sum, s) => {
-      if (s.sessionId === sessionId) {
-        return sum + (Number(currentTotalDistance) || 0);
-      }
-      return sum + (Number(s.totalDistance) || 0);
-    }, 0);
+    const ledgerTotalKm = ledgerSumResult[0]?.totalKm || 0;
+    const roundedDayKm = Math.round(Math.max(currentTotalDistance, ledgerTotalKm) * 100) / 100;
 
-    const roundedDayKm = Math.round(dayTotalKm * 100) / 100;
     await Attendance.findOneAndUpdate(
       { employee: req.user._id, date: targetDate },
       { $set: { totalDistanceTraveled: roundedDayKm } }
