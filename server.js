@@ -98,9 +98,9 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Health check endpoint (placed BEFORE rate limiter so uptime monitors and CI/CD never get blocked)
-app.get('/api/health', (req, res) => res.json({ status: 'now3 OK AWS Working CI-CD Live Test', timestamp: new Date() }));
+app.get('/api/health', (req, res) => res.json({ status: 'now4 OK AWS Working CI-CD Live Test', timestamp: new Date() }));
 
-// Rate limiting
+// Rate limitingertbetb
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 2000, // relaxed limit for multi-device offices and NAT gateways
