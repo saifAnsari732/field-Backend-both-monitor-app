@@ -579,7 +579,10 @@ exports.updateLocation = async (req, res) => {
       await LiveLocation.findOneAndUpdate(
         { sessionId, employee: req.user._id, isActive: true },
         {
-          $push: { coordinates: { $each: tagged }, rejectionReasons: { $each: rejectionReasons } },
+          $push: { 
+            coordinates: { $each: tagged, $slice: -500 }, 
+            rejectionReasons: { $each: rejectionReasons, $slice: -100 } 
+          },
           $inc: {
             gpsPointCount: totalRawPoints,
             acceptedPointCount: acceptedPoints,
