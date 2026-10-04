@@ -13,19 +13,32 @@ const {
   clearIdempotencyKey
 } = require('../services/cache.service');
 
+// Business date (YYYY-MM-DD) in the given timezone (default IST)
+function getBusinessDate(date = new Date(), timeZone = 'Asia/Kolkata') {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).format(date);
+}
+
 // @desc Start tracking session
 exports.startTracking = async (req, res) => {
   try {
-    const { lat, lng, selfieUrl } = req.body;
+    const { selfieUrl } = req.body;
+    const lat = Number(req.body.lat);
+    const lng = Number(req.body.lng);
     const today = getBusinessDate(new Date(), 'Asia/Kolkata');
+    const hasCoords = Number.isFinite(lat) && Number.isFinite(lng);
 
     // Start geocoding in background to avoid blocking the response
-    const addressPromise = reverseGeocode(lat, lng);
-    
-    const address = await Promise.race([
+    const addressPromise = hasCoords
+      ? Promise.resolve(reverseGeocode(lat, lng)).catch(() => null)
+      : Promise.resolve(null);
+
+    const fallbackAddress = hasCoords ? `Location (${lat.toFixed(4)}, ${lng.toFixed(4)})` : 'Location unavailable';
+    const address = (await Promise.race([
       addressPromise,
-      new Promise(resolve => setTimeout(() => resolve(`Location (${lat.toFixed(4)}, ${lng.toFixed(4)})`), 800))
-    ]);
+      new Promise(resolve => setTimeout(() => resolve(fallbackAddress), 800))
+    ])) || fallbackAddress;
 
     // Check if employee already has an active session (Punch-In Protection)
     const existingActiveSession = await LiveLocation.findOne({
@@ -51,7 +64,7 @@ exports.startTracking = async (req, res) => {
       organizationId: req.user.organizationId?._id || req.user.organizationId,
       employee: req.user._id,
       sessionId: uuidv4(),
-      coordinates: [{ lat, lng, timestamp: new Date(), address }],
+      coordinates: hasCoords ? [{ lat, lng, timestamp: new Date(), address }] : [],
       isActive: true,
       date: today,
       startAddress: address,
@@ -63,8 +76,8 @@ exports.startTracking = async (req, res) => {
     // This keeps live admin responses in sync even while Mongo persistence runs asynchronously.
     await saveSessionState(session.sessionId, {
       totalDistance: 0,
-      lastLat: Number(lat),
-      lastLng: Number(lng),
+      lastLat: hasCoords ? lat : null,
+      lastLng: hasCoords ? lng : null,
       lastTs: new Date().toISOString(),
     });
 
