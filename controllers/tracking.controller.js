@@ -17,31 +17,28 @@ const {
 exports.startTracking = async (req, res) => {
   try {
     const { lat, lng, selfieUrl } = req.body;
-    const today = new Date().toISOString().slice(0, 10);
+    const today = getBusinessDate(new Date(), 'Asia/Kolkata');
 
     // Start geocoding in background to avoid blocking the response
     const addressPromise = reverseGeocode(lat, lng);
     
-    // Create session with temporary address if needed, or wait briefly
-    // To keep it simple and responsive, we'll wait max 500ms for geocode
     const address = await Promise.race([
       addressPromise,
       new Promise(resolve => setTimeout(() => resolve(`Location (${lat.toFixed(4)}, ${lng.toFixed(4)})`), 800))
     ]);
 
-    // Check if employee already has an active session for today (Punch-In Protection)
+    // Check if employee already has an active session (Punch-In Protection)
     const existingActiveSession = await LiveLocation.findOne({
       employee: req.user._id,
       isActive: true,
-      date: today,
-    });
+    }).sort({ createdAt: -1 });
 
     if (existingActiveSession) {
       console.log(`📍 startTracking: Re-attaching to existing active session ${existingActiveSession.sessionId}`);
       await User.findByIdAndUpdate(req.user._id, { isTracking: true });
       return res.status(200).json({
         success: true,
-        message: 'Active shift already exists for today. Reconnected.',
+        message: 'Active shift already exists. Reconnected.',
         sessionId: existingActiveSession.sessionId,
         totalDistance: existingActiveSession.totalDistance || 0,
         totalDistanceToday: existingActiveSession.totalDistance || 0,
@@ -49,12 +46,6 @@ exports.startTracking = async (req, res) => {
         session: existingActiveSession,
       });
     }
-
-    // Close any previous orphaned active sessions from prior days for this employee
-    await LiveLocation.updateMany(
-      { employee: req.user._id, isActive: true },
-      { $set: { isActive: false, endTime: new Date() } }
-    );
 
     const session = await LiveLocation.create({
       organizationId: req.user.organizationId?._id || req.user.organizationId,
