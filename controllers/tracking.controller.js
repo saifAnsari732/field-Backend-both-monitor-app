@@ -437,29 +437,14 @@ exports.updateLocation = async (req, res) => {
       const stepSpeedKmh = (stepDistKm / effectiveDt) * 3600;
       if (stepSpeedKmh > batchMaxSpeed && stepSpeedKmh <= 220) batchMaxSpeed = stepSpeedKmh;
 
-      // 6. Classification & Decision Matrix
-      if (bayesianResult.classification === 'REJECTED' && (stepSpeedKmh > 220 || stepDistKm > 10)) {
-        rejectedPoints++;
-        rejectedEventIds.push(eventId);
-        rejectionReasons.push({
-          timestamp,
-          reason: 'BAYESIAN_OUTLIER_REJECTED',
-          score: bayesianResult.score,
-          lat: filterLat,
-          lng: filterLng,
-          speed: stepSpeedKmh,
-          stepDistKm
-        });
-        filterLat = snap.lat; filterLng = snap.lng; filterPLat = snap.pLat; filterPLng = snap.pLng;
-        continue;
-      }
+      // 6. Mathematical Bayesian & IMM Decision Gate
+      const isMathematicallyValidMovement = 
+        (bayesianResult.classification === 'ACCEPTED' || bayesianResult.classification === 'RECOVERED') &&
+        bayesianResult.motionState !== 'STATIONARY' &&
+        stepDistKm * 1000 >= 5.0 &&
+        stepSpeedKmh <= 220;
 
-      // Check for stationary jitter vs real movement
-      const reportedSpeedMps = Number(coord?.speed) || 0;
-      const isMovement = (stepDistKm * 1000 >= 5) || (reportedSpeedMps >= 0.4 && stepDistKm * 1000 >= 3) || (dt > 120 && stepDistKm * 1000 >= 10);
-
-      if (isMovement) {
-        currentTotalDistance += stepDistKm;
+      if (isMathematicallyValidMovement) {
         acceptedPoints++;
         acceptedEventIds.push(eventId);
 
@@ -478,8 +463,8 @@ exports.updateLocation = async (req, res) => {
           toLng: filterLng,
           distanceMeters: Math.round(stepDistKm * 1000),
           distanceKm: Math.round(stepDistKm * 1000) / 1000,
-          classification: bayesianResult.classification === 'RECOVERED' ? 'RECOVERED' : 'ACCEPTED',
-          reason: dt > 120 ? 'STATIONARY_RESUME' : (bayesianResult.classification === 'RECOVERED' ? 'HERMITE_RECOVERY' : 'NORMAL_STEP'),
+          classification: bayesianResult.classification,
+          reason: bayesianResult.classification === 'RECOVERED' ? 'BAYESIAN_HERMITE_RECOVERY' : 'BAYESIAN_ACCEPTED_STEP',
           algorithmVersion: 'AGTRIE-X-v7.2-DURABLE'
         });
 
@@ -489,6 +474,7 @@ exports.updateLocation = async (req, res) => {
         lastValidLng = filterLng;
         lastEventId = eventId;
       } else {
+        // Stationary drift — raw telemetry is saved in TrackingPoint, but ZERO distance is added to ledger!
         acceptedEventIds.push(eventId);
       }
 
@@ -521,6 +507,15 @@ exports.updateLocation = async (req, res) => {
       }
     }
 
+    // Derive authoritative session total directly from immutable DistanceLedger sum
+    const sessionLedgerAgg = await DistanceLedger.aggregate([
+      { $match: { sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
+      { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
+    ]);
+
+    currentTotalDistance = sessionLedgerAgg[0]?.totalKm || 0;
+    currentTotalDistance = Math.round(currentTotalDistance * 1000) / 1000;
+
     // Bulk update TrackingPoint statuses
     if (acceptedEventIds.length > 0) {
       TrackingPoint.updateMany(
@@ -535,7 +530,6 @@ exports.updateLocation = async (req, res) => {
       ).catch(() => {});
     }
 
-    currentTotalDistance = Math.round(currentTotalDistance * 1000) / 1000;
     const finalSpeedKmh = Math.min(batchMaxSpeed, 220);
     const currentMotionState = classifyMotionState(finalSpeedKmh);
     const runningAvgAccuracy = sumAccuracy / (totalRawPoints || 1);
