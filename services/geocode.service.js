@@ -55,8 +55,14 @@ const formatAddress = (result) => {
 };
 
 const reverseGeocode = async (lat, lng) => {
+  const numLat = Number(lat);
+  const numLng = Number(lng);
+  if (!Number.isFinite(numLat) || !Number.isFinite(numLng) || numLat < -90 || numLat > 90 || numLng < -180 || numLng > 180) {
+    return '';
+  }
+
   // 3 decimal places (~110m resolution) is ideal for address geocoding and maximizes cache hits
-  const cacheKey = `geo:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `geo:${numLat.toFixed(3)},${numLng.toFixed(3)}`;
   
   const cachedValue = await geocodeCache.get(cacheKey);
   if (cachedValue) return cachedValue;
