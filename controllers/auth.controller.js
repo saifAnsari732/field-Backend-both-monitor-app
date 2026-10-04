@@ -71,7 +71,7 @@ exports.refreshToken = async (req, res) => {
 exports.logout = async (req, res) => {
   try {
     await User.findByIdAndUpdate(req.user._id, {
-      isOnline: false, isTracking: false, lastSeen: new Date(), socketId: null
+      isOnline: false, lastSeen: new Date(), socketId: null
     });
     await ActivityLog.create({ employee: req.user._id, action: 'LOGOUT', description: 'User logged out' });
     res.json({ success: true, message: 'Logged out successfully' });
