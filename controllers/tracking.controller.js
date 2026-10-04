@@ -9,7 +9,8 @@ const {
   incrementSessionDistance,
   clearSessionState,
   acquireDistributedLock,
-  checkAndSetIdempotency
+  checkAndSetIdempotency,
+  clearIdempotencyKey
 } = require('../services/cache.service');
 
 // @desc Start tracking session
@@ -506,6 +507,11 @@ exports.updateLocation = async (req, res) => {
         await DistanceLedger.insertMany(ledgerSegments, { ordered: false });
       } catch (ledgerErr) {
         console.error('❌ [DISTANCE_LEDGER_ERROR] Failed to persist distance ledger:', ledgerErr.message);
+        if (incomingEventIds.length > 0) {
+          for (const eid of incomingEventIds) {
+            await clearIdempotencyKey(sessionId, eid).catch(() => {});
+          }
+        }
         if (typeof releaseSessionLock === 'function') await releaseSessionLock();
         return res.status(500).json({ 
           success: false, 

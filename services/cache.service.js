@@ -179,6 +179,12 @@ const checkAndSetIdempotency = async (sessionId, eventId, ttlSec = 86400) => {
   return true;
 };
 
+const clearIdempotencyKey = async (sessionId, eventId) => {
+  if (!eventId) return;
+  const key = `gps:idem:${sessionId}:${eventId}`;
+  await deleteCache(key);
+};
+
 // ─── Exports ───────────────────────────────────────────────────────────────────
 const liveCache = {
   get: getCache,
@@ -203,4 +209,5 @@ module.exports = {
   clearSessionState,
   acquireDistributedLock,
   checkAndSetIdempotency,
+  clearIdempotencyKey,
 };

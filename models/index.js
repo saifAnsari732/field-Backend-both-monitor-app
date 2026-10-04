@@ -112,7 +112,7 @@ const distanceLedgerSchema = new mongoose.Schema({
 
 distanceLedgerSchema.index({ sessionId: 1, fromTimestamp: 1 });
 distanceLedgerSchema.index({ sessionId: 1, toTimestamp: 1 });
-distanceLedgerSchema.index({ sessionId: 1, toEventId: 1 }, { unique: true, sparse: true });
+distanceLedgerSchema.index({ sessionId: 1, fromEventId: 1, toEventId: 1 }, { unique: true, sparse: true });
 distanceLedgerSchema.index({ organizationId: 1, employee: 1, toTimestamp: -1 });
 
 // ─── Meeting ──────────────────────────────────────────────────────────────────
