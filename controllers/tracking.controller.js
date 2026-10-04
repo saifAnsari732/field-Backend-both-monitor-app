@@ -431,22 +431,45 @@ exports.updateLocation = async (req, res) => {
         filterPLng = (1 - kLng) * predPLng;
       }
 
-      // 5. Geodesic Step Distance
-      const stepDistKm = haversineDistance(
-        { lat: lastValidLat, lng: lastValidLng },
-        { lat: filterLat, lng: filterLng }
-      );
+      // 5. AGTRIE-X v8.0 Multi-Model Consensus Engine (Undercount-Averse Policy)
+      // Candidate A: Raw Geodesic WGS84 distance
+      const dRawKm = prevValid
+        ? haversineDistance({ lat: prevValid.latRaw ?? prevValid.lat, lng: prevValid.lngRaw ?? prevValid.lng }, { lat, lng })
+        : 0;
+
+      // Candidate B: Kalman State-Space smoothed distance
+      const dFilteredKm = haversineDistance({ lat: lastValidLat, lng: lastValidLng }, { lat: filterLat, lng: filterLng });
+
+      // Candidate C: Speed-Integrated distance (v_report * dt)
+      const reportedSpeedKmh = Number(coord.speed) > 0 ? (Number(coord.speed) <= 60 ? Number(coord.speed) * 3.6 : Number(coord.speed)) : 0;
+      const dSpeedKm = reportedSpeedKmh > 0 && reportedSpeedKmh <= 220 ? (reportedSpeedKmh * Math.min(dt, 60)) / 3600 : 0;
+
+      // Filter out invalid candidates (> 220 km/h speed threshold)
+      const rawSpeedKmh = dt > 0 ? (dRawKm / dt) * 3600 : 0;
+      const filteredSpeedKmh = dt > 0 ? (dFilteredKm / dt) * 3600 : 0;
+
+      const validCandidates = [];
+      if (rawSpeedKmh <= 220 && accuracy <= 50) validCandidates.push(dRawKm);
+      if (filteredSpeedKmh <= 220) validCandidates.push(dFilteredKm);
+      if (dSpeedKm > 0 && dSpeedKm <= (220 * dt) / 3600) validCandidates.push(dSpeedKm);
+
+      // Undercount-Averse Policy: Choose maximum defensible valid candidate
+      const stepDistKm = validCandidates.length > 0 ? Math.max(...validCandidates) : dFilteredKm;
 
       const effectiveDt = dt > 120 ? Math.max(10, (stepDistKm / 80) * 3600) : dt;
       const stepSpeedKmh = (stepDistKm / effectiveDt) * 3600;
       if (stepSpeedKmh > batchMaxSpeed && stepSpeedKmh <= 220) batchMaxSpeed = stepSpeedKmh;
 
-      // 6. Mathematical Bayesian & IMM Decision Gate
+      // 6. Mathematical Bayesian & IMM Decision Gate (No Hard 5m Drop — Adaptive Micro-Movement)
+      const isStationaryDrift = 
+        bayesianResult.motionState === 'STATIONARY' && 
+        dRawKm * 1000 <= Math.max(accuracy * 0.4, 8) && 
+        reportedSpeedKmh < 1.2;
+
       const isMathematicallyValidMovement = 
-        (bayesianResult.classification === 'ACCEPTED' || bayesianResult.classification === 'RECOVERED') &&
-        bayesianResult.motionState !== 'STATIONARY' &&
-        stepDistKm * 1000 >= 5.0 &&
-        stepSpeedKmh <= 220;
+        !isStationaryDrift &&
+        stepSpeedKmh <= 220 &&
+        stepDistKm * 1000 >= 1.0; // Accept micro-movements (> 1m) when actually moving
 
       if (isMathematicallyValidMovement) {
         acceptedPoints++;
@@ -461,19 +484,19 @@ exports.updateLocation = async (req, res) => {
           toEventId: eventId,
           fromTimestamp: new Date(prevTimestamp - (dt * 1000)),
           toTimestamp: timestamp,
-          fromLat: lastValidLat,
-          fromLng: lastValidLng,
-          toLat: filterLat,
-          toLng: filterLng,
+          fromLat: prevValid?.latRaw ?? lastValidLat,
+          fromLng: prevValid?.lngRaw ?? lastValidLng,
+          toLat: lat,
+          toLng: lng,
           distanceMeters: Math.round(stepDistKm * 1000),
           distanceKm: Math.round(stepDistKm * 1000) / 1000,
           classification: bayesianResult.classification,
-          reason: bayesianResult.classification === 'RECOVERED' ? 'BAYESIAN_HERMITE_RECOVERY' : 'BAYESIAN_ACCEPTED_STEP',
-          algorithmVersion: 'AGTRIE-X-v7.2-DURABLE'
+          reason: 'AGTRIE_X_V8_MULTIMODAL_MAX_CONSENSUS',
+          algorithmVersion: 'AGTRIE-X-v8.0-UNDERCOUNT-AVERSE'
         });
 
         prev2Valid = prevValid;
-        prevValid = { lat: filterLat, lng: filterLng, timestamp: timestamp.toISOString(), heading: coord.heading };
+        prevValid = { lat: filterLat, lng: filterLng, latRaw: lat, lngRaw: lng, accuracy, timestamp: timestamp.toISOString(), heading: coord.heading };
         lastValidLat = filterLat;
         lastValidLng = filterLng;
         lastEventId = eventId;
@@ -732,18 +755,30 @@ exports.stopTracking = async (req, res) => {
     session.isActive = false;
     session.endTime = new Date();
 
-    // Never allow a stale cache read to lower the durable MongoDB total.
-    session.totalDistance = Math.max(
+    // Calculate ground-truth distance from AGTRIE-X v8.0 Engine
+    const baseGpsKm = Math.max(
       Number(session.totalDistance) || 0,
       Number(redisTotalDist) || 0
     );
 
+    // ─── 5% Business Tolerance Credit on Punch Out ──────────────────────────
+    // Automatically adds a 5% business tolerance bonus at Punch Out for employee/manager
+    // Complete audit trail maintained via manualDistanceAdded and manualAdjustmentReason
+    const toleranceBonusKm = baseGpsKm > 0 ? Math.round(baseGpsKm * 0.05 * 100) / 100 : 0;
+    const finalOfficialKm = Math.round((baseGpsKm + toleranceBonusKm) * 100) / 100;
+
+    session.totalDistance = finalOfficialKm;
+    session.officialDistance = finalOfficialKm;
+    if (toleranceBonusKm > 0) {
+      session.manualDistanceAdded = Math.round(((session.manualDistanceAdded || 0) + toleranceBonusKm) * 100) / 100;
+      session.manualAdjustmentReason = `5% Business Tolerance Credit (+${toleranceBonusKm} KM on Punch Out)`;
+    }
+
     // Get end address from last coordinate
-    if (session.coordinates.length > 0) {
+    if (session.coordinates && session.coordinates.length > 0) {
       session.endAddress = session.coordinates[session.coordinates.length - 1].address;
     }
 
-    session.officialDistance = session.totalDistance;
     await session.save();
 
     // Clear Redis session state — shift is over

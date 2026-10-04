@@ -22,6 +22,18 @@ const initCronJobs = (io) => {
     try {
       console.log('⏳ [CRON] Running hourly pending notification check...');
       
+      // Auto-cleanup legacy auto-stop notifications so old DB entries don't trigger reminders
+      await Notification.updateMany(
+        { 
+          $or: [
+            { title: /Tracking stopped automatically/i },
+            { message: /without accepted GPS movement/i }
+          ],
+          isRead: false 
+        },
+        { $set: { isRead: true } }
+      ).catch(() => {});
+
       // Find all unread notifications grouped by recipient
       const unreadStats = await Notification.aggregate([
         { $match: { isRead: false } },
