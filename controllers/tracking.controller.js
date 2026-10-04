@@ -150,6 +150,16 @@ const {
   haversineM
 } = require('../services/trajectoryEngine');
 
+// ─── Motion State Classifier (AGTRIE-X v7) ────────────────────────────────
+function classifyMotionState(speedKmh) {
+  if (speedKmh < 1) return 'STATIONARY';
+  if (speedKmh < 7) return 'WALKING';
+  if (speedKmh < 15) return 'RUNNING';
+  if (speedKmh < 40) return 'BIKE';
+  if (speedKmh <= 220) return 'VEHICLE';
+  return 'UNKNOWN';
+}
+
 // Re-open a session that the SERVER auto-closed (inactivity cron), never one the
 // employee punched out of manually. Only same-day sessions are resumed.
 async function reopenIfAutoClosed(sessionId, employeeId) {
@@ -635,6 +645,14 @@ exports.updateLocation = async (req, res) => {
       sessionId,
       motionState: currentMotionState
     });
+
+    // Invalidate live location & dashboard caches so admin/manager UI updates instantly
+    if (orgId) {
+      await deleteCache(`live_locations_${orgId}`).catch(() => {});
+      await deleteCache(`admin_dashboard_${orgId}`).catch(() => {});
+    }
+    await deleteCache(`live_locations_${req.user._id}`).catch(() => {});
+    await deleteCache('live_locations_all').catch(() => {});
 
     res.json({ 
       success: true, 
