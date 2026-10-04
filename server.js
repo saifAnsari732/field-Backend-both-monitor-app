@@ -23,7 +23,7 @@ dotenv.config();
 
 const app = express();
 
-// Trust the reverse proxy (like Nginx/MilesWeb) to properly pass client IPs for rate-limiting
+// df Trust the reverse proxy (like Nginx/MilesWeb) to properly pass client IPs for rate-limiting
 app.set('trust proxy', 1);
 
 const server = http.createServer(app);
@@ -98,7 +98,7 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Health check endpoint (placed BEFORE rate limiter so uptime monitors and CI/CD never get blocked)
-app.get('/api/health', (req, res) => res.json({ status: 'now2 OK AWS Working CI-CD Live Test', timestamp: new Date() }));
+app.get('/api/health', (req, res) => res.json({ status: 'now3 OK AWS Working CI-CD Live Test', timestamp: new Date() }));
 
 // Rate limiting
 const limiter = rateLimit({
