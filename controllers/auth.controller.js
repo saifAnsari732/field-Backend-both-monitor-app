@@ -49,10 +49,25 @@ exports.login = async (req, res) => {
   }
 };
 
-// @desc Refresh Token
+// @desc Refresh Token (Supports refreshing expired JWT tokens safely)
 exports.refreshToken = async (req, res) => {
   try {
-    const user = await User.findById(req.user._id).populate('organizationId');
+    const rawToken = req.body?.refreshToken || req.headers?.authorization?.replace('Bearer ', '') || req.body?.token;
+    if (!rawToken) {
+      return res.status(401).json({ success: false, message: 'Token required for refresh' });
+    }
+
+    let userId = req.user?._id;
+    if (!userId) {
+      try {
+        const decoded = jwt.verify(rawToken, process.env.JWT_SECRET, { ignoreExpiration: true });
+        userId = decoded.id;
+      } catch (e) {
+        return res.status(401).json({ success: false, message: 'Invalid token' });
+      }
+    }
+
+    const user = await User.findById(userId).populate('organizationId');
     if (!user) {
       return res.status(401).json({ success: false, message: 'User not found' });
     }

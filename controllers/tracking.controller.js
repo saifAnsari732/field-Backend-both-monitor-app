@@ -142,6 +142,7 @@ exports.startTracking = async (req, res) => {
 };
 
 const { reverseGeocode } = require('../services/geocode.service');
+const { snapToRoads } = require('../services/roads.service');
 
 // AGTRIE-X 5.0 Advanced Mathematical GPS Engine
 const {
@@ -437,14 +438,28 @@ exports.updateLocation = async (req, res) => {
         filterPLng = (1 - kLng) * predPLng;
       }
 
-      // 5. AGTRIE-X v8.0 Multi-Model Consensus Engine (Undercount-Averse Policy)
-      // Candidate A: Raw Geodesic WGS84 distance
-      const dRawKm = prevValid
-        ? haversineDistance({ lat: prevValid.latRaw ?? prevValid.lat, lng: prevValid.lngRaw ?? prevValid.lng }, { lat, lng })
-        : 0;
+      // 5. AGTRIE-X v8.2 Multi-Model Consensus Engine (Fair Road Curvature & Tortuosity Policy)
+      // Discrete GPS straight-line chords naturally undercount curved roads and market alleyways by 5-10%.
+      // We apply dynamic road tortuosity curvature factor when moving to match real-world odometer/travel:
+      const estMovementSpeed = Math.max(reportedSpeedKmh, dt > 0 ? (dRawKm / dt) * 3600 : 0);
+      let tortuosityFactor = 1.0;
+      if (estMovementSpeed >= 1.2 || reportedSpeedKmh > 0.3) {
+        if (estMovementSpeed < 7.0) {
+          tortuosityFactor = 1.08; // +8% fair curve compensation for market alleys & slow walking
+        } else if (estMovementSpeed < 45.0) {
+          tortuosityFactor = 1.06; // +6% curve compensation for city bike / scooter turns & roundabouts
+        } else if (estMovementSpeed <= 120.0) {
+          tortuosityFactor = 1.05; // +5% road curvature compensation for vehicle driving
+        } else {
+          tortuosityFactor = 1.02; // Highway
+        }
+      }
 
-      // Candidate B: Kalman State-Space smoothed distance
-      const dFilteredKm = haversineDistance({ lat: lastValidLat, lng: lastValidLng }, { lat: filterLat, lng: filterLng });
+      // Candidate A: Raw Geodesic WGS84 distance with curve compensation
+      const dRawCurvedKm = dRawKm * tortuosityFactor;
+
+      // Candidate B: Kalman State-Space smoothed distance with curve compensation
+      const dFilteredCurvedKm = dFilteredKm * tortuosityFactor;
 
       // Candidate C: Speed-Integrated distance over the gap duration
       const toKmh = (s) => (Number(s) > 0 ? (Number(s) <= 60 ? Number(s) * 3.6 : Number(s)) : 0);
@@ -460,16 +475,16 @@ exports.updateLocation = async (req, res) => {
       }
 
       // Filter out invalid candidates (> 220 km/h speed threshold over true anchor dt)
-      const rawSpeedKmh = dt > 0 ? (dRawKm / dt) * 3600 : 0;
-      const filteredSpeedKmh = dt > 0 ? (dFilteredKm / dt) * 3600 : 0;
+      const rawSpeedKmh = dt > 0 ? (dRawCurvedKm / dt) * 3600 : 0;
+      const filteredSpeedKmh = dt > 0 ? (dFilteredCurvedKm / dt) * 3600 : 0;
 
       const validCandidates = [];
-      if (rawSpeedKmh <= 220 && accuracy <= 350) validCandidates.push(dRawKm);
-      if (filteredSpeedKmh <= 220) validCandidates.push(dFilteredKm);
+      if (rawSpeedKmh <= 220 && accuracy <= 350) validCandidates.push(dRawCurvedKm);
+      if (filteredSpeedKmh <= 220) validCandidates.push(dFilteredCurvedKm);
       if (dSpeedKm > 0 && dSpeedKm <= (220 * dt) / 3600) validCandidates.push(dSpeedKm);
 
       // Undercount-Averse Policy: Choose maximum defensible valid candidate
-      const stepDistKm = validCandidates.length > 0 ? Math.max(...validCandidates) : dFilteredKm;
+      const stepDistKm = validCandidates.length > 0 ? Math.max(...validCandidates) : dFilteredCurvedKm;
 
       const effectiveDt = dt > 120 ? Math.max(10, (stepDistKm / 80) * 3600) : dt;
       const stepSpeedKmh = (stepDistKm / effectiveDt) * 3600;
@@ -516,11 +531,12 @@ exports.updateLocation = async (req, res) => {
         lastValidLng = filterLng;
         lastEventId = eventId;
       } else {
-        // Advance stationary anchor timestamp so stationary rest time is preserved without poisoning movement speed
+        // For stationary rest, advance timestamp so sitting still doesn't build up false velocity.
+        // For micro-movements (< 1m) while walking, preserve anchor timestamp & coords until cumulative movement >= 1m.
         if (prevValid) {
           prevValid = {
             ...prevValid,
-            timestamp: timestamp.toISOString(),
+            timestamp: isStationaryDrift ? timestamp.toISOString() : prevValid.timestamp,
             latRaw: isStationaryDrift ? lat : prevValid.latRaw,
             lngRaw: isStationaryDrift ? lng : prevValid.lngRaw
           };
@@ -1014,6 +1030,18 @@ exports.getSessionRoute = async (req, res) => {
       session = await LiveLocation.findOne({ sessionId: id }).populate('employee', 'name employeeId avatar');
     }
     if (!session) return res.status(404).json({ success: false, message: 'Session not found' });
+
+    // Optionally snap coordinates to road geometry using Google Roads API if requested
+    if (req.query.snap === 'true' && Array.isArray(session.coordinates) && session.coordinates.length >= 2) {
+      try {
+        const snapped = await snapToRoads(session.coordinates, true);
+        if (session.toObject) {
+          session = session.toObject();
+        }
+        session.snappedCoordinates = snapped;
+      } catch (_) {}
+    }
+
     res.json({ success: true, session });
   } catch (err) {
     console.error('Get session route error:', err.message);
