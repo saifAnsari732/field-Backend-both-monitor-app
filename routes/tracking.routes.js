@@ -16,6 +16,7 @@ router.get('/live', protect, authorize('admin', 'hr', 'manager', 'org_admin', 's
 router.get('/live-locations', protect, authorize('admin', 'hr', 'manager', 'org_admin', 'super_admin'), tc.getLiveLocations);
 router.get('/session/:id', protect, tc.getSessionRoute);
 router.get('/geocode', protect, tc.geocode);
+router.get('/diagnostic', protect, tc.getSessionDiagnostic);
 
 // Reconcile distance from DistanceLedger
 router.post('/reconcile', protect, tc.reconcileSession);

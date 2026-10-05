@@ -440,16 +440,28 @@ exports.updateLocation = async (req, res) => {
       // Candidate B: Kalman State-Space smoothed distance
       const dFilteredKm = haversineDistance({ lat: lastValidLat, lng: lastValidLng }, { lat: filterLat, lng: filterLng });
 
-      // Candidate C: Speed-Integrated distance (v_report * dt)
-      const reportedSpeedKmh = Number(coord.speed) > 0 ? (Number(coord.speed) <= 60 ? Number(coord.speed) * 3.6 : Number(coord.speed)) : 0;
-      const dSpeedKm = reportedSpeedKmh > 0 && reportedSpeedKmh <= 220 ? (reportedSpeedKmh * Math.min(dt, 60)) / 3600 : 0;
+      // Candidate C: Speed-Integrated distance — trapezoid of endpoint speeds over the FULL gap.
+      // (Old code capped dt at 60s, so a 5-min GPS gap at 40 km/h counted only 1 min of travel.)
+      // Bounded by ROAD_CURVE_FACTOR x chord: real roads are rarely >1.35x longer than the straight line
+      // between two fixes, so this recovers curvature without inventing distance.
+      const toKmh = (s) => (Number(s) > 0 ? (Number(s) <= 60 ? Number(s) * 3.6 : Number(s)) : 0);
+      const reportedSpeedKmh = toKmh(coord.speed);
+      const prevSpeedKmh = Number.isFinite(prevValid?.speedKmh) ? prevValid.speedKmh : reportedSpeedKmh;
+      const ROAD_CURVE_FACTOR = 1.35;
+      let dSpeedKm = 0;
+      if (reportedSpeedKmh >= 5 && prevSpeedKmh >= 5 && dt <= 600) {
+        const avgKmh = (reportedSpeedKmh + prevSpeedKmh) / 2;
+        dSpeedKm = Math.min((avgKmh * dt) / 3600, dRawKm * ROAD_CURVE_FACTOR);
+      } else if (reportedSpeedKmh > 0 && reportedSpeedKmh <= 220) {
+        dSpeedKm = (reportedSpeedKmh * Math.min(dt, 60)) / 3600;
+      }
 
       // Filter out invalid candidates (> 220 km/h speed threshold)
       const rawSpeedKmh = dt > 0 ? (dRawKm / dt) * 3600 : 0;
       const filteredSpeedKmh = dt > 0 ? (dFilteredKm / dt) * 3600 : 0;
 
       const validCandidates = [];
-      if (rawSpeedKmh <= 220 && accuracy <= 50) validCandidates.push(dRawKm);
+      if (rawSpeedKmh <= 220 && accuracy <= 250) validCandidates.push(dRawKm);
       if (filteredSpeedKmh <= 220) validCandidates.push(dFilteredKm);
       if (dSpeedKm > 0 && dSpeedKm <= (220 * dt) / 3600) validCandidates.push(dSpeedKm);
 
@@ -496,7 +508,7 @@ exports.updateLocation = async (req, res) => {
         });
 
         prev2Valid = prevValid;
-        prevValid = { lat: filterLat, lng: filterLng, latRaw: lat, lngRaw: lng, accuracy, timestamp: timestamp.toISOString(), heading: coord.heading };
+        prevValid = { lat: filterLat, lng: filterLng, latRaw: lat, lngRaw: lng, accuracy, speedKmh: reportedSpeedKmh, timestamp: timestamp.toISOString(), heading: coord.heading };
         lastValidLat = filterLat;
         lastValidLng = filterLng;
         lastEventId = eventId;
@@ -755,23 +767,25 @@ exports.stopTracking = async (req, res) => {
     session.isActive = false;
     session.endTime = new Date();
 
-    // Calculate ground-truth distance from AGTRIE-X v8.0 Engine
+    // Pure GPS distance from the AGTRIE-X engine (never modified)
     const baseGpsKm = Math.max(
       Number(session.totalDistance) || 0,
       Number(redisTotalDist) || 0
     );
+    const gpsKm = Math.round(baseGpsKm * 100) / 100;
 
-    // ─── 5% Business Tolerance Credit on Punch Out ──────────────────────────
-    // Automatically adds a 5% business tolerance bonus at Punch Out for employee/manager
-    // Complete audit trail maintained via manualDistanceAdded and manualAdjustmentReason
-    const toleranceBonusKm = baseGpsKm > 0 ? Math.round(baseGpsKm * 0.05 * 100) / 100 : 0;
-    const finalOfficialKm = Math.round((baseGpsKm + toleranceBonusKm) * 100) / 100;
+    // 10% Punch Out tolerance — stored as a SEPARATE, visible adjustment (not mixed into GPS km)
+    const TOLERANCE_PCT = Number(process.env.PUNCH_OUT_TOLERANCE_PCT ?? 10);
+    const toleranceKm = gpsKm > 0 ? Math.round(gpsKm * (TOLERANCE_PCT / 100) * 100) / 100 : 0;
+    const finalOfficialKm = Math.round((gpsKm + toleranceKm) * 100) / 100;
 
+    session.acceptedDistance = gpsKm;       // pure GPS km
+    session.rawGpsDistance = gpsKm;
     session.totalDistance = finalOfficialKm;
     session.officialDistance = finalOfficialKm;
-    if (toleranceBonusKm > 0) {
-      session.manualDistanceAdded = Math.round(((session.manualDistanceAdded || 0) + toleranceBonusKm) * 100) / 100;
-      session.manualAdjustmentReason = `5% Business Tolerance Credit (+${toleranceBonusKm} KM on Punch Out)`;
+    if (toleranceKm > 0) {
+      session.manualDistanceAdded = Math.round(((Number(session.manualDistanceAdded) || 0) + toleranceKm) * 100) / 100;
+      session.manualAdjustmentReason = `${TOLERANCE_PCT}% Punch Out tolerance: GPS ${gpsKm} km + ${toleranceKm} km = ${finalOfficialKm} km`;
     }
 
     // Get end address from last coordinate
@@ -1104,8 +1118,8 @@ exports.getLiveLocations = async (req, res) => {
     const locations = rawLocations.filter(Boolean);
     const responseData = { locations, count: locations.length };
     
-    // Store in cache for 10 seconds
-    await liveCache.set(cacheKey, responseData, 10);
+    // Store in cache for 3 seconds for near-instant dashboard distance updates
+    await liveCache.set(cacheKey, responseData, 3);
 
     res.json({ success: true, ...responseData });
   } catch (err) {
@@ -1293,6 +1307,115 @@ exports.reconcileSession = async (req, res) => {
       session: updated
     });
   } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// @desc Diagnostic API — Deep Telemetry Inspection for Employee KM & Session Pipeline
+exports.getSessionDiagnostic = async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const { employeeId } = req.query;
+
+    const query = { date: today };
+    if (employeeId) {
+      query.employee = employeeId;
+    }
+
+    const activeSessions = await LiveLocation.find(query)
+      .populate('employee', 'name employeeId department isOnline lastSeen')
+      .sort({ createdAt: -1 });
+
+    const diagnostics = await Promise.all(
+      activeSessions.map(async (session) => {
+        if (!session.employee) return null;
+
+        // 1. Raw GPS Telemetry Count
+        const rawPointCount = await TrackingPoint.countDocuments({ sessionId: session.sessionId });
+        const lastRawPoint = await TrackingPoint.findOne({ sessionId: session.sessionId })
+          .sort({ timestamp: -1 })
+          .select('timestamp lat lng accuracy speed provider');
+
+        // 2a. Raw polyline length + sampling-gap statistics (separates "points never arrived" from "engine lost km")
+        const rawPts = await TrackingPoint.find({ sessionId: session.sessionId })
+          .sort({ timestamp: 1 }).limit(8000).select('lat lng timestamp accuracy').lean();
+        let rawPolylineKm = 0, maxGapSec = 0, gapsOver120s = 0, sumGapSec = 0;
+        for (let i = 1; i < rawPts.length; i++) {
+          const a = rawPts[i - 1], b = rawPts[i];
+          const gap = (new Date(b.timestamp) - new Date(a.timestamp)) / 1000;
+          if (gap > 0) { sumGapSec += gap; if (gap > maxGapSec) maxGapSec = gap; if (gap > 120) gapsOver120s++; }
+          const seg = haversineDistance({ lat: a.lat, lng: a.lng }, { lat: b.lat, lng: b.lng });
+          if (gap > 0 && (seg / gap) * 3600 <= 220) rawPolylineKm += seg;
+        }
+        rawPolylineKm = Math.round(rawPolylineKm * 100) / 100;
+        const avgGapSec = rawPts.length > 1 ? Math.round(sumGapSec / (rawPts.length - 1)) : 0;
+        const ledgerCount = await DistanceLedger.countDocuments({ sessionId: session.sessionId });
+        const ledgerAgg = await DistanceLedger.aggregate([
+          { $match: { sessionId: session.sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
+          { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
+        ]);
+        const ledgerTotalKm = Math.round((ledgerAgg[0]?.totalKm || 0) * 100) / 100;
+
+        // 3. Cache State
+        const sessionState = await getSessionState(session.sessionId);
+
+        // 4. Determine Exact Diagnostic Bottleneck
+        let diagnosticStatus = 'OK_ACTIVE_CALCULATED';
+        let actionRequired = 'None. Tracking pipeline operating normally.';
+
+        if (rawPointCount === 0) {
+          diagnosticStatus = 'NO_MOBILE_GPS_RECEIVED';
+          actionRequired = 'Employee phone is not sending GPS pings. Check Location Permission ("Allow all the time"), Battery Optimization, and verify app is running.';
+        } else if (rawPointCount > 0 && ledgerTotalKm === 0) {
+          diagnosticStatus = 'GPS_RECEIVED_STATIONARY_RESTING';
+          actionRequired = 'GPS fixes are arriving, but employee is stationary / resting (speed = 0 km/h). Distance will count once movement starts.';
+        } else if (ledgerTotalKm > 0 && (session.totalDistance || 0) === 0) {
+          diagnosticStatus = 'LEDGER_AGGREGATION_DISCREPANCY';
+          actionRequired = 'Ledger has calculated distance, but LiveLocation total is un-synced. Run session reconcile.';
+        } else if (rawPolylineKm > 0.5 && ledgerTotalKm < rawPolylineKm * 0.9) {
+          diagnosticStatus = 'ENGINE_LOSS_RAW_POLYLINE_HIGHER';
+          actionRequired = `Stored GPS points sum to ${rawPolylineKm} km but ledger has ${ledgerTotalKm} km. Engine is dropping valid movement - send this JSON for tuning.`;
+        } else if (gapsOver120s > 3 || avgGapSec > 60) {
+          diagnosticStatus = 'SPARSE_GPS_SAMPLING';
+          actionRequired = `Phone delivered few GPS fixes (avg gap ${avgGapSec}s, max gap ${maxGapSec}s, ${gapsOver120s} gaps >2min). Km lost on road curves between fixes. Fix on phone: Location "Allow all the time", Battery "Unrestricted", disable OEM app-killer.`;
+        }
+
+        return {
+          employeeName: session.employee.name,
+          employeeIdCode: session.employee.employeeId,
+          employeeId: session.employee._id,
+          sessionId: session.sessionId,
+          isActive: session.isActive,
+          startTime: session.startTime,
+          lastActivity: session.lastActivity,
+          diagnosticStatus,
+          actionRequired,
+          telemetry: {
+            rawPointCount,
+            rawPolylineKm,
+            avgGapSec,
+            maxGapSec,
+            gapsOver120s,
+            lastRawPointTimestamp: lastRawPoint?.timestamp || null,
+            lastRawPointCoordinates: lastRawPoint ? `${lastRawPoint.lat}, ${lastRawPoint.lng}` : null,
+            lastAccuracyMeters: lastRawPoint?.accuracy || 0,
+            lastSpeedMps: lastRawPoint?.speed || 0,
+            ledgerSegmentCount: ledgerCount,
+            ledgerTotalKm,
+            liveLocationSessionKm: session.totalDistance || 0,
+            redisCachedKm: sessionState?.totalDistance || 0,
+          }
+        };
+      })
+    );
+
+    res.json({
+      success: true,
+      diagnosticsCount: diagnostics.filter(Boolean).length,
+      diagnostics: diagnostics.filter(Boolean)
+    });
+  } catch (err) {
+    console.error('❌ [DIAGNOSTIC_ERROR]', err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 };

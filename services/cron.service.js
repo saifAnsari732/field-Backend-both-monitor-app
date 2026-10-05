@@ -45,24 +45,9 @@ const initCronJobs = (io) => {
         return;
       }
 
-      console.log(`[CRON] Found ${unreadStats.length} employees with pending notifications.`);
-
-      unreadStats.forEach(stat => {
-        const employeeId = stat._id.toString();
-        const unreadCount = stat.count;
-
-        // Emit a reminder notification over Socket.io to the specific employee
-        io.to(employeeId).emit('notification', {
-          _id: `reminder_${Date.now()}_${Math.random()}`,
-          title: 'Unread Notifications Reminder',
-          message: `You have ${unreadCount} pending notification(s). Please review them.`,
-          type: 'alert',
-          isRead: false,
-          createdAt: new Date().toISOString()
-        });
-      });
-
-      console.log('✅ [CRON] Hourly reminder notifications sent successfully.');
+      // Hourly notification reminder socket emission disabled to prevent spamming phone notifications.
+      // Notifications remain accessible in the app's notification center.
+      console.log(`[CRON] Pending notifications check completed for ${unreadStats.length} users.`);
     } catch (error) {
       console.error('❌ [CRON] Error running pending notification check:', error.message);
     }
