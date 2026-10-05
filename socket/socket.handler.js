@@ -1,9 +1,6 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User.model');
 
-const HEARTBEAT_TIMEOUT = 180000; // 180 seconds (3 minutes — prevents disconnect when browser tab is inactive)
-const heartbeatTimers = new Map(); // Track heartbeat timers per socket
-
 module.exports = (io) => {
   // Auth middleware for socket
   io.use(async (socket, next) => {
@@ -62,26 +59,10 @@ module.exports = (io) => {
       socket.emit('online_employees', onlineEmployees);
     }
 
-    // ─── Socket Heartbeat (Keeps Real-Time Connection Active) ─────────────────
-    const setupHeartbeatTimeout = () => {
-      if (heartbeatTimers.has(socket.id)) {
-        clearTimeout(heartbeatTimers.get(socket.id));
-      }
-
-      // 15-minute socket inactivity timeout for background mobile clients
-      const timer = setTimeout(() => {
-        heartbeatTimers.delete(socket.id);
-      }, 15 * 60 * 1000);
-
-      heartbeatTimers.set(socket.id, timer);
-    };
-
-    socket.on('heartbeat', (data) => {
-      setupHeartbeatTimeout();
+    // ─── Socket Heartbeat Ack (Native Engine.IO handles ping/pong) ───────────
+    socket.on('heartbeat', () => {
       socket.emit('heartbeat_ack', { timestamp: Date.now() });
     });
-
-    setupHeartbeatTimeout();
 
     // ─── Tracking Events (Scoped by Org Room) ──────────────────────────────────
     socket.on('location_ping', async (data) => {
