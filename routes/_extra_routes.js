@@ -44,7 +44,12 @@ r2.get('/today', protect, async (req, res) => {
 
 // ─── Notification Routes ─────────────────────────────────────────────────────
 r3.get('/', protect, async (req, res) => {
-  const notifications = await Notification.find({ recipient: req.user._id }).sort({ createdAt: -1 }).limit(50);
+  const filter = {
+    recipient: req.user._id,
+    title: { $not: /Tracking stopped automatically/i },
+    message: { $not: /without accepted GPS movement/i }
+  };
+  const notifications = await Notification.find(filter).sort({ createdAt: -1 }).limit(50);
   res.json({ success: true, notifications });
 });
 r3.put('/:id/read', protect, async (req, res) => {
