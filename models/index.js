@@ -103,7 +103,7 @@ const distanceLedgerSchema = new mongoose.Schema({
   distanceKm:       { type: Number, required: true },
   classification:   { 
     type: String, 
-    enum: ['ACCEPTED', 'RECOVERED', 'UNVERIFIED', 'REJECTED'], 
+    enum: ['ACCEPTED', 'RECOVERED', 'CANDIDATE', 'UNVERIFIED', 'REJECTED'], 
     default: 'ACCEPTED' 
   },
   reason:           { type: String, default: 'NORMAL_TRAJECTORY' },

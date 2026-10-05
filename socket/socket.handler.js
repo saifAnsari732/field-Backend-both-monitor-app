@@ -62,16 +62,16 @@ module.exports = (io) => {
       socket.emit('online_employees', onlineEmployees);
     }
 
-    // ─── Heartbeat Mechanism ────────────────────────────────────────────────────
+    // ─── Socket Heartbeat (Keeps Real-Time Connection Active) ─────────────────
     const setupHeartbeatTimeout = () => {
       if (heartbeatTimers.has(socket.id)) {
         clearTimeout(heartbeatTimers.get(socket.id));
       }
 
+      // 15-minute socket inactivity timeout for background mobile clients
       const timer = setTimeout(() => {
-        console.log(`⏱️ Heartbeat timeout for ${user.name}, disconnecting...`);
-        socket.disconnect(true);
-      }, HEARTBEAT_TIMEOUT);
+        heartbeatTimers.delete(socket.id);
+      }, 15 * 60 * 1000);
 
       heartbeatTimers.set(socket.id, timer);
     };

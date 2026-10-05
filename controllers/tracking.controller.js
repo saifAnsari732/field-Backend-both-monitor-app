@@ -271,16 +271,20 @@ exports.updateLocation = async (req, res) => {
       await saveSessionState(sessionId, sessionState);
     }
 
-    // Step 1: Chronological Sorting & Redis Idempotency Gate
+    // Step 1: Chronological Sorting & Durable Idempotency Gate
     const orderedCoordinates = [...coordinates].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
     
-    // Fast Redis Idempotency Gate (drops network retries before hitting Mongo)
+    // Durable Idempotency Gate (drops duplicate retries only if already committed to DistanceLedger)
     const incomingEventIds = [];
     const nonDuplicateCoordinates = [];
     for (const c of orderedCoordinates) {
       if (c?.eventId) {
-        const isNew = await checkAndSetIdempotency(sessionId, c.eventId);
-        if (!isNew) continue; // Dropped by Redis Idempotency
+        const isNewInRedis = await checkAndSetIdempotency(sessionId, c.eventId);
+        if (!isNewInRedis) {
+          // Verify if this event was actually committed into DistanceLedger
+          const alreadyCommitted = await DistanceLedger.exists({ sessionId, toEventId: c.eventId });
+          if (alreadyCommitted) continue; // Safely skip truly duplicate committed point
+        }
         incomingEventIds.push(c.eventId);
       }
       nonDuplicateCoordinates.push(c);
@@ -397,10 +401,12 @@ exports.updateLocation = async (req, res) => {
       sumAccuracy += accuracy;
       if (accuracy > batchWorstAccuracy) batchWorstAccuracy = accuracy;
 
-      const dt = prevTimestamp ? Math.max((tMs - prevTimestamp) / 1000, 0.5) : 1.0;
+      // Ensure dt is calculated strictly against the last trusted anchor timestamp
+      const lastTrustedMs = prevValid?.timestamp ? new Date(prevValid.timestamp).getTime() : (prevTimestamp || tMs - 1000);
+      const dt = Math.max((tMs - lastTrustedMs) / 1000, 0.5);
       prevTimestamp = tMs;
 
-      // 3. Master Bayesian GPS Scoring (AGTRIE-X 5.0: S_t = w1*A + w2*V + w3*H + w4*T + w5*M + w6*G + w7*C)
+      // 3. Master Bayesian GPS Scoring (AGTRIE-X 5.0)
       const bayesianResult = BayesianGPSScorer.scorePoint(
         { lat, lng, accuracy, speed: coord.speed, heading: coord.heading, timestamp: coord.timestamp },
         prevValid,
@@ -440,10 +446,7 @@ exports.updateLocation = async (req, res) => {
       // Candidate B: Kalman State-Space smoothed distance
       const dFilteredKm = haversineDistance({ lat: lastValidLat, lng: lastValidLng }, { lat: filterLat, lng: filterLng });
 
-      // Candidate C: Speed-Integrated distance — trapezoid of endpoint speeds over the FULL gap.
-      // (Old code capped dt at 60s, so a 5-min GPS gap at 40 km/h counted only 1 min of travel.)
-      // Bounded by ROAD_CURVE_FACTOR x chord: real roads are rarely >1.35x longer than the straight line
-      // between two fixes, so this recovers curvature without inventing distance.
+      // Candidate C: Speed-Integrated distance over the gap duration
       const toKmh = (s) => (Number(s) > 0 ? (Number(s) <= 60 ? Number(s) * 3.6 : Number(s)) : 0);
       const reportedSpeedKmh = toKmh(coord.speed);
       const prevSpeedKmh = Number.isFinite(prevValid?.speedKmh) ? prevValid.speedKmh : reportedSpeedKmh;
@@ -456,12 +459,12 @@ exports.updateLocation = async (req, res) => {
         dSpeedKm = (reportedSpeedKmh * Math.min(dt, 60)) / 3600;
       }
 
-      // Filter out invalid candidates (> 220 km/h speed threshold)
+      // Filter out invalid candidates (> 220 km/h speed threshold over true anchor dt)
       const rawSpeedKmh = dt > 0 ? (dRawKm / dt) * 3600 : 0;
       const filteredSpeedKmh = dt > 0 ? (dFilteredKm / dt) * 3600 : 0;
 
       const validCandidates = [];
-      if (rawSpeedKmh <= 220 && accuracy <= 250) validCandidates.push(dRawKm);
+      if (rawSpeedKmh <= 220 && accuracy <= 350) validCandidates.push(dRawKm);
       if (filteredSpeedKmh <= 220) validCandidates.push(dFilteredKm);
       if (dSpeedKm > 0 && dSpeedKm <= (220 * dt) / 3600) validCandidates.push(dSpeedKm);
 
@@ -472,7 +475,7 @@ exports.updateLocation = async (req, res) => {
       const stepSpeedKmh = (stepDistKm / effectiveDt) * 3600;
       if (stepSpeedKmh > batchMaxSpeed && stepSpeedKmh <= 220) batchMaxSpeed = stepSpeedKmh;
 
-      // 6. Mathematical Bayesian & IMM Decision Gate (No Hard 5m Drop — Adaptive Micro-Movement)
+      // 6. Mathematical Bayesian & IMM Decision Gate
       const isStationaryDrift = 
         bayesianResult.motionState === 'STATIONARY' && 
         dRawKm * 1000 <= Math.max(accuracy * 0.4, 8) && 
@@ -494,7 +497,7 @@ exports.updateLocation = async (req, res) => {
           sessionId,
           fromEventId: lastEventId,
           toEventId: eventId,
-          fromTimestamp: new Date(prevTimestamp - (dt * 1000)),
+          fromTimestamp: new Date(lastTrustedMs),
           toTimestamp: timestamp,
           fromLat: prevValid?.latRaw ?? lastValidLat,
           fromLng: prevValid?.lngRaw ?? lastValidLng,
@@ -502,9 +505,9 @@ exports.updateLocation = async (req, res) => {
           toLng: lng,
           distanceMeters: Math.round(stepDistKm * 1000),
           distanceKm: Math.round(stepDistKm * 1000) / 1000,
-          classification: bayesianResult.classification,
-          reason: 'AGTRIE_X_V8_MULTIMODAL_MAX_CONSENSUS',
-          algorithmVersion: 'AGTRIE-X-v8.0-UNDERCOUNT-AVERSE'
+          classification: (dt > 120 || bayesianResult.classification === 'CANDIDATE') ? 'RECOVERED' : (bayesianResult.classification === 'ACCEPTED' ? 'ACCEPTED' : 'RECOVERED'),
+          reason: dt > 120 ? 'LONG_GAP_RECOVERY' : (bayesianResult.classification === 'CANDIDATE' ? 'BAYESIAN_CANDIDATE_RECOVERED' : 'AGTRIE_X_V8_MULTIMODAL_MAX_CONSENSUS'),
+          algorithmVersion: 'AGTRIE-X-v8.1-ANCHOR-SYNCED'
         });
 
         prev2Valid = prevValid;
@@ -513,7 +516,15 @@ exports.updateLocation = async (req, res) => {
         lastValidLng = filterLng;
         lastEventId = eventId;
       } else {
-        // Stationary drift — raw telemetry is saved in TrackingPoint, but ZERO distance is added to ledger!
+        // Advance stationary anchor timestamp so stationary rest time is preserved without poisoning movement speed
+        if (prevValid) {
+          prevValid = {
+            ...prevValid,
+            timestamp: timestamp.toISOString(),
+            latRaw: isStationaryDrift ? lat : prevValid.latRaw,
+            lngRaw: isStationaryDrift ? lng : prevValid.lngRaw
+          };
+        }
         acceptedEventIds.push(eventId);
       }
 
@@ -548,7 +559,7 @@ exports.updateLocation = async (req, res) => {
 
     // Derive authoritative session total directly from immutable DistanceLedger sum
     const sessionLedgerAgg = await DistanceLedger.aggregate([
-      { $match: { sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
+      { $match: { sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED', 'CANDIDATE'] } } },
       { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
     ]);
 
@@ -677,7 +688,7 @@ exports.updateLocation = async (req, res) => {
       { 
         $match: { 
           employee: req.user._id, 
-          classification: { $in: ['ACCEPTED', 'RECOVERED'] },
+          classification: { $in: ['ACCEPTED', 'RECOVERED', 'CANDIDATE'] },
           createdAt: { 
             $gte: new Date(`${targetDate}T00:00:00.000Z`), 
             $lte: new Date(`${targetDate}T23:59:59.999Z`) 
@@ -925,41 +936,77 @@ exports.getSessionRoute = async (req, res) => {
       // If not found by document _id, check if id is an Employee _id
       if (!session) {
         const today = new Date().toISOString().slice(0, 10);
-        const daySessions = await LiveLocation.find({ employee: id, date: today })
-          .sort({ startTime: 1 })
-          .populate('employee', 'name employeeId avatar department');
+        const startOfToday = new Date();
+        startOfToday.setHours(0, 0, 0, 0);
+
+        const [daySessions, attRecord, empObj] = await Promise.all([
+          LiveLocation.find({ 
+            employee: id, 
+            $or: [{ date: today }, { createdAt: { $gte: startOfToday } }, { isActive: true }] 
+          })
+            .sort({ startTime: 1 })
+            .populate('employee', 'name employeeId avatar department'),
+          Attendance.findOne({ 
+            employee: id, 
+            $or: [{ date: today }, { createdAt: { $gte: startOfToday } }] 
+          }).lean(),
+          User.findById(id).select('name employeeId avatar department phone address')
+        ]);
 
         if (daySessions && daySessions.length > 0) {
           let cumulativeDistance = 0;
           let combinedCoordinates = [];
 
           daySessions.forEach((s) => {
-            cumulativeDistance += Number(s.totalDistance) || 0;
+            cumulativeDistance += Number(s.totalDistance) || Number(s.officialDistance) || 0;
             if (Array.isArray(s.coordinates)) {
               combinedCoordinates.push(...s.coordinates);
             }
           });
 
+          const maxDist = Math.max(
+            cumulativeDistance,
+            Number(attRecord?.totalDistanceTraveled) || 0
+          );
+
           const firstSess = daySessions[0];
           session = {
             _id: id,
-            employee: firstSess.employee,
-            totalDistance: Math.round(cumulativeDistance * 100) / 100,
+            employee: firstSess.employee || empObj,
+            totalDistance: Math.round(maxDist * 100) / 100,
             coordinates: combinedCoordinates,
             startTime: firstSess.startTime,
             endTime: daySessions[daySessions.length - 1].endTime,
+            isActive: daySessions.some(s => s.isActive),
             isCombined: true,
           };
         } else {
-          // If employee did NOT punch in / track today, return 0 KM and empty coordinates
-          const empObj = await User.findById(id).select('name employeeId avatar department');
-          session = {
-            _id: id,
-            employee: empObj || { name: 'Employee' },
-            totalDistance: 0,
-            coordinates: [],
-            isCombined: true,
-          };
+          // Check if employee has a previous recent session
+          const latestPastSession = await LiveLocation.findOne({ employee: id })
+            .sort({ createdAt: -1 })
+            .populate('employee', 'name employeeId avatar department');
+
+          if (latestPastSession) {
+            session = {
+              _id: id,
+              employee: latestPastSession.employee || empObj,
+              totalDistance: Number(attRecord?.totalDistanceTraveled) || Number(latestPastSession.totalDistance) || 0,
+              coordinates: latestPastSession.coordinates || [],
+              startTime: latestPastSession.startTime,
+              endTime: latestPastSession.endTime,
+              isActive: latestPastSession.isActive,
+              isCombined: true,
+              isPastSession: true,
+            };
+          } else {
+            session = {
+              _id: id,
+              employee: empObj || { name: 'Employee' },
+              totalDistance: Number(attRecord?.totalDistanceTraveled) || 0,
+              coordinates: [],
+              isCombined: true,
+            };
+          }
         }
       }
     }
@@ -990,15 +1037,10 @@ exports.getLiveEmployees = async (req, res) => {
       .select('name employeeId department avatar isTracking isOnline lastSeen organizationId');
     const empIds = scopedUsers.map(e => e._id);
 
-    // Active tracking sessions within the last 14 hours (independent of phone lock or background state)
-    const cutoff = new Date(Date.now() - 14 * 60 * 60 * 1000);
+    // Active tracking sessions — strictly authoritative on isActive: true
     const locations = await LiveLocation.find({
       isActive: true,
-      employee: { $in: empIds },
-      $or: [
-        { lastActivity: { $gte: cutoff } },
-        { lastActivity: null, updatedAt: { $gte: cutoff } }
-      ]
+      employee: { $in: empIds }
     }).populate('employee', 'name employeeId avatar department isOnline lastSeen');
 
     const activeEmpIdSet = new Set(locations.map(l => String(l.employee?._id || l.employee)));

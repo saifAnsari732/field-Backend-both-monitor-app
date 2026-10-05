@@ -205,7 +205,77 @@ exports.getAllEmployees = async (req, res) => {
       .limit(+limit);
 
     const total = await User.countDocuments(filter);
-    res.json({ success: true, employees, total, pages: Math.ceil(total / limit) });
+
+    // Enrich employees with today's real attendance distance and live location metrics
+    const empIds = employees.map(e => e._id);
+    const today = new Date().toISOString().slice(0, 10);
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const [todayAttendances, todayLiveLocations] = await Promise.all([
+      Attendance.find({ 
+        employee: { $in: empIds }, 
+        $or: [{ date: today }, { createdAt: { $gte: startOfToday } }] 
+      }).lean(),
+      LiveLocation.find({ 
+        employee: { $in: empIds }, 
+        $or: [{ date: today }, { createdAt: { $gte: startOfToday } }, { isActive: true }] 
+      }).lean()
+    ]);
+
+    const attMap = new Map();
+    todayAttendances.forEach(a => {
+      const empKey = String(a.employee);
+      const existing = attMap.get(empKey);
+      if (!existing || (a.totalDistanceTraveled || 0) > (existing.totalDistanceTraveled || 0)) {
+        attMap.set(empKey, a);
+      }
+    });
+
+    const empSessionsDistMap = new Map();
+    const liveMap = new Map();
+
+    todayLiveLocations.forEach(l => {
+      const empKey = String(l.employee);
+      const sessionDist = Number(l.totalDistance) || Number(l.officialDistance) || Number(l.acceptedDistance) || 0;
+      empSessionsDistMap.set(empKey, (empSessionsDistMap.get(empKey) || 0) + sessionDist);
+
+      const existing = liveMap.get(empKey);
+      if (!existing || (l.isActive && !existing.isActive) || (new Date(l.updatedAt || 0) > new Date(existing.updatedAt || 0))) {
+        liveMap.set(empKey, l);
+      }
+    });
+
+    const enrichedEmployees = employees.map(e => {
+      const empObj = e.toObject ? e.toObject() : { ...e };
+      const empIdStr = String(empObj._id);
+      const att = attMap.get(empIdStr);
+      const live = liveMap.get(empIdStr);
+
+      const isLive = live?.isActive === true || empObj.isTracking === true;
+      const todayKm = Math.round(Math.max(
+        Number(att?.totalDistanceTraveled) || 0,
+        empSessionsDistMap.get(empIdStr) || 0,
+        Number(live?.totalDistance) || 0,
+        Number(live?.officialDistance) || 0
+      ) * 100) / 100;
+
+      const lastPingTime = live?.lastActivity || live?.updatedAt || att?.checkIn || empObj.lastSeen || empObj.updatedAt;
+
+      return {
+        ...empObj,
+        isTracking: isLive,
+        isLive,
+        totalDistance: todayKm,
+        totalDistanceToday: todayKm,
+        lastPing: lastPingTime,
+        lastCheckIn: att?.checkIn || empObj.lastCheckIn,
+        attendanceStatus: att?.status || (isLive ? 'present' : 'absent'),
+        currentAddress: live?.currentAddress || live?.endAddress || live?.startAddress || empObj.address
+      };
+    });
+
+    res.json({ success: true, employees: enrichedEmployees, total, pages: Math.ceil(total / limit) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
