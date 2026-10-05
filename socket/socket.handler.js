@@ -135,22 +135,20 @@ module.exports = (io) => {
     socket.on('disconnect', async () => {
       console.log(`🔌 ${user.name} disconnected`);
 
-      // Clear heartbeat timer
-      if (heartbeatTimers.has(socket.id)) {
-        clearTimeout(heartbeatTimers.get(socket.id));
-        heartbeatTimers.delete(socket.id);
+      try {
+        await User.findByIdAndUpdate(user._id, {
+          isOnline: false,
+          lastSeen: new Date(),
+          socketId: null,
+        });
+
+        io.to('admins').emit('employee_offline', {
+          employeeId: user._id,
+          name: user.name,
+        });
+      } catch (discErr) {
+        console.error(`Socket disconnect error for ${user.name}:`, discErr.message);
       }
-
-      await User.findByIdAndUpdate(user._id, {
-        isOnline: false,
-        lastSeen: new Date(),
-        socketId: null,
-      });
-
-      io.to('admins').emit('employee_offline', {
-        employeeId: user._id,
-        name: user.name,
-      });
     });
 
     // ─── Error Handling ─────────────────────────────────────────────────────────
