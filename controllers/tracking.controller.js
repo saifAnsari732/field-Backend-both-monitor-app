@@ -166,19 +166,18 @@ function classifyMotionState(speedKmh) {
   return 'UNKNOWN';
 }
 
-// Re-open a session that the SERVER auto-closed (inactivity cron), never one the
-// employee punched out of manually. Only same-day sessions are resumed.
+// Re-open a session whenever live telemetry arrives for it.
 async function reopenIfAutoClosed(sessionId, employeeId) {
-  const today = new Date().toISOString().slice(0, 10);
   const doc = await LiveLocation.findOneAndUpdate(
-    { sessionId, employee: employeeId, isActive: false, autoClosed: true, date: today },
+    { sessionId, employee: employeeId },
     { $set: { isActive: true, autoClosed: false, lastActivity: new Date() }, $unset: { endTime: 1 } },
     { new: true }
   );
   if (!doc) return false;
-  await User.findByIdAndUpdate(employeeId, { isTracking: true });
+  await User.findByIdAndUpdate(employeeId, { isTracking: true, isOnline: true });
+  const today = new Date().toISOString().slice(0, 10);
   await Attendance.findOneAndUpdate({ employee: employeeId, date: today }, { $unset: { checkOut: 1 } }).catch(() => {});
-  console.log(`[tracking] Re-opened auto-closed session ${sessionId}`);
+  console.log(`[tracking] Auto-reactivated session ${sessionId} for employee ${employeeId}`);
   return true;
 }
 
@@ -240,16 +239,33 @@ exports.updateLocation = async (req, res) => {
 
     releaseSessionLock = await acquireDistributedLock(sessionId, 6000);
 
-    // Verify the session is really active in MongoDB. A stale Redis key must never
-    // let GPS points be "accepted" (200 OK) while Mongo silently drops them.
-    const activeDoc = await LiveLocation.findOne({ sessionId, employee: req.user._id }, { isActive: 1 }).lean();
-    if (!activeDoc) return res.status(404).json({ success: false, message: 'Session not found', sessionClosed: true });
-    if (!activeDoc.isActive) {
-      const reopened = await reopenIfAutoClosed(sessionId, req.user._id);
-      if (!reopened) {
-        return res.status(409).json({ success: false, sessionClosed: true, message: 'Session is closed.' });
+    // Verify session in MongoDB. If closed or missing, auto-reactivate or auto-adopt on the fly!
+    let activeDoc = await LiveLocation.findOne({ sessionId, employee: req.user._id });
+    if (!activeDoc) {
+      const today = getBusinessDate(new Date(), 'Asia/Kolkata');
+      activeDoc = await LiveLocation.findOne({ employee: req.user._id, isActive: true, date: today }).sort({ createdAt: -1 });
+      if (!activeDoc) {
+        activeDoc = await LiveLocation.create({
+          organizationId: orgId,
+          employee: req.user._id,
+          sessionId: sessionId,
+          coordinates: [],
+          isActive: true,
+          date: today,
+          startTime: new Date(),
+          startAddress: 'Auto-Adopted Live Shift'
+        });
       }
     }
+
+    if (!activeDoc.isActive) {
+      activeDoc.isActive = true;
+      activeDoc.autoClosed = false;
+      activeDoc.lastActivity = new Date();
+      await activeDoc.save();
+      console.log(`🛡️ [AUTO_RESUME] Auto-reactivated session ${sessionId} for ${req.user.name || req.user._id}`);
+    }
+    await User.findByIdAndUpdate(req.user._id, { isTracking: true, isOnline: true, lastSeen: new Date() });
 
     let sessionState = await getSessionState(sessionId);
     if (!sessionState) {
