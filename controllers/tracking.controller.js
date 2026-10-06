@@ -1365,18 +1365,26 @@ exports.getLiveLocations = async (req, res) => {
 
       const latestCoord = session.coordinates[session.coordinates.length - 1] || {};
       const sessionState = await getSessionState(session.sessionId);
+      const sessionDist = sessionState?.totalDistance ?? session.totalDistance ?? 0;
 
-      // Sum up total distance across ALL sessions for this employee today
-      const allTodaySessions = await LiveLocation.find({ 
-        employee: session.employee._id, 
-        $or: [{ date: today }, { date: session.date }]
-      });
-      const cumulativeDistance = allTodaySessions.reduce((sum, s) => {
-        if (s.sessionId === session.sessionId) {
-          return sum + (sessionState?.totalDistance ?? s.totalDistance ?? 0);
-        }
-        return sum + (s.totalDistance || 0);
-      }, 0);
+      // For multi-day ongoing sessions (e.g. 70h+), calculate distance traveled strictly TODAY
+      const startOfToday = new Date(`${today}T00:00:00.000Z`);
+      const todayLedgerAgg = await DistanceLedger.aggregate([
+        {
+          $match: {
+            sessionId: session.sessionId,
+            classification: { $in: ['ACCEPTED', 'RECOVERED', 'CANDIDATE'] },
+            createdAt: { $gte: startOfToday }
+          }
+        },
+        { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
+      ]);
+
+      const todayLedgerKm = todayLedgerAgg[0]?.totalKm;
+      const isMultiDaySession = session.startTime && (new Date() - new Date(session.startTime)) > 24 * 60 * 60 * 1000;
+      const displayDistance = (isMultiDaySession && typeof todayLedgerKm === 'number')
+        ? Math.round(todayLedgerKm * 100) / 100
+        : Math.round(sessionDist * 100) / 100;
 
       return {
         employeeId: session.employee._id,
@@ -1388,7 +1396,8 @@ exports.getLiveLocations = async (req, res) => {
         lng: latestCoord.lng,
         speed: latestCoord.speed || 0,
         address: latestCoord.address,
-        totalDistance: Math.round(cumulativeDistance * 100) / 100,
+        totalDistance: displayDistance,
+        sessionTotalDistance: Math.round(sessionDist * 100) / 100,
         sessionId: session.sessionId,
         startTime: session.startTime,
         updatedAt: latestCoord.timestamp || session.updatedAt,
