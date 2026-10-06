@@ -122,7 +122,7 @@ exports.getTeamTrackingHistory = async (req, res) => {
 
     const history = await LiveLocation.find(filter)
       .populate('employee', 'name employeeId department designation avatar')
-      .sort({ createdAt: -1 })
+      .sort({ isActive: -1, updatedAt: -1 })
       .skip((page - 1) * limit)
       .limit(+limit);
 
