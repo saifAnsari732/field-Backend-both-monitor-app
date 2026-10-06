@@ -480,8 +480,13 @@ exports.getTrackingHistory = async (req, res) => {
       .skip((page - 1) * limit)
       .limit(+limit);
 
-    // Auto-recalculate any 0.0 KM sessions using stored raw points
+    const targetDateStr = date || startDate || new Date().toISOString().slice(0, 10);
+    const startOfTarget = new Date(`${targetDateStr}T00:00:00.000Z`);
+    const endOfTarget = new Date(`${targetDateStr}T23:59:59.999Z`);
+
+    // Auto-recalculate 0.0 KM sessions and isolate date-specific KM
     if (Array.isArray(history)) {
+      const { DistanceLedger } = require('../models/index');
       for (const s of history) {
         if (!s.totalDistance || s.totalDistance === 0) {
           try {
@@ -489,6 +494,31 @@ exports.getTrackingHistory = async (req, res) => {
             if (recalculated > 0) {
               s.totalDistance = recalculated;
               s.officialDistance = recalculated;
+            }
+          } catch (_) {}
+        }
+
+        const sessionDateStr = s.date || (s.startTime ? new Date(s.startTime).toISOString().slice(0, 10) : targetDateStr);
+        if (sessionDateStr !== targetDateStr || (s.startTime && new Date(s.startTime) < startOfTarget)) {
+          try {
+            const ledgerAgg = await DistanceLedger.aggregate([
+              {
+                $match: {
+                  sessionId: s.sessionId,
+                  classification: { $in: ['ACCEPTED', 'RECOVERED', 'CANDIDATE'] },
+                  toTimestamp: { $gte: startOfTarget, $lte: endOfTarget }
+                }
+              },
+              { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
+            ]);
+
+            const dateSpecificKm = Math.round((ledgerAgg[0]?.totalKm || 0) * 100) / 100;
+            if (s.toObject) {
+              s.totalDistance = dateSpecificKm;
+              s.officialDistance = dateSpecificKm;
+            } else {
+              s.totalDistance = dateSpecificKm;
+              s.officialDistance = dateSpecificKm;
             }
           } catch (_) {}
         }
