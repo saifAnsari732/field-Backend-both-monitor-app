@@ -1207,6 +1207,13 @@ const recalculateSessionFromPoints = async (sessionId) => {
         const ts2 = new Date(pt.timestamp).getTime();
         const dt = Math.max((ts2 - ts1) / 1000, 0.5);
 
+        // Gap Re-Anchoring Policy: Time gaps > 1 hour (3600s) indicate offline/rest period.
+        // Re-anchor on fresh coordinate without adding straight-line gap distance.
+        if (dt > 3600) {
+          prevPoint = pt;
+          continue;
+        }
+
         const speedKmh = Number(pt.speed) > 0 
           ? (Number(pt.speed) <= 60 ? Number(pt.speed) * 3.6 : Number(pt.speed))
           : (dt > 0 ? (dRawKm / dt) * 3600 : 0);
@@ -1220,6 +1227,7 @@ const recalculateSessionFromPoints = async (sessionId) => {
         }
 
         const dCurvedKm = dRawKm * tortuosity;
+        const stepSpeed = dt > 0 ? (dCurvedKm / dt) * 3600 : 0;
         const isRealisticSpeed = stepSpeed <= 90;
         const isPlausibleStep = dCurvedKm <= 15 || (dt >= 600 && stepSpeed <= 90);
 
