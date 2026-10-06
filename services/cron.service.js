@@ -1,21 +1,23 @@
 const cron = require('node-cron');
 const { Notification } = require('../models');
-const { autoStopInactiveSessions } = require('../controllers/tracking.controller');
+const { autoStopInactiveSessions, reconcileAllActiveSessions } = require('../controllers/tracking.controller');
 
 /**
  * Initializes all background cron jobs.
  * @param {Object} io - Socket.io instance for emitting real-time events
  */
 const initCronJobs = (io) => {
-  // [PERMANENT ZERO DATA LOSS POLICY]: Auto-stop cron is disabled.
-  // Sessions remain active indefinitely until explicit Punch Out or Admin Force Close.
-  // cron.schedule('*/5 * * * *', async () => {
-  //   try {
-  //     await autoStopInactiveSessions(io);
-  //   } catch (error) {
-  //     console.error('❌ [CRON] Error auto-stopping inactive tracking:', error.message);
-  //   }
-  // });
+  // ─── Continuous Background Reconciliation Worker ─────────────────────────
+  // Scans active sessions every 5 minutes to repair any KM discrepancies/unprocessed points in MongoDB
+  cron.schedule('*/5 * * * *', async () => {
+    try {
+      if (typeof reconcileAllActiveSessions === 'function') {
+        await reconcileAllActiveSessions();
+      }
+    } catch (error) {
+      console.error('❌ [CRON] Error running background session reconciliation:', error.message);
+    }
+  });
 
   // Run at minute 0 past every hour: '0 * * * *'
   cron.schedule('0 * * * *', async () => {

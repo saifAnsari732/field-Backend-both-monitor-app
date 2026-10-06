@@ -597,18 +597,24 @@ exports.updateLocation = async (req, res) => {
       try {
         await DistanceLedger.insertMany(ledgerSegments, { ordered: false });
       } catch (ledgerErr) {
-        console.error('❌ [DISTANCE_LEDGER_ERROR] Failed to persist distance ledger:', ledgerErr.message);
-        if (incomingEventIds.length > 0) {
-          for (const eid of incomingEventIds) {
-            await clearIdempotencyKey(sessionId, eid).catch(() => {});
+        // E11000 duplicate key error means some segments were already inserted during a retried request.
+        // With ordered: false, non-duplicate segments are inserted safely.
+        if (ledgerErr.code === 11000 || ledgerErr.name === 'MongoBulkWriteError' || (ledgerErr.message && ledgerErr.message.includes('E11000'))) {
+          console.log(`ℹ️ [DISTANCE_LEDGER] Duplicate segment key ignored for session ${sessionId}`);
+        } else {
+          console.error('❌ [DISTANCE_LEDGER_ERROR] Failed to persist distance ledger:', ledgerErr.message);
+          if (incomingEventIds.length > 0) {
+            for (const eid of incomingEventIds) {
+              await clearIdempotencyKey(sessionId, eid).catch(() => {});
+            }
           }
+          if (typeof releaseSessionLock === 'function') await releaseSessionLock();
+          return res.status(500).json({ 
+            success: false, 
+            message: 'Distance Ledger persistence failed.',
+            retryable: true 
+          });
         }
-        if (typeof releaseSessionLock === 'function') await releaseSessionLock();
-        return res.status(500).json({ 
-          success: false, 
-          message: 'Distance Ledger persistence failed.',
-          retryable: true 
-        });
       }
     }
 
@@ -1248,7 +1254,11 @@ const recalculateSessionFromPoints = async (sessionId) => {
     if (totalDistKm > 0 || ledgerSegments.length > 0) {
       if (ledgerSegments.length > 0) {
         await DistanceLedger.deleteMany({ sessionId });
-        await DistanceLedger.insertMany(ledgerSegments, { ordered: false }).catch(() => {});
+        try {
+          await DistanceLedger.insertMany(ledgerSegments, { ordered: false });
+        } catch (insertErr) {
+          console.error(`[recalculateSessionFromPoints] Ledger insert warning for ${sessionId}:`, insertErr.message);
+        }
       }
 
       await LiveLocation.updateOne(
@@ -1272,7 +1282,11 @@ const recalculateSessionFromPoints = async (sessionId) => {
         { $set: { totalDistanceTraveled: Math.round(empDayTotal * 100) / 100 } }
       ).catch(() => {});
 
-      await saveSessionState(sessionId, { totalDistance: totalDistKm });
+      const currentState = (await getSessionState(sessionId)) || {};
+      await saveSessionState(sessionId, {
+        ...currentState,
+        totalDistance: totalDistKm
+      });
     }
 
     return totalDistKm;
@@ -1282,6 +1296,27 @@ const recalculateSessionFromPoints = async (sessionId) => {
   }
 };
 exports.recalculateSessionFromPoints = recalculateSessionFromPoints;
+
+// @desc Continuous background worker to reconcile all active sessions in MongoDB
+exports.reconcileAllActiveSessions = async () => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const activeSessions = await LiveLocation.find({
+      $or: [{ date: today }, { isActive: true }]
+    });
+
+    for (const session of activeSessions) {
+      const rawCount = await TrackingPoint.countDocuments({ sessionId: session.sessionId });
+      const ledgerCount = await DistanceLedger.countDocuments({ sessionId: session.sessionId });
+
+      if (rawCount >= 2 && (ledgerCount < Math.max(1, Math.floor(rawCount / 2)) || !session.totalDistance || session.totalDistance === 0)) {
+        await recalculateSessionFromPoints(session.sessionId);
+      }
+    }
+  } catch (err) {
+    console.error('❌ [reconcileAllActiveSessions] Error:', err.message);
+  }
+};
 
 // @desc Get live locations (optimized with server-side caching & tenant isolation)
 exports.getLiveLocations = async (req, res) => {
