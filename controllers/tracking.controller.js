@@ -421,7 +421,6 @@ exports.updateLocation = async (req, res) => {
       // Ensure dt is calculated strictly against the last trusted anchor timestamp
       const lastTrustedMs = prevValid?.timestamp ? new Date(prevValid.timestamp).getTime() : (prevTimestamp || tMs - 1000);
       const dt = Math.max((tMs - lastTrustedMs) / 1000, 0.5);
-      prevTimestamp = tMs;
 
       // 3. Master Bayesian GPS Scoring (AGTRIE-X 5.0)
       const bayesianResult = BayesianGPSScorer.scorePoint(
@@ -454,7 +453,23 @@ exports.updateLocation = async (req, res) => {
         filterPLng = (1 - kLng) * predPLng;
       }
 
-      // 5. AGTRIE-X v8.2 Multi-Model Consensus Engine (Fair Road Curvature & Tortuosity Policy)
+      // 5. Raw & Filtered Segment Distance Calculations
+      const dRawKm = prevValid
+        ? haversineDistance(
+            { lat: prevValid.latRaw ?? prevValid.lat, lng: prevValid.lngRaw ?? prevValid.lng },
+            { lat, lng }
+          )
+        : 0;
+
+      const dFilteredKm = haversineDistance(
+        { lat: lastValidLat, lng: lastValidLng },
+        { lat: filterLat, lng: filterLng }
+      );
+
+      const toKmh = (s) => (Number(s) > 0 ? (Number(s) <= 60 ? Number(s) * 3.6 : Number(s)) : 0);
+      const reportedSpeedKmh = toKmh(coord.speed);
+
+      // 6. AGTRIE-X v8.2 Multi-Model Consensus Engine (Fair Road Curvature & Tortuosity Policy)
       // Discrete GPS straight-line chords naturally undercount curved roads and market alleyways by 5-10%.
       // We apply dynamic road tortuosity curvature factor when moving to match real-world odometer/travel:
       const estMovementSpeed = Math.max(reportedSpeedKmh, dt > 0 ? (dRawKm / dt) * 3600 : 0);
@@ -478,8 +493,6 @@ exports.updateLocation = async (req, res) => {
       const dFilteredCurvedKm = dFilteredKm * tortuosityFactor;
 
       // Candidate C: Speed-Integrated distance over the gap duration
-      const toKmh = (s) => (Number(s) > 0 ? (Number(s) <= 60 ? Number(s) * 3.6 : Number(s)) : 0);
-      const reportedSpeedKmh = toKmh(coord.speed);
       const prevSpeedKmh = Number.isFinite(prevValid?.speedKmh) ? prevValid.speedKmh : reportedSpeedKmh;
       const ROAD_CURVE_FACTOR = 1.35;
       let dSpeedKm = 0;
@@ -520,6 +533,7 @@ exports.updateLocation = async (req, res) => {
       if (isMathematicallyValidMovement) {
         acceptedPoints++;
         acceptedEventIds.push(eventId);
+        prevTimestamp = tMs;
 
         // Record into immutable DistanceLedger
         ledgerSegments.push({
@@ -546,18 +560,27 @@ exports.updateLocation = async (req, res) => {
         lastValidLat = filterLat;
         lastValidLng = filterLng;
         lastEventId = eventId;
-      } else {
+      } else if (isStationaryDrift) {
         // For stationary rest, advance timestamp so sitting still doesn't build up false velocity.
-        // For micro-movements (< 1m) while walking, preserve anchor timestamp & coords until cumulative movement >= 1m.
         if (prevValid) {
           prevValid = {
             ...prevValid,
-            timestamp: isStationaryDrift ? timestamp.toISOString() : prevValid.timestamp,
-            latRaw: isStationaryDrift ? lat : prevValid.latRaw,
-            lngRaw: isStationaryDrift ? lng : prevValid.lngRaw
+            timestamp: timestamp.toISOString(),
+            latRaw: lat,
+            lngRaw: lng
           };
         }
+        prevTimestamp = tMs;
         acceptedEventIds.push(eventId);
+      } else {
+        // GPS outlier / teleportation > 220 km/h: REJECT without contaminating trusted anchor
+        rejectedPoints++;
+        rejectedEventIds.push(eventId);
+        rejectionReasons.push({
+          timestamp,
+          reason: 'TELEPORTATION_SPEED_EXCEEDED',
+          lat, lng, accuracy, speed: stepSpeedKmh
+        });
       }
 
       validCoords.push({
@@ -644,7 +667,7 @@ exports.updateLocation = async (req, res) => {
       date: sessionState.date || dbLiveDoc?.date,
       lastLat: lastValidLat,
       lastLng: lastValidLng,
-      lastTs: new Date(prevTimestamp || Date.now()).toISOString(),
+      lastTs: new Date(prevValid?.timestamp || sessionState.lastTs || Date.now()).toISOString(),
       lastEventId,
       pLat: filterPLat,
       pLng: filterPLng,
@@ -858,10 +881,26 @@ exports.stopTracking = async (req, res) => {
     const allSessions = await LiveLocation.find({ employee: req.user._id, date: targetDate });
     const totalDist = allSessions.reduce((acc, s) => acc + (s.totalDistance || 0), 0);
 
-    await Attendance.findOneAndUpdate(
-      { employee: req.user._id, date: targetDate },
-      { checkOut: new Date(), totalDistanceTraveled: totalDist }
-    );
+    const attRecord = await Attendance.findOne({ employee: req.user._id, date: targetDate });
+    if (attRecord) {
+      const checkInTime = attRecord.checkIn ? new Date(attRecord.checkIn).getTime() : Date.now();
+      const workHours = Math.max(0, (Date.now() - checkInTime) / (1000 * 60 * 60));
+      attRecord.checkOut = new Date();
+      attRecord.totalWorkHours = Math.round(workHours * 100) / 100;
+      attRecord.totalDistanceTraveled = Math.round(totalDist * 100) / 100;
+      await attRecord.save();
+    } else {
+      await Attendance.create({
+        organizationId: req.user.organizationId?._id || req.user.organizationId,
+        employee: req.user._id,
+        date: targetDate,
+        checkIn: session.startTime || new Date(),
+        checkOut: new Date(),
+        totalWorkHours: Math.round(Math.max(0, (Date.now() - (session.startTime ? new Date(session.startTime).getTime() : Date.now())) / (1000 * 60 * 60)) * 100) / 100,
+        totalDistanceTraveled: Math.round(totalDist * 100) / 100,
+        status: 'present'
+      });
+    }
 
     await ActivityLog.create({
       employee: req.user._id, action: 'TRACKING_STOP',
@@ -1131,6 +1170,119 @@ function haversineDistance(p1, p2) {
 }
 function toRad(deg) { return deg * (Math.PI / 180); }
 
+// @desc Auto-recalculate session distance from stored raw TrackingPoints or LiveLocation coordinates
+const recalculateSessionFromPoints = async (sessionId) => {
+  try {
+    const session = await LiveLocation.findOne({ sessionId });
+    if (!session) return 0;
+
+    let points = await TrackingPoint.find({ sessionId }).sort({ timestamp: 1 }).lean();
+    if (!points || points.length < 2) {
+      points = session.coordinates || [];
+    }
+    if (!points || points.length < 2) return session.totalDistance || 0;
+
+    let totalDistKm = 0;
+    const ledgerSegments = [];
+    let prevPoint = null;
+
+    for (const pt of points) {
+      const lat = Number(pt.lat);
+      const lng = Number(pt.lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat === 0 || lng === 0) continue;
+
+      if (prevPoint) {
+        const dRawKm = haversineDistance(
+          { lat: prevPoint.lat, lng: prevPoint.lng },
+          { lat, lng }
+        );
+
+        const ts1 = new Date(prevPoint.timestamp).getTime();
+        const ts2 = new Date(pt.timestamp).getTime();
+        const dt = Math.max((ts2 - ts1) / 1000, 0.5);
+
+        const speedKmh = Number(pt.speed) > 0 
+          ? (Number(pt.speed) <= 60 ? Number(pt.speed) * 3.6 : Number(pt.speed))
+          : (dt > 0 ? (dRawKm / dt) * 3600 : 0);
+
+        let tortuosity = 1.0;
+        if (speedKmh >= 1.2) {
+          if (speedKmh < 7) tortuosity = 1.08;
+          else if (speedKmh < 45) tortuosity = 1.06;
+          else if (speedKmh <= 120) tortuosity = 1.05;
+          else tortuosity = 1.02;
+        }
+
+        const dCurvedKm = dRawKm * tortuosity;
+        const stepSpeed = dt > 0 ? (dCurvedKm / dt) * 3600 : 0;
+
+        if (dCurvedKm * 1000 >= 1.0 && stepSpeed <= 220) {
+          totalDistKm += dCurvedKm;
+          ledgerSegments.push({
+            organizationId: session.organizationId,
+            employee: session.employee,
+            sessionId,
+            fromEventId: prevPoint.eventId || `${sessionId}:${ts1}`,
+            toEventId: pt.eventId || `${sessionId}:${ts2}`,
+            fromTimestamp: new Date(ts1),
+            toTimestamp: new Date(ts2),
+            fromLat: prevPoint.lat,
+            fromLng: prevPoint.lng,
+            toLat: lat,
+            toLng: lng,
+            distanceMeters: Math.round(dCurvedKm * 1000),
+            distanceKm: Math.round(dCurvedKm * 1000) / 1000,
+            classification: 'ACCEPTED',
+            reason: 'AUTO_RECALCULATED_FROM_RAW_POINTS',
+            algorithmVersion: 'AGTRIE-X-v8.2-RECALC'
+          });
+          prevPoint = pt;
+        }
+      } else {
+        prevPoint = pt;
+      }
+    }
+
+    totalDistKm = Math.round(totalDistKm * 1000) / 1000;
+
+    if (totalDistKm > 0 || ledgerSegments.length > 0) {
+      if (ledgerSegments.length > 0) {
+        await DistanceLedger.deleteMany({ sessionId });
+        await DistanceLedger.insertMany(ledgerSegments, { ordered: false }).catch(() => {});
+      }
+
+      await LiveLocation.updateOne(
+        { sessionId },
+        { 
+          $set: { 
+            totalDistance: totalDistKm, 
+            officialDistance: totalDistKm,
+            acceptedDistance: totalDistKm,
+            rawGpsDistance: totalDistKm
+          } 
+        }
+      );
+
+      const targetDate = session.date || new Date().toISOString().slice(0, 10);
+      const allEmpSessions = await LiveLocation.find({ employee: session.employee, date: targetDate });
+      const empDayTotal = allEmpSessions.reduce((sum, s) => sum + (s.sessionId === sessionId ? totalDistKm : (s.totalDistance || 0)), 0);
+
+      await Attendance.updateOne(
+        { employee: session.employee, date: targetDate },
+        { $set: { totalDistanceTraveled: Math.round(empDayTotal * 100) / 100 } }
+      ).catch(() => {});
+
+      await saveSessionState(sessionId, { totalDistance: totalDistKm });
+    }
+
+    return totalDistKm;
+  } catch (err) {
+    console.error(`[recalculateSessionFromPoints] Error for ${sessionId}:`, err.message);
+    return 0;
+  }
+};
+exports.recalculateSessionFromPoints = recalculateSessionFromPoints;
+
 // @desc Get live locations (optimized with server-side caching & tenant isolation)
 exports.getLiveLocations = async (req, res) => {
   try {
@@ -1169,6 +1321,13 @@ exports.getLiveLocations = async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
     const rawLocations = await Promise.all(activeSessions.map(async (session) => {
       if (!session.employee) return null;
+
+      // Auto-recalculate 0.0 KM sessions if raw points exist
+      if (!session.totalDistance || session.totalDistance === 0) {
+        const recalculated = await recalculateSessionFromPoints(session.sessionId);
+        if (recalculated > 0) session.totalDistance = recalculated;
+      }
+
       const latestCoord = session.coordinates[session.coordinates.length - 1] || {};
       const sessionState = await getSessionState(session.sessionId);
 
@@ -1306,24 +1465,30 @@ exports.getEmployeeReport = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
-// @desc Delete all tracking history for an employee
+// @desc Delete all tracking history for an employee / Reset test data
 exports.deleteEmployeeHistory = async (req, res) => {
   try {
     const { employeeId } = req.params;
     
-    // Optional: Filter by date if needed, but the request says "All history"
     const result = await LiveLocation.deleteMany({ employee: employeeId });
+    await TrackingPoint.deleteMany({ employee: employeeId }).catch(() => {});
+    await DistanceLedger.deleteMany({ employee: employeeId }).catch(() => {});
+    await Attendance.deleteMany({ employee: employeeId }).catch(() => {});
+    await User.findByIdAndUpdate(employeeId, { isTracking: false, isOnline: false }).catch(() => {});
     
+    // Invalidate live location caches
+    await deleteCache('live_locations_all').catch(() => {});
+
     // Log activity
     await ActivityLog.create({
       employee: req.user._id,
       action: 'HISTORY_DELETED',
-      description: `Deleted ${result.deletedCount} tracking records for employee ${employeeId}`
+      description: `Reset all tracking & attendance history for employee ${employeeId}`
     });
 
     res.json({ 
       success: true, 
-      message: `Successfully deleted ${result.deletedCount} history records for this employee.`,
+      message: `Successfully reset all tracking & attendance history for employee.`,
       deletedCount: result.deletedCount
     });
   } catch (err) {

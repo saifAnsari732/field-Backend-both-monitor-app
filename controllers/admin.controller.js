@@ -467,6 +467,7 @@ exports.getTrackingHistory = async (req, res) => {
       filter.date = date;
     }
 
+    const trackingController = require('./tracking.controller');
     const history = await LiveLocation.find(filter, { 
       coordinates: { $slice: -1 }
     })
@@ -474,6 +475,21 @@ exports.getTrackingHistory = async (req, res) => {
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(+limit);
+
+    // Auto-recalculate any 0.0 KM sessions using stored raw points
+    if (Array.isArray(history)) {
+      for (const s of history) {
+        if (!s.totalDistance || s.totalDistance === 0) {
+          try {
+            const recalculated = await trackingController.recalculateSessionFromPoints(s.sessionId);
+            if (recalculated > 0) {
+              s.totalDistance = recalculated;
+              s.officialDistance = recalculated;
+            }
+          } catch (_) {}
+        }
+      }
+    }
 
     const total = await LiveLocation.countDocuments(filter);
 
