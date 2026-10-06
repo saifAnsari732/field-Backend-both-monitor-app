@@ -1220,9 +1220,10 @@ const recalculateSessionFromPoints = async (sessionId) => {
         }
 
         const dCurvedKm = dRawKm * tortuosity;
-        const stepSpeed = dt > 0 ? (dCurvedKm / dt) * 3600 : 0;
+        const isRealisticSpeed = stepSpeed <= 90;
+        const isPlausibleStep = dCurvedKm <= 15 || (dt >= 600 && stepSpeed <= 90);
 
-        if (dCurvedKm * 1000 >= 1.0 && stepSpeed <= 220) {
+        if (dCurvedKm * 1000 >= 1.0 && isRealisticSpeed && isPlausibleStep) {
           totalDistKm += dCurvedKm;
           ledgerSegments.push({
             organizationId: session.organizationId,
