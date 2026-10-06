@@ -462,9 +462,13 @@ exports.getTrackingHistory = async (req, res) => {
     }
 
     if (startDate && endDate) {
-      filter.date = { $gte: startDate, $lte: endDate };
+      if (startDate === endDate) {
+        filter.$or = [{ date: startDate }, { isActive: true }];
+      } else {
+        filter.$or = [{ date: { $gte: startDate, $lte: endDate } }, { isActive: true }];
+      }
     } else if (date) {
-      filter.date = date;
+      filter.$or = [{ date: date }, { isActive: true }];
     }
 
     const trackingController = require('./tracking.controller');

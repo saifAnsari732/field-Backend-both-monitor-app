@@ -115,7 +115,9 @@ exports.getTeamTrackingHistory = async (req, res) => {
     const teamMembers = await User.find({ manager: req.user._id }).select('_id');
     const teamIds = teamMembers.map(emp => emp._id);
     const filter = { employee: { $in: teamIds } };
-    if (date) filter.date = date;
+    if (date) {
+      filter.$or = [{ date }, { isActive: true }];
+    }
     if (employeeId) filter.employee = employeeId;
 
     const history = await LiveLocation.find(filter)
