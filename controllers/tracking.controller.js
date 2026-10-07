@@ -480,38 +480,29 @@ exports.updateLocation = async (req, res) => {
         filterPLng = (1 - kLng) * predPLng;
       }
 
-      // 5. Raw & Filtered Segment Distance Calculations
+      // 5. Raw Segment Distance & Kinematic Calculations
       const dRawKm = prevValid
         ? haversineDistance(
             { lat: prevValid.latRaw ?? prevValid.lat, lng: prevValid.lngRaw ?? prevValid.lng },
             { lat, lng }
           )
         : 0;
-
-      const dFilteredKm = haversineDistance(
-        { lat: lastValidLat, lng: lastValidLng },
-        { lat: filterLat, lng: filterLng }
-      );
+      const distM = dRawKm * 1000;
 
       const toKmh = (s) => (Number(s) > 0 ? (Number(s) <= 60 ? Number(s) * 3.6 : Number(s)) : 0);
       const reportedSpeedKmh = toKmh(coord.speed);
+      const rawCalcSpeedKmh = dt > 0 ? (dRawKm / dt) * 3600 : 0;
+      const effectiveSpeedKmh = reportedSpeedKmh > 0 ? Math.max(reportedSpeedKmh, rawCalcSpeedKmh) : rawCalcSpeedKmh;
 
-      // 6. AGTRIE-X v10.0 Kinematic Step & Velocity Guard
-      const calcSpeedKmh = dt > 0 ? (dFilteredKm / dt) * 3600 : 0;
-      const stepSpeedKmh = reportedSpeedKmh > 0 ? Math.max(reportedSpeedKmh, calcSpeedKmh) : calcSpeedKmh;
-      const stepDistKm = stepSpeedKmh <= 180 ? dFilteredKm : 0;
-      if (stepSpeedKmh > batchMaxSpeed && stepSpeedKmh <= 180) batchMaxSpeed = stepSpeedKmh;
+      if (effectiveSpeedKmh > batchMaxSpeed && effectiveSpeedKmh <= 160) {
+        batchMaxSpeed = effectiveSpeedKmh;
+      }
 
-      // 7. Advanced AGTRIE-X v10.0 Sovereign Stationary Noise & Indoor Drift Shield
-      const distM = dRawKm * 1000;
-      const isLowSpeed = reportedSpeedKmh < 1.8 || stepSpeedKmh < 1.8 || bayesianResult.motionState === 'STATIONARY';
-      const isStationaryDrift = isLowSpeed && (distM < 50.0 || distM < Math.max(20.0, accuracy * 2.0));
-
-      const isMathematicallyValidMovement = 
-        !isStationaryDrift &&
-        stepDistKm > 0 &&
-        stepSpeedKmh <= 180 &&
-        stepDistKm * 1000 >= 3.0; // Require at least 3.0m genuine displacement when moving
+      // 6. High-Fidelity Movement vs Stationary Drift Gate
+      // Real travel: speed >= 1.4 km/h and displacement >= 4m, or any displacement >= 15m
+      const isStationaryDrift = (distM < 4.0) || (effectiveSpeedKmh < 1.4 && distM < 15.0);
+      const isTeleportation = effectiveSpeedKmh > 160.0;
+      const isMathematicallyValidMovement = !isStationaryDrift && !isTeleportation && dRawKm > 0 && dt <= 1800;
 
       if (isMathematicallyValidMovement) {
         acceptedPoints++;
@@ -531,11 +522,11 @@ exports.updateLocation = async (req, res) => {
           fromLng: prevValid?.lngRaw ?? lastValidLng,
           toLat: lat,
           toLng: lng,
-          distanceMeters: Math.round(stepDistKm * 1000),
-          distanceKm: Math.round(stepDistKm * 1000) / 1000,
+          distanceMeters: Math.round(dRawKm * 1000),
+          distanceKm: Math.round(dRawKm * 1000) / 1000,
           classification: 'ACCEPTED',
-          reason: 'AGTRIE_X_V9_STRICT_1TO1_ACCEPTED',
-          algorithmVersion: 'AGTRIE-X-v9.2-STRICT'
+          reason: 'AGTRIE_X_V10_RAW_GEODESIC_ACCEPTED',
+          algorithmVersion: 'AGTRIE-X-v10.0-PRO'
         });
 
         prev2Valid = prevValid;
@@ -1426,6 +1417,28 @@ exports.getLiveLocations = async (req, res) => {
         displayDistance = Math.round(sessionDist * 100) / 100;
       }
 
+      // Calculate today's full cumulative accepted KM across all today's sessions for this employee
+      const today = getBusinessDate(new Date(), 'Asia/Kolkata');
+      const todayStartMs = new Date(`${today}T00:00:00.000Z`).getTime();
+
+      const empTodayLedgerAgg = await DistanceLedger.aggregate([
+        {
+          $match: {
+            employee: session.employee._id,
+            classification: 'ACCEPTED',
+            toTimestamp: { $gte: new Date(todayStartMs) }
+          }
+        },
+        { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
+      ]);
+
+      let todayTotalKm = 0;
+      if (empTodayLedgerAgg && empTodayLedgerAgg.length > 0 && typeof empTodayLedgerAgg[0].totalKm === 'number' && empTodayLedgerAgg[0].totalKm > 0) {
+        todayTotalKm = Math.round(empTodayLedgerAgg[0].totalKm * 100) / 100;
+      } else {
+        todayTotalKm = displayDistance;
+      }
+
       return {
         employeeId: session.employee._id,
         name: session.employee.name,
@@ -1436,7 +1449,7 @@ exports.getLiveLocations = async (req, res) => {
         lng: latestCoord.lng,
         speed: latestCoord.speed || 0,
         address: latestCoord.address,
-        totalDistance: displayDistance,
+        totalDistance: todayTotalKm,
         sessionTotalDistance: displayDistance,
         sessionId: session.sessionId,
         startTime: session.startTime,
