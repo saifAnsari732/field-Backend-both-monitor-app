@@ -47,17 +47,27 @@ exports.startTracking = async (req, res) => {
     }).sort({ createdAt: -1 });
 
     if (existingActiveSession) {
-      console.log(`📍 startTracking: Re-attaching to existing active session ${existingActiveSession.sessionId}`);
-      await User.findByIdAndUpdate(req.user._id, { isTracking: true });
-      return res.status(200).json({
-        success: true,
-        message: 'Active shift already exists. Reconnected.',
-        sessionId: existingActiveSession.sessionId,
-        totalDistance: existingActiveSession.totalDistance || 0,
-        totalDistanceToday: existingActiveSession.totalDistance || 0,
-        startTime: existingActiveSession.startTime,
-        session: existingActiveSession,
-      });
+      const sessionDate = existingActiveSession.date;
+      if (sessionDate && sessionDate !== today) {
+        console.log(`📍 startTracking: Closing stale multi-day session ${existingActiveSession.sessionId} from ${sessionDate}`);
+        await LiveLocation.findByIdAndUpdate(existingActiveSession._id, {
+          isActive: false,
+          endTime: new Date(),
+        });
+        await clearSessionState(existingActiveSession.sessionId);
+      } else {
+        console.log(`📍 startTracking: Re-attaching to existing active session ${existingActiveSession.sessionId}`);
+        await User.findByIdAndUpdate(req.user._id, { isTracking: true });
+        return res.status(200).json({
+          success: true,
+          message: 'Active shift already exists. Reconnected.',
+          sessionId: existingActiveSession.sessionId,
+          totalDistance: existingActiveSession.totalDistance || 0,
+          totalDistanceToday: existingActiveSession.totalDistance || 0,
+          startTime: existingActiveSession.startTime,
+          session: existingActiveSession,
+        });
+      }
     }
 
     const session = await LiveLocation.create({
@@ -469,66 +479,32 @@ exports.updateLocation = async (req, res) => {
       const toKmh = (s) => (Number(s) > 0 ? (Number(s) <= 60 ? Number(s) * 3.6 : Number(s)) : 0);
       const reportedSpeedKmh = toKmh(coord.speed);
 
-      // 6. AGTRIE-X v8.2 Multi-Model Consensus Engine (Fair Road Curvature & Tortuosity Policy)
-      // Discrete GPS straight-line chords naturally undercount curved roads and market alleyways by 5-10%.
-      // We apply dynamic road tortuosity curvature factor when moving to match real-world odometer/travel:
-      const estMovementSpeed = Math.max(reportedSpeedKmh, dt > 0 ? (dRawKm / dt) * 3600 : 0);
+      // 6. AGTRIE-X v9.0 Ultra-Precise EKF Trajectory Engine
+      // Primary distance metric: Geodesic Haversine between Kalman-smoothed position states (dFilteredKm).
+      // Standard road tortuosity factor is capped at 1.02 (+2%) ONLY when actively driving, eliminating artificial 1.35x inflation.
+      const estMovementSpeed = Math.max(reportedSpeedKmh, dt > 0 ? (dFilteredKm / dt) * 3600 : 0);
       let tortuosityFactor = 1.0;
-      if (estMovementSpeed >= 1.2 || reportedSpeedKmh > 0.3) {
-        if (estMovementSpeed < 7.0) {
-          tortuosityFactor = 1.08; // +8% fair curve compensation for market alleys & slow walking
-        } else if (estMovementSpeed < 45.0) {
-          tortuosityFactor = 1.06; // +6% curve compensation for city bike / scooter turns & roundabouts
-        } else if (estMovementSpeed <= 120.0) {
-          tortuosityFactor = 1.05; // +5% road curvature compensation for vehicle driving
-        } else {
-          tortuosityFactor = 1.02; // Highway
-        }
+      if (estMovementSpeed >= 7.0 && reportedSpeedKmh >= 3.0) {
+        tortuosityFactor = 1.02; // Fair 2% curvature for vehicular travel; no excessive curve inflation
       }
 
-      // Candidate A: Raw Geodesic WGS84 distance with curve compensation
-      const dRawCurvedKm = dRawKm * tortuosityFactor;
-
-      // Candidate B: Kalman State-Space smoothed distance with curve compensation
-      const dFilteredCurvedKm = dFilteredKm * tortuosityFactor;
-
-      // Candidate C: Speed-Integrated distance over the gap duration
-      const prevSpeedKmh = Number.isFinite(prevValid?.speedKmh) ? prevValid.speedKmh : reportedSpeedKmh;
-      const ROAD_CURVE_FACTOR = 1.35;
-      let dSpeedKm = 0;
-      if (reportedSpeedKmh >= 5 && prevSpeedKmh >= 5 && dt <= 600) {
-        const avgKmh = (reportedSpeedKmh + prevSpeedKmh) / 2;
-        dSpeedKm = Math.min((avgKmh * dt) / 3600, dRawKm * ROAD_CURVE_FACTOR);
-      } else if (reportedSpeedKmh > 0 && reportedSpeedKmh <= 220) {
-        dSpeedKm = (reportedSpeedKmh * Math.min(dt, 60)) / 3600;
-      }
-
-      // Filter out invalid candidates (> 220 km/h speed threshold over true anchor dt)
-      const rawSpeedKmh = dt > 0 ? (dRawCurvedKm / dt) * 3600 : 0;
-      const filteredSpeedKmh = dt > 0 ? (dFilteredCurvedKm / dt) * 3600 : 0;
-
-      const validCandidates = [];
-      if (rawSpeedKmh <= 220 && accuracy <= 350) validCandidates.push(dRawCurvedKm);
-      if (filteredSpeedKmh <= 220) validCandidates.push(dFilteredCurvedKm);
-      if (dSpeedKm > 0 && dSpeedKm <= (220 * dt) / 3600) validCandidates.push(dSpeedKm);
-
-      // Undercount-Averse Policy: Choose maximum defensible valid candidate
-      const stepDistKm = validCandidates.length > 0 ? Math.max(...validCandidates) : dFilteredCurvedKm;
+      // Step distance is strictly based on the Kalman-filtered position state
+      const stepDistKm = dFilteredKm * tortuosityFactor;
 
       const effectiveDt = dt > 120 ? Math.max(10, (stepDistKm / 80) * 3600) : dt;
-      const stepSpeedKmh = (stepDistKm / effectiveDt) * 3600;
+      const stepSpeedKmh = effectiveDt > 0 ? (stepDistKm / effectiveDt) * 3600 : 0;
       if (stepSpeedKmh > batchMaxSpeed && stepSpeedKmh <= 220) batchMaxSpeed = stepSpeedKmh;
 
-      // 6. Mathematical Bayesian & IMM Decision Gate
+      // 7. Advanced Stationary Noise & Indoor Drift Gate
+      const distM = dRawKm * 1000;
       const isStationaryDrift = 
-        bayesianResult.motionState === 'STATIONARY' && 
-        dRawKm * 1000 <= Math.max(accuracy * 0.4, 8) && 
-        reportedSpeedKmh < 1.2;
+        (bayesianResult.motionState === 'STATIONARY' || reportedSpeedKmh < 1.8 || stepSpeedKmh < 1.8) && 
+        (distM < 15.0 || distM < Math.max(12.0, accuracy * 0.75));
 
       const isMathematicallyValidMovement = 
         !isStationaryDrift &&
         stepSpeedKmh <= 220 &&
-        stepDistKm * 1000 >= 1.0; // Accept micro-movements (> 1m) when actually moving
+        stepDistKm * 1000 >= 3.0; // Require at least 3.0m genuine displacement when moving
 
       if (isMathematicallyValidMovement) {
         acceptedPoints++;
@@ -551,8 +527,8 @@ exports.updateLocation = async (req, res) => {
           distanceMeters: Math.round(stepDistKm * 1000),
           distanceKm: Math.round(stepDistKm * 1000) / 1000,
           classification: (dt > 120 || bayesianResult.classification === 'CANDIDATE') ? 'RECOVERED' : (bayesianResult.classification === 'ACCEPTED' ? 'ACCEPTED' : 'RECOVERED'),
-          reason: dt > 120 ? 'LONG_GAP_RECOVERY' : (bayesianResult.classification === 'CANDIDATE' ? 'BAYESIAN_CANDIDATE_RECOVERED' : 'AGTRIE_X_V8_MULTIMODAL_MAX_CONSENSUS'),
-          algorithmVersion: 'AGTRIE-X-v8.1-ANCHOR-SYNCED'
+          reason: dt > 120 ? 'LONG_GAP_RECOVERY' : 'AGTRIE_X_V9_EKF_EXACT_HAIVERSINE',
+          algorithmVersion: 'AGTRIE-X-v9.0-EKF'
         });
 
         prev2Valid = prevValid;
@@ -561,7 +537,7 @@ exports.updateLocation = async (req, res) => {
         lastValidLng = filterLng;
         lastEventId = eventId;
       } else if (isStationaryDrift) {
-        // For stationary rest, advance timestamp so sitting still doesn't build up false velocity.
+        // For stationary rest, advance anchor timestamp without adding distance to prevent speed spikes when motion resumes.
         if (prevValid) {
           prevValid = {
             ...prevValid,
@@ -1176,13 +1152,18 @@ function haversineDistance(p1, p2) {
 }
 function toRad(deg) { return deg * (Math.PI / 180); }
 
-// @desc Auto-recalculate session distance from stored raw TrackingPoints or LiveLocation coordinates
+// @desc Auto-recalculate session distance safely from validated TrackingPoints
 const recalculateSessionFromPoints = async (sessionId) => {
   try {
     const session = await LiveLocation.findOne({ sessionId });
     if (!session) return 0;
 
-    let points = await TrackingPoint.find({ sessionId }).sort({ timestamp: 1 }).lean();
+    // Filter points that are ACCEPTED or RECOVERED to avoid re-introducing rejected GPS noise
+    let points = await TrackingPoint.find({ 
+      sessionId, 
+      processingStatus: { $in: ['ACCEPTED', 'RECOVERED', 'PENDING'] } 
+    }).sort({ timestamp: 1 }).lean();
+
     if (!points || points.length < 2) {
       points = session.coordinates || [];
     }
@@ -1196,6 +1177,7 @@ const recalculateSessionFromPoints = async (sessionId) => {
       const lat = Number(pt.lat);
       const lng = Number(pt.lng);
       if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat === 0 || lng === 0) continue;
+      if (pt.mocked === true || pt.isMock === true) continue;
 
       if (prevPoint) {
         const dRawKm = haversineDistance(
@@ -1208,30 +1190,32 @@ const recalculateSessionFromPoints = async (sessionId) => {
         const dt = Math.max((ts2 - ts1) / 1000, 0.5);
 
         // Gap Re-Anchoring Policy: Time gaps > 1 hour (3600s) indicate offline/rest period.
-        // Re-anchor on fresh coordinate without adding straight-line gap distance.
         if (dt > 3600) {
           prevPoint = pt;
           continue;
         }
 
+        const distM = dRawKm * 1000;
         const speedKmh = Number(pt.speed) > 0 
           ? (Number(pt.speed) <= 60 ? Number(pt.speed) * 3.6 : Number(pt.speed))
           : (dt > 0 ? (dRawKm / dt) * 3600 : 0);
 
+        // Hard stationary gate during recalculation: ignore micro-drift < 15m or speed < 1.8 km/h
+        if (distM < 15.0 || (speedKmh < 1.8 && distM < 20.0)) {
+          prevPoint = pt;
+          continue;
+        }
+
         let tortuosity = 1.0;
-        if (speedKmh >= 1.2) {
-          if (speedKmh < 7) tortuosity = 1.08;
-          else if (speedKmh < 45) tortuosity = 1.06;
-          else if (speedKmh <= 120) tortuosity = 1.05;
-          else tortuosity = 1.02;
+        if (speedKmh >= 7.0) {
+          tortuosity = 1.02; // Fair 2% curve compensation when driving
         }
 
         const dCurvedKm = dRawKm * tortuosity;
         const stepSpeed = dt > 0 ? (dCurvedKm / dt) * 3600 : 0;
-        const isRealisticSpeed = stepSpeed <= 90;
-        const isPlausibleStep = dCurvedKm <= 15 || (dt >= 600 && stepSpeed <= 90);
+        const isRealisticSpeed = stepSpeed <= 180;
 
-        if (dCurvedKm * 1000 >= 1.0 && isRealisticSpeed && isPlausibleStep) {
+        if (dCurvedKm * 1000 >= 3.0 && isRealisticSpeed) {
           totalDistKm += dCurvedKm;
           ledgerSegments.push({
             organizationId: session.organizationId,
@@ -1248,8 +1232,8 @@ const recalculateSessionFromPoints = async (sessionId) => {
             distanceMeters: Math.round(dCurvedKm * 1000),
             distanceKm: Math.round(dCurvedKm * 1000) / 1000,
             classification: 'ACCEPTED',
-            reason: 'AUTO_RECALCULATED_FROM_RAW_POINTS',
-            algorithmVersion: 'AGTRIE-X-v8.2-RECALC'
+            reason: 'SAFE_RECALCULATED_VALIDATED_POINTS',
+            algorithmVersion: 'AGTRIE-X-v9.0-SAFE-RECALC'
           });
           prevPoint = pt;
         }
@@ -1260,14 +1244,13 @@ const recalculateSessionFromPoints = async (sessionId) => {
 
     totalDistKm = Math.round(totalDistKm * 1000) / 1000;
 
-    if (totalDistKm > 0 || ledgerSegments.length > 0) {
-      if (ledgerSegments.length > 0) {
-        await DistanceLedger.deleteMany({ sessionId });
-        try {
-          await DistanceLedger.insertMany(ledgerSegments, { ordered: false });
-        } catch (insertErr) {
-          console.error(`[recalculateSessionFromPoints] Ledger insert warning for ${sessionId}:`, insertErr.message);
-        }
+    // Only update ledger if recalculation yielded valid non-zero segments
+    if (totalDistKm > 0 && ledgerSegments.length > 0) {
+      await DistanceLedger.deleteMany({ sessionId });
+      try {
+        await DistanceLedger.insertMany(ledgerSegments, { ordered: false });
+      } catch (insertErr) {
+        console.error(`[recalculateSessionFromPoints] Ledger insert warning for ${sessionId}:`, insertErr.message);
       }
 
       await LiveLocation.updateOne(
@@ -1306,7 +1289,7 @@ const recalculateSessionFromPoints = async (sessionId) => {
 };
 exports.recalculateSessionFromPoints = recalculateSessionFromPoints;
 
-// @desc Continuous background worker to reconcile all active sessions in MongoDB
+// @desc Continuous background worker to reconcile all active sessions in MongoDB (NON-DESTRUCTIVE SYNC)
 exports.reconcileAllActiveSessions = async () => {
   try {
     const today = new Date().toISOString().slice(0, 10);
@@ -1315,11 +1298,18 @@ exports.reconcileAllActiveSessions = async () => {
     });
 
     for (const session of activeSessions) {
-      const rawCount = await TrackingPoint.countDocuments({ sessionId: session.sessionId });
-      const ledgerCount = await DistanceLedger.countDocuments({ sessionId: session.sessionId });
+      // Non-destructive audit: calculate official distance strictly from DistanceLedger sum
+      const ledgerAgg = await DistanceLedger.aggregate([
+        { $match: { sessionId: session.sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED', 'CANDIDATE'] } } },
+        { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
+      ]);
 
-      if (rawCount >= 2 && (ledgerCount < Math.max(1, Math.floor(rawCount / 2)) || !session.totalDistance || session.totalDistance === 0)) {
-        await recalculateSessionFromPoints(session.sessionId);
+      const officialKm = Math.round((ledgerAgg[0]?.totalKm || 0) * 1000) / 1000;
+      if (officialKm > 0 && Math.abs((session.totalDistance || 0) - officialKm) > 0.01) {
+        await LiveLocation.updateOne(
+          { sessionId: session.sessionId },
+          { $set: { totalDistance: officialKm, officialDistance: officialKm, acceptedDistance: officialKm } }
+        );
       }
     }
   } catch (err) {
@@ -1376,24 +1366,33 @@ exports.getLiveLocations = async (req, res) => {
       const sessionState = await getSessionState(session.sessionId);
       const sessionDist = sessionState?.totalDistance ?? session.totalDistance ?? 0;
 
-      // For multi-day ongoing sessions (e.g. 70h+), calculate distance traveled strictly TODAY
-      const startOfToday = new Date(`${today}T00:00:00.000Z`);
-      const todayLedgerAgg = await DistanceLedger.aggregate([
-        {
-          $match: {
-            sessionId: session.sessionId,
-            classification: { $in: ['ACCEPTED', 'RECOVERED', 'CANDIDATE'] },
-            createdAt: { $gte: startOfToday }
-          }
-        },
-        { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
-      ]);
+      // Calculate today-wise distance and start time for current day (Asia/Kolkata timezone)
+      const todayIST = getBusinessDate(new Date(), 'Asia/Kolkata');
+      const todayCoords = (session.coordinates || []).filter(c => {
+        if (!c.timestamp) return false;
+        return getBusinessDate(new Date(c.timestamp), 'Asia/Kolkata') === todayIST;
+      });
 
-      const todayLedgerKm = todayLedgerAgg[0]?.totalKm;
-      const isMultiDaySession = session.startTime && (new Date() - new Date(session.startTime)) > 24 * 60 * 60 * 1000;
-      const displayDistance = (isMultiDaySession && typeof todayLedgerKm === 'number')
-        ? Math.round(todayLedgerKm * 100) / 100
+      let todayKmFromCoords = 0;
+      for (let i = 1; i < todayCoords.length; i++) {
+        const p1 = todayCoords[i - 1];
+        const p2 = todayCoords[i];
+        if (p1.lat && p1.lng && p2.lat && p2.lng) {
+          const R = 6371;
+          const dLat = (p2.lat - p1.lat) * Math.PI / 180;
+          const dLng = (p2.lng - p1.lng) * Math.PI / 180;
+          const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(p1.lat * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+          const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+          todayKmFromCoords += R * c;
+        }
+      }
+
+      const isMultiDaySession = session.startTime && (new Date() - new Date(session.startTime)) > 20 * 60 * 60 * 1000;
+      const displayDistance = (isMultiDaySession || todayCoords.length > 0)
+        ? Math.round(todayKmFromCoords * 100) / 100
         : Math.round(sessionDist * 100) / 100;
+
+      const displayStartTime = todayCoords[0]?.timestamp || session.startTime;
 
       return {
         employeeId: session.employee._id,
@@ -1408,7 +1407,7 @@ exports.getLiveLocations = async (req, res) => {
         totalDistance: displayDistance,
         sessionTotalDistance: Math.round(sessionDist * 100) / 100,
         sessionId: session.sessionId,
-        startTime: session.startTime,
+        startTime: displayStartTime,
         updatedAt: latestCoord.timestamp || session.updatedAt,
       };
     }));
