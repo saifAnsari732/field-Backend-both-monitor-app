@@ -1,4 +1,7 @@
-const Redis = require('ioredis');
+let Redis = null;
+try {
+  Redis = require('ioredis');
+} catch (_) {}
 const NodeCache = require('node-cache');
 
 // ─── In-memory fallback cache (when Redis is not available) ──────────────────
@@ -8,7 +11,7 @@ const memCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
 let redisClient = null;
 let redisAvailable = false;
 
-if (process.env.REDIS_URL) {
+if (Redis && process.env.REDIS_URL) {
   try {
     const isRediss = process.env.REDIS_URL.startsWith('rediss://');
     redisClient = new Redis(process.env.REDIS_URL, {

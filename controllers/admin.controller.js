@@ -36,6 +36,27 @@ exports.updateMeeting = async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
+exports.getAllMeetings = async (req, res) => {
+  try {
+    const { page = 1, limit = 10, status, date, employeeId } = req.query;
+    const filter = {};
+    if (status) filter.status = status;
+    if (employeeId) filter.employee = employeeId;
+    if (date) { const d = new Date(date); filter.date = { $gte: d, $lt: new Date(d.getTime() + 86400000) }; }
+    const meetings = await Meeting.find(filter).populate('employee', 'name email employeeId').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(+limit);
+    const total = await Meeting.countDocuments(filter);
+    res.json({ success: true, meetings, total, pages: Math.ceil(total / limit) });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
+
+exports.deleteMeeting = async (req, res) => {
+  try {
+    const meeting = await Meeting.findByIdAndDelete(req.params.id);
+    if (!meeting) return res.status(404).json({ success: false, message: 'Meeting not found' });
+    res.json({ success: true, message: 'Meeting deleted successfully' });
+  } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+};
+
 // ─── Expense Controller ───────────────────────────────────────────────────────
 exports.createExpense = async (req, res) => {
   try {
@@ -484,52 +505,43 @@ exports.getTrackingHistory = async (req, res) => {
     const startOfTarget = new Date(`${targetDateStr}T00:00:00.000Z`);
     const endOfTarget = new Date(`${targetDateStr}T23:59:59.999Z`);
 
-    // Auto-recalculate 0.0 KM sessions and isolate date-specific KM
-    if (Array.isArray(history)) {
-      const { DistanceLedger } = require('../models/index');
-      for (const s of history) {
-        if (!s.totalDistance || s.totalDistance === 0) {
-          try {
-            const recalculated = await trackingController.recalculateSessionFromPoints(s.sessionId);
-            if (recalculated > 0) {
-              s.totalDistance = recalculated;
-              s.officialDistance = recalculated;
-            }
-          } catch (_) {}
-        }
+    // Derive authoritative distance strictly from DistanceLedger for every history session
+    const { DistanceLedger } = require('../models/index');
+    const sanitizedHistory = await Promise.all((history || []).map(async (doc) => {
+      const s = doc.toObject ? doc.toObject() : { ...doc };
 
-        const sessionDateStr = s.date || (s.startTime ? new Date(s.startTime).toISOString().slice(0, 10) : targetDateStr);
-        if (sessionDateStr !== targetDateStr || (s.startTime && new Date(s.startTime) < startOfTarget)) {
-          try {
-            const ledgerAgg = await DistanceLedger.aggregate([
-              {
-                $match: {
-                  sessionId: s.sessionId,
-                  classification: { $in: ['ACCEPTED', 'RECOVERED', 'CANDIDATE'] },
-                  toTimestamp: { $gte: startOfTarget, $lte: endOfTarget }
-                }
-              },
-              { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
-            ]);
+      const ledgerAgg = await DistanceLedger.aggregate([
+        {
+          $match: {
+            sessionId: s.sessionId,
+            classification: 'ACCEPTED'
+          }
+        },
+        { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
+      ]);
 
-            const dateSpecificKm = Math.round((ledgerAgg[0]?.totalKm || 0) * 100) / 100;
-            if (s.toObject) {
-              s.totalDistance = dateSpecificKm;
-              s.officialDistance = dateSpecificKm;
-            } else {
-              s.totalDistance = dateSpecificKm;
-              s.officialDistance = dateSpecificKm;
-            }
-          } catch (_) {}
-        }
+      if (ledgerAgg && ledgerAgg.length > 0 && typeof ledgerAgg[0].totalKm === 'number' && ledgerAgg[0].totalKm > 0) {
+        const verifiedKm = Math.round(ledgerAgg[0].totalKm * 100) / 100;
+        s.totalDistance = verifiedKm;
+        s.officialDistance = verifiedKm;
+      } else if (!s.totalDistance || s.totalDistance === 0) {
+        try {
+          const recalculated = await trackingController.recalculateSessionFromPoints(s.sessionId);
+          if (recalculated > 0) {
+            s.totalDistance = recalculated;
+            s.officialDistance = recalculated;
+          }
+        } catch (_) {}
       }
-    }
+
+      return s;
+    }));
 
     const total = await LiveLocation.countDocuments(filter);
 
     res.json({
       success: true,
-      history,
+      history: sanitizedHistory,
       total,
       pages: Math.ceil(total / limit)
     });

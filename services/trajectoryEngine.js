@@ -557,7 +557,9 @@ class DistanceLedgerCalculator {
   }
 
   getSnapshot() {
-    const officialKm = parseFloat((this.acceptedKm + this.recoveredKm).toFixed(3));
+    // CRITICAL INVARIANT: Official KM is strictly derived from verified, accepted real GPS segments.
+    // Zero recovered, zero spline-interpolated, zero estimated distance is ever added to officialKm.
+    const officialKm = parseFloat(this.acceptedKm.toFixed(3));
     const sigmaKm = parseFloat(Math.sqrt(this.varianceSum).toFixed(3));
     const rawTotalKm = parseFloat((this.acceptedKm + this.recoveredKm + this.rejectedKm + this.unverifiedKm).toFixed(3));
     
