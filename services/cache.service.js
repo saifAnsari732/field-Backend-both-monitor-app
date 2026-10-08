@@ -16,11 +16,24 @@ const rawRedisUrl = (process.env.REDIS_URL || '').trim().replace(/^["']|["']$/g,
 if (Redis && rawRedisUrl) {
   try {
     const isRediss = rawRedisUrl.startsWith('rediss://');
+    let tlsConfig = undefined;
+    if (isRediss) {
+      try {
+        const u = new URL(rawRedisUrl);
+        tlsConfig = {
+          rejectUnauthorized: false,
+          servername: u.hostname, // Crucial for Linux OpenSSL TLS SNI on AWS EC2
+        };
+      } catch (_) {
+        tlsConfig = { rejectUnauthorized: false };
+      }
+    }
+
     redisClient = new Redis(rawRedisUrl, {
       lazyConnect: true,
       family: 4, // Force IPv4 (Solves timeout/drop issues on some hostings)
       connectTimeout: 10000,
-      tls: isRediss ? { rejectUnauthorized: false } : undefined, // TLS required for rediss:// (Upstash)
+      tls: tlsConfig,
       retryStrategy: (times) => {
         if (times > 5) {
           console.warn('⚠️  Redis: Max retries reached. Falling back to in-memory cache.');
