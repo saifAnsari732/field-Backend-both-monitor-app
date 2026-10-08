@@ -15,35 +15,34 @@ const rawRedisUrl = (process.env.REDIS_URL || '').trim().replace(/^["']|["']$/g,
 
 if (Redis && rawRedisUrl) {
   try {
-    const isRediss = rawRedisUrl.startsWith('rediss://');
-    let tlsConfig = undefined;
-    if (isRediss) {
-      try {
-        const u = new URL(rawRedisUrl);
-        tlsConfig = {
-          rejectUnauthorized: false,
-          servername: u.hostname, // Crucial for Linux OpenSSL TLS SNI on AWS EC2
-        };
-      } catch (_) {
-        tlsConfig = { rejectUnauthorized: false };
-      }
+    let redisOptions = {};
+    if (rawRedisUrl.startsWith('redis://') || rawRedisUrl.startsWith('rediss://')) {
+      const isRediss = rawRedisUrl.startsWith('rediss://');
+      const u = new URL(rawRedisUrl);
+      redisOptions = {
+        host: u.hostname,
+        port: parseInt(u.port || '6379', 10),
+        username: u.username || 'default',
+        password: decodeURIComponent(u.password || ''),
+        tls: isRediss ? { rejectUnauthorized: false, servername: u.hostname } : undefined,
+        family: 4, // Force IPv4 (Solves timeout/drop issues on AWS EC2)
+        connectTimeout: 10000,
+        lazyConnect: true,
+        maxRetriesPerRequest: 2,
+        retryStrategy: (times) => {
+          if (times > 5) {
+            console.warn('⚠️  Redis: Max retries reached. Falling back to in-memory cache.');
+            redisAvailable = false;
+            return null; // Stop retrying
+          }
+          return Math.min(times * 200, 2000); // Exponential backoff
+        },
+      };
+    } else {
+      redisOptions = { lazyConnect: true };
     }
 
-    redisClient = new Redis(rawRedisUrl, {
-      lazyConnect: true,
-      family: 4, // Force IPv4 (Solves timeout/drop issues on some hostings)
-      connectTimeout: 10000,
-      tls: tlsConfig,
-      retryStrategy: (times) => {
-        if (times > 5) {
-          console.warn('⚠️  Redis: Max retries reached. Falling back to in-memory cache.');
-          redisAvailable = false;
-          return null; // Stop retrying
-        }
-        return Math.min(times * 200, 2000); // Exponential backoff
-      },
-      maxRetriesPerRequest: 2,
-    });
+    redisClient = new Redis(redisOptions);
 
     redisClient.on('connect', () => {
       redisAvailable = true;
@@ -56,7 +55,6 @@ if (Redis && rawRedisUrl) {
 
     redisClient.on('error', (err) => {
       redisAvailable = false;
-      // Swallow: fallback to in-memory
     });
 
     redisClient.connect().then(() => {
