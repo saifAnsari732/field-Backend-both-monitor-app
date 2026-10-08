@@ -60,8 +60,18 @@ exports.deleteMeeting = async (req, res) => {
 // ─── Expense Controller ───────────────────────────────────────────────────────
 exports.createExpense = async (req, res) => {
   try {
-    const expense = await Expense.create({ ...req.body, employee: req.user._id });
-    await ActivityLog.create({ employee: req.user._id, action: 'EXPENSE_SUBMITTED', description: `₹${expense.amount} - ${expense.category}` });
+    const orgId = req.user.organizationId?._id || req.user.organizationId;
+    const expense = await Expense.create({ 
+      ...req.body, 
+      employee: req.user._id,
+      organizationId: orgId
+    });
+    await ActivityLog.create({ 
+      employee: req.user._id, 
+      organizationId: orgId,
+      action: 'EXPENSE_SUBMITTED', 
+      description: `₹${expense.amount} - ${expense.category}` 
+    });
     const io = req.app.get('io');
     io.to('admins').emit('new_expense', { expense, employeeName: req.user.name });
     res.status(201).json({ success: true, expense });
@@ -358,11 +368,18 @@ const getScopedEmployeeIds = async (user) => {
   if (['SUPER_ADMIN', 'SUPERADMIN'].includes(userRole)) return null;
 
   const orgId = user?.organizationId?._id || user?.organizationId;
-  const userScope = { organizationId: orgId };
+  const userScope = {};
+  if (orgId) {
+    userScope.organizationId = orgId;
+  }
+
   if (userRole === 'MANAGER') {
     userScope.$or = [{ managerId: user._id }, { manager: user._id }, { _id: user._id }];
   } else if (userRole === 'EMPLOYEE') {
     userScope._id = user._id;
+  } else if (!orgId) {
+    // Org Admin or Admin without explicit orgId assigned: allow querying all records
+    return null;
   }
 
   const scopedUsers = await User.find(userScope).select('_id');
@@ -405,7 +422,7 @@ exports.getAllMeetings = async (req, res) => {
     }
 
     if (status) filter.status = status;
-    const meetings = await Meeting.find(filter).populate('employee', 'name employeeId department').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(+limit);
+    const meetings = await Meeting.find(filter).populate('employee', 'name employeeId department avatar emp_profile_pic managerPro_pic phone role').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(+limit);
     const total = await Meeting.countDocuments(filter);
     res.json({ success: true, meetings, total, pages: Math.ceil(total / limit) });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
@@ -413,26 +430,55 @@ exports.getAllMeetings = async (req, res) => {
 
 exports.getAllExpenses = async (req, res) => {
   try {
-    const { page = 1, limit = 20, status, employeeId, category } = req.query;
+    const { page = 1, limit = 100, status, employeeId, category } = req.query;
     const filter = {};
 
-    const scopedIds = await getScopedEmployeeIds(req.user);
-    if (scopedIds !== null) {
-      if (employeeId) {
-        if (!scopedIds.some(id => String(id) === String(employeeId))) {
-          return res.json({ success: true, expenses: [], total: 0, pages: 0 });
+    const userRole = (req.user?.role || '').toUpperCase();
+    const isSuperAdmin = ['SUPER_ADMIN', 'SUPERADMIN'].includes(userRole);
+    const orgId = req.user?.organizationId?._id || req.user?.organizationId;
+
+    if (!isSuperAdmin) {
+      if (userRole === 'MANAGER') {
+        const scopedUsers = await User.find({
+          $or: [{ managerId: req.user._id }, { manager: req.user._id }, { _id: req.user._id }]
+        }).select('_id');
+        const scopedIds = scopedUsers.map(u => u._id);
+        if (employeeId) {
+          if (scopedIds.some(id => String(id) === String(employeeId))) {
+            filter.employee = employeeId;
+          } else {
+            return res.json({ success: true, expenses: [], total: 0, pages: 0 });
+          }
+        } else {
+          filter.employee = { $in: scopedIds };
         }
+      } else if (userRole === 'EMPLOYEE') {
+        filter.employee = req.user._id;
+      } else if (orgId) {
+        // Org Admin / Admin
+        const orgUsers = await User.find({ organizationId: orgId }).select('_id');
+        const orgUserIds = orgUsers.map(u => u._id);
+        if (employeeId) {
+          filter.employee = employeeId;
+        } else if (orgUserIds.length > 0) {
+          filter.$or = [{ organizationId: orgId }, { employee: { $in: orgUserIds } }];
+        } else {
+          filter.organizationId = orgId;
+        }
+      } else if (employeeId) {
         filter.employee = employeeId;
-      } else {
-        filter.employee = { $in: scopedIds };
       }
     } else if (employeeId) {
       filter.employee = employeeId;
     }
 
-    if (status) filter.status = status;
+    if (status && status !== 'all') filter.status = status;
     if (category) filter.category = category;
-    const expenses = await Expense.find(filter).populate('employee', 'name employeeId department').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(+limit);
+    const expenses = await Expense.find(filter)
+      .populate('employee', 'name employeeId department avatar emp_profile_pic managerPro_pic phone role')
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(+limit);
     const total = await Expense.countDocuments(filter);
     res.json({ success: true, expenses, total, pages: Math.ceil(total / limit) });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }

@@ -58,7 +58,7 @@ exports.getAllLeaves = async (req, res) => {
     if (employeeId) filter.employee = employeeId;
 
     const leaves = await Leave.find(filter)
-      .populate('employee', 'name employeeId department avatar')
+      .populate('employee', 'name employeeId department avatar emp_profile_pic managerPro_pic phone role')
       .sort({ createdAt: -1 });
     
     res.json({ success: true, leaves });

@@ -113,7 +113,7 @@ app.use('/api/', limiter);
 
 // Make io accessible to routes
 app.set('io', io); 
- 
+  
 // Routes
 app.use('/api/auth', require('./routes/auth.routes'));
 app.use('/api/employees', require('./routes/employee.routes'));
@@ -225,4 +225,4 @@ const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
 
 module.exports = { app, server, io };
-  
+    
