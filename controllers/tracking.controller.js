@@ -499,9 +499,9 @@ exports.updateLocation = async (req, res) => {
       }
 
       // 6. High-Fidelity Movement vs Stationary Drift Gate
-      // Real travel: speed >= 1.4 km/h and displacement >= 4m, or any displacement >= 15m
-      const isStationaryDrift = (distM < 4.0) || (effectiveSpeedKmh < 1.4 && distM < 15.0);
-      const isTeleportation = effectiveSpeedKmh > 160.0;
+      // Stationary jitter: displacement < 3.0m
+      const isStationaryDrift = (distM < 3.0);
+      const isTeleportation = effectiveSpeedKmh > 180.0;
       const isMathematicallyValidMovement = !isStationaryDrift && !isTeleportation && dRawKm > 0 && dt <= 1800;
 
       if (isMathematicallyValidMovement) {
@@ -509,12 +509,13 @@ exports.updateLocation = async (req, res) => {
         acceptedEventIds.push(eventId);
         prevTimestamp = tMs;
 
-        // Record into immutable DistanceLedger
+        // Record into immutable DistanceLedger with guaranteed non-null fromEventId
+        const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
         ledgerSegments.push({
           organizationId: orgId,
           employee: req.user._id,
           sessionId,
-          fromEventId: lastEventId,
+          fromEventId: safeFromEventId,
           toEventId: eventId,
           fromTimestamp: new Date(lastTrustedMs),
           toTimestamp: timestamp,
@@ -591,7 +592,12 @@ exports.updateLocation = async (req, res) => {
       { $match: { sessionId, classification: 'ACCEPTED' } },
       { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
     ]);
-    currentTotalDistance = Math.round((ledgerAgg[0]?.totalKm || 0) * 100) / 100;
+    const ledgerKm = Math.round((ledgerAgg[0]?.totalKm || 0) * 100) / 100;
+    const liveDocLatest = await LiveLocation.findOne({ sessionId, employee: req.user._id }).select('totalDistance manualDistanceAdded').lean();
+    const prevDist = Math.max(Number(sessionState.totalDistance) || 0, Number(liveDocLatest?.totalDistance) || 0);
+
+    // Monotonic non-decreasing guarantee: distance can NEVER drop to 0 if travel has occurred
+    currentTotalDistance = Math.round(Math.max(prevDist, ledgerKm) * 100) / 100;
 
     // Bulk update TrackingPoint statuses
     if (acceptedEventIds.length > 0) {
@@ -1140,8 +1146,10 @@ exports.getLiveEmployees = async (req, res) => {
         cleanKm = Math.round(todayCleanDistKm * 100) / 100;
       }
       
-      loc.totalDistance = cleanKm;
-      loc.officialDistance = cleanKm;
+      const existingKm = Number(loc.totalDistance) || Number(loc.officialDistance) || 0;
+      const finalKm = Math.round(Math.max(existingKm, cleanKm) * 100) / 100;
+      loc.totalDistance = finalKm;
+      loc.officialDistance = finalKm;
     }
 
     const activeEmpIdSet = new Set(locations.map(l => String(l.employee?._id || l.employee)));
