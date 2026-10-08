@@ -15,34 +15,18 @@ const rawRedisUrl = (process.env.REDIS_URL || '').trim().replace(/^["']|["']$/g,
 
 if (Redis && rawRedisUrl) {
   try {
-    let redisOptions = {};
-    if (rawRedisUrl.startsWith('redis://') || rawRedisUrl.startsWith('rediss://')) {
-      const isRediss = rawRedisUrl.startsWith('rediss://');
-      const u = new URL(rawRedisUrl);
-      redisOptions = {
-        host: u.hostname,
-        port: parseInt(u.port || '6379', 10),
-        username: u.username || 'default',
-        password: decodeURIComponent(u.password || ''),
-        tls: isRediss ? { rejectUnauthorized: false, servername: u.hostname } : undefined,
-        family: 4, // Force IPv4 (Solves timeout/drop issues on AWS EC2)
-        connectTimeout: 10000,
-        lazyConnect: true,
-        maxRetriesPerRequest: 2,
-        retryStrategy: (times) => {
-          if (times > 5) {
-            console.warn('⚠️  Redis: Max retries reached. Falling back to in-memory cache.');
-            redisAvailable = false;
-            return null; // Stop retrying
-          }
-          return Math.min(times * 200, 2000); // Exponential backoff
-        },
-      };
-    } else {
-      redisOptions = { lazyConnect: true };
-    }
-
-    redisClient = new Redis(redisOptions);
+    redisClient = new Redis(rawRedisUrl, {
+      connectTimeout: 10000,
+      maxRetriesPerRequest: 2,
+      retryStrategy: (times) => {
+        if (times > 5) {
+          console.warn('⚠️  Redis: Max retries reached. Falling back to in-memory cache.');
+          redisAvailable = false;
+          return null; // Stop retrying
+        }
+        return Math.min(times * 200, 2000); // Exponential backoff
+      },
+    });
 
     redisClient.on('connect', () => {
       redisAvailable = true;
@@ -55,13 +39,6 @@ if (Redis && rawRedisUrl) {
 
     redisClient.on('error', (err) => {
       redisAvailable = false;
-    });
-
-    redisClient.connect().then(() => {
-      redisAvailable = true;
-      console.log('🟢 Redis Connection Established & Active');
-    }).catch((err) => {
-      console.warn('⚠️  Redis: Initial connection failed (' + err.message + '). Using in-memory fallback cache.');
     });
   } catch (e) {
     console.warn('⚠️  Redis: Initialization error. Using in-memory fallback cache.');
