@@ -457,15 +457,33 @@ exports.updateLocation = async (req, res) => {
       const R = Math.pow(Math.max(accuracy, 5) / 111320, 2);
       if (dt > 1800) {
         // ── 30-MINUTE / LONG STATIONARY RE-ANCHORING ────────────────────────────
-        // Reset filter directly on fresh observation to eliminate covariance lag
+        // Reset filter directly on fresh observation to eliminate covariance lag.
+        // CRITICAL P0 FIX: Advance prevValid & prev2Valid to establish the new trusted anchor,
+        // preventing infinite loop of dt > 1800 on subsequent 10s telemetry updates!
         filterLat = lat;
         filterLng = lng;
         filterPLat = R;
         filterPLng = R;
-        lastValidLat = filterLat;
-        lastValidLng = filterLng;
+        lastValidLat = lat;
+        lastValidLng = lng;
         lastEventId = eventId;
         prevTimestamp = tMs;
+
+        const toKmh = (s) => (Number(s) > 0 ? (Number(s) <= 60 ? Number(s) * 3.6 : Number(s)) : 0);
+        const reportedSpeedKmh = toKmh(coord.speed);
+
+        prev2Valid = prevValid;
+        prevValid = {
+          lat: filterLat,
+          lng: filterLng,
+          latRaw: lat,
+          lngRaw: lng,
+          accuracy,
+          speedKmh: reportedSpeedKmh,
+          timestamp: timestamp.toISOString(),
+          heading: coord.heading
+        };
+
         acceptedEventIds.push(eventId);
         continue;
       } else {
@@ -561,7 +579,7 @@ exports.updateLocation = async (req, res) => {
         rejectionReasons.push({
           timestamp,
           reason: 'TELEPORTATION_OR_STEP_LIMIT_EXCEEDED',
-          lat, lng, accuracy, speed: stepSpeedKmh
+          lat, lng, accuracy, speed: effectiveSpeedKmh
         });
       }
 
@@ -583,13 +601,25 @@ exports.updateLocation = async (req, res) => {
           console.log(`ℹ️ [DISTANCE_LEDGER] Duplicate segment key ignored for session ${sessionId}`);
         } else {
           console.error('❌ [DISTANCE_LEDGER_ERROR] Failed to persist distance ledger:', ledgerErr.message);
+          try {
+            await TrackingPoint.updateMany(
+              { sessionId, eventId: { $in: ledgerSegments.map(x => x.toEventId) } },
+              { $set: { processingStatus: 'PENDING' } }
+            );
+          } catch (_) {}
+          if (typeof releaseSessionLock === 'function') await releaseSessionLock();
+          return res.status(503).json({
+            success: false,
+            retryable: true,
+            message: 'GPS stored but distance processing is pending'
+          });
         }
       }
     }
 
-    // Derive authoritative session total directly from immutable DistanceLedger (strictly ACCEPTED segments)
+    // Derive authoritative session total directly from immutable DistanceLedger (ACCEPTED + RECOVERED segments)
     const ledgerAgg = await DistanceLedger.aggregate([
-      { $match: { sessionId, classification: 'ACCEPTED' } },
+      { $match: { sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
       { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
     ]);
     const ledgerKm = Math.round((ledgerAgg[0]?.totalKm || 0) * 100) / 100;
@@ -1744,8 +1774,13 @@ exports.getSessionDiagnostic = async (req, res) => {
           diagnosticStatus = 'NO_MOBILE_GPS_RECEIVED';
           actionRequired = 'Employee phone is not sending GPS pings. Check Location Permission ("Allow all the time"), Battery Optimization, and verify app is running.';
         } else if (rawPointCount > 0 && ledgerTotalKm === 0) {
-          diagnosticStatus = 'GPS_RECEIVED_STATIONARY_RESTING';
-          actionRequired = 'GPS fixes are arriving, but employee is stationary / resting (speed = 0 km/h). Distance will count once movement starts.';
+          if (rawPolylineKm > 0.1) {
+            diagnosticStatus = 'PROCESSING_OR_GAP_ISSUE';
+            actionRequired = `Raw GPS points show ${rawPolylineKm} km movement, but distance ledger total is 0. Check for long gaps, processing errors, or run session reconcile.`;
+          } else {
+            diagnosticStatus = 'GPS_RECEIVED_STATIONARY_RESTING';
+            actionRequired = 'GPS fixes are arriving, but employee is stationary / resting (speed = 0 km/h). Distance will count once movement starts.';
+          }
         } else if (ledgerTotalKm > 0 && (session.totalDistance || 0) === 0) {
           diagnosticStatus = 'LEDGER_AGGREGATION_DISCREPANCY';
           actionRequired = 'Ledger has calculated distance, but LiveLocation total is un-synced. Run session reconcile.';
