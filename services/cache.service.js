@@ -50,12 +50,19 @@ if (Redis && rawRedisUrl) {
       console.log('🟢 Redis Connected to Upstash');
     });
 
+    redisClient.on('ready', () => {
+      redisAvailable = true;
+    });
+
     redisClient.on('error', (err) => {
       redisAvailable = false;
       // Swallow: fallback to in-memory
     });
 
-    redisClient.connect().catch((err) => {
+    redisClient.connect().then(() => {
+      redisAvailable = true;
+      console.log('🟢 Redis Connection Established & Active');
+    }).catch((err) => {
       console.warn('⚠️  Redis: Initial connection failed (' + err.message + '). Using in-memory fallback cache.');
     });
   } catch (e) {
