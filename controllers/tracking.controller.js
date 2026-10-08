@@ -1100,8 +1100,29 @@ exports.getLiveEmployees = async (req, res) => {
     const today = getBusinessDate(new Date(), 'Asia/Kolkata');
     const todayStartMs = new Date(`${today}T00:00:00.000Z`).getTime();
 
+    // Auto-heal abandoned single-point sessions (where phone failed to start background tracking task)
+    const activeLocations = [];
+    const nowMs = Date.now();
+
     for (let i = 0; i < locations.length; i++) {
       const loc = locations[i];
+      const coordCount = loc.coordinates ? loc.coordinates.length : 0;
+      const lastActMs = new Date(loc.lastActivity || loc.startTime || loc.createdAt || 0).getTime();
+
+      // If a session has <= 1 coordinate and no background points for > 15 mins, auto-close it
+      if (coordCount <= 1 && (nowMs - lastActMs) > 15 * 60 * 1000) {
+        console.log(`🛡️ [AUTO_HEAL] Closing abandoned 1-point session for ${loc.employee?.name || loc.employee}`);
+        LiveLocation.updateOne({ _id: loc._id }, { $set: { isActive: false, endTime: new Date() } }).catch(() => {});
+        if (loc.employee?._id || loc.employee) {
+          User.findByIdAndUpdate(loc.employee._id || loc.employee, { isTracking: false }).catch(() => {});
+        }
+        continue; // Exclude from active live locations list
+      }
+      activeLocations.push(loc);
+    }
+
+    for (let i = 0; i < activeLocations.length; i++) {
+      const loc = activeLocations[i];
       let cleanKm = 0;
 
       // Primary: Authoritative DistanceLedger ACCEPTED sum
@@ -1152,7 +1173,7 @@ exports.getLiveEmployees = async (req, res) => {
       loc.officialDistance = finalKm;
     }
 
-    const activeEmpIdSet = new Set(locations.map(l => String(l.employee?._id || l.employee)));
+    const activeEmpIdSet = new Set(activeLocations.map(l => String(l.employee?._id || l.employee)));
 
     // Auto-reconcile desynced User.isTracking flags
     const employees = [];
@@ -1167,7 +1188,7 @@ exports.getLiveEmployees = async (req, res) => {
       }
     });
 
-    res.json({ success: true, employees, locations });
+    res.json({ success: true, employees, locations: activeLocations });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
