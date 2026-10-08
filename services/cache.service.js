@@ -11,13 +11,16 @@ const memCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
 let redisClient = null;
 let redisAvailable = false;
 
-if (Redis && process.env.REDIS_URL) {
+const rawRedisUrl = (process.env.REDIS_URL || '').trim().replace(/^["']|["']$/g, '');
+
+if (Redis && rawRedisUrl) {
   try {
-    const isRediss = process.env.REDIS_URL.startsWith('rediss://');
-    redisClient = new Redis(process.env.REDIS_URL, {
+    const isRediss = rawRedisUrl.startsWith('rediss://');
+    redisClient = new Redis(rawRedisUrl, {
       lazyConnect: true,
       family: 4, // Force IPv4 (Solves timeout/drop issues on some hostings)
-      ...(isRediss && { tls: { rejectUnauthorized: false } }), // Prevent strict SSL rejection on MilesWeb
+      connectTimeout: 10000,
+      tls: isRediss ? { rejectUnauthorized: false } : undefined, // TLS required for rediss:// (Upstash)
       retryStrategy: (times) => {
         if (times > 5) {
           console.warn('⚠️  Redis: Max retries reached. Falling back to in-memory cache.');
@@ -39,8 +42,8 @@ if (Redis && process.env.REDIS_URL) {
       // Swallow: fallback to in-memory
     });
 
-    redisClient.connect().catch(() => {
-      console.warn('⚠️  Redis: Initial connection failed. Using in-memory fallback cache.');
+    redisClient.connect().catch((err) => {
+      console.warn('⚠️  Redis: Initial connection failed (' + err.message + '). Using in-memory fallback cache.');
     });
   } catch (e) {
     console.warn('⚠️  Redis: Initialization error. Using in-memory fallback cache.');
