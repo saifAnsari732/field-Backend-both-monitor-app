@@ -12,8 +12,20 @@ let redisClient = null;
 let redisAvailable = false;
 
 const rawRedisUrl = (process.env.REDIS_URL || '').trim().replace(/^["']|["']$/g, '');
-const restUrl = (process.env.UPSTASH_REDIS_REST_URL || '').trim().replace(/^["']|["']$/g, '');
-const restToken = (process.env.UPSTASH_REDIS_REST_TOKEN || '').trim().replace(/^["']|["']$/g, '');
+let restUrl = (process.env.UPSTASH_REDIS_REST_URL || '').trim().replace(/^["']|["']$/g, '');
+let restToken = (process.env.UPSTASH_REDIS_REST_TOKEN || '').trim().replace(/^["']|["']$/g, '');
+
+// Auto-derive Upstash REST endpoint & token from REDIS_URL if not explicitly defined
+if (!restToken && rawRedisUrl && rawRedisUrl.includes('@')) {
+  try {
+    const u = new URL(rawRedisUrl);
+    if (u.hostname.includes('upstash.io')) {
+      restUrl = `https://${u.hostname}`;
+      restToken = decodeURIComponent(u.password || '');
+    }
+  } catch (_) {}
+}
+
 const useRest = Boolean(restUrl && restToken);
 
 if (useRest) {
