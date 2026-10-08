@@ -7,11 +7,18 @@ const NodeCache = require('node-cache');
 // ─── In-memory fallback cache (when Redis is not available) ──────────────────
 const memCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
 
-// ─── Redis Connection ──────────────────────────────────────────────────────────
+// ─── Redis Connection (Supports ioredis TCP & Upstash HTTPS REST) ─────────────
 let redisClient = null;
 let redisAvailable = false;
 
 const rawRedisUrl = (process.env.REDIS_URL || '').trim().replace(/^["']|["']$/g, '');
+const restUrl = (process.env.UPSTASH_REDIS_REST_URL || '').trim().replace(/^["']|["']$/g, '');
+const restToken = (process.env.UPSTASH_REDIS_REST_TOKEN || '').trim().replace(/^["']|["']$/g, '');
+const useRest = Boolean(restUrl && restToken);
+
+if (useRest) {
+  console.log('🟢 Upstash Redis REST Mode Active (HTTPS Port 443)');
+}
 
 if (Redis && rawRedisUrl) {
   try {
@@ -20,7 +27,7 @@ if (Redis && rawRedisUrl) {
       maxRetriesPerRequest: 2,
       retryStrategy: (times) => {
         if (times > 5) {
-          console.warn('⚠️  Redis: Max retries reached. Falling back to in-memory cache.');
+          if (!useRest) console.warn('⚠️  Redis: Max retries reached. Falling back to in-memory cache.');
           redisAvailable = false;
           return null; // Stop retrying
         }
@@ -30,7 +37,7 @@ if (Redis && rawRedisUrl) {
 
     redisClient.on('connect', () => {
       redisAvailable = true;
-      console.log('🟢 Redis Connected to Upstash');
+      console.log('🟢 Redis Connected to Upstash (TCP)');
     });
 
     redisClient.on('ready', () => {
@@ -41,17 +48,36 @@ if (Redis && rawRedisUrl) {
       redisAvailable = false;
     });
   } catch (e) {
-    console.warn('⚠️  Redis: Initialization error. Using in-memory fallback cache.');
+    if (!useRest) console.warn('⚠️  Redis: Initialization error. Using in-memory fallback cache.');
   }
-} else {
-  console.warn('⚠️  REDIS_URL not set. Using in-memory fallback cache (not persistent across restarts).');
 }
+
+const upstashRestCall = async (commandArr) => {
+  if (!useRest) return null;
+  try {
+    const fetch = globalThis.fetch || require('node-fetch');
+    const endpoint = `${restUrl}/${commandArr.map(encodeURIComponent).join('/')}`;
+    const res = await fetch(endpoint, {
+      headers: { Authorization: `Bearer ${restToken}` }
+    });
+    const json = await res.json();
+    return json?.result ?? null;
+  } catch (err) {
+    return null;
+  }
+};
 
 // ─── Generic Cache Helpers ────────────────────────────────────────────────────
 const getCache = async (key) => {
   if (redisAvailable && redisClient) {
     try {
       const data = await redisClient.get(key);
+      return data ? JSON.parse(data) : null;
+    } catch { /* fall through */ }
+  }
+  if (useRest) {
+    try {
+      const data = await upstashRestCall(['get', key]);
       return data ? JSON.parse(data) : null;
     } catch { /* fall through */ }
   }
@@ -66,12 +92,21 @@ const setCache = async (key, value, ttl = 60) => {
       return;
     } catch { /* fall through */ }
   }
+  if (useRest) {
+    try {
+      await upstashRestCall(['set', key, JSON.stringify(value), 'EX', String(ttl)]);
+      return;
+    } catch { /* fall through */ }
+  }
   memCache.set(key, value, ttl);
 };
 
 const deleteCache = async (key) => {
   if (redisAvailable && redisClient) {
     try { await redisClient.del(key); } catch { /* ignore */ }
+  }
+  if (useRest) {
+    try { await upstashRestCall(['del', key]); } catch { /* ignore */ }
   }
   memCache.del(key);
 };
