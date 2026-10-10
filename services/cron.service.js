@@ -8,8 +8,8 @@ const { autoStopInactiveSessions, reconcileAllActiveSessions } = require('../con
  */
 const initCronJobs = (io) => {
   // ─── Continuous Background Autonomous Sentinel Worker ────────────────────
-  // Scans active sessions every 2 minutes to repair any KM discrepancies/unprocessed points in MongoDB
-  cron.schedule('*/2 * * * *', async () => {
+  // Scans active sessions every 10 minutes to repair any KM discrepancies in MongoDB
+  cron.schedule('*/10 * * * *', async () => {
     try {
       if (typeof reconcileAllActiveSessions === 'function') {
         await reconcileAllActiveSessions();

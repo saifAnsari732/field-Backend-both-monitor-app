@@ -158,8 +158,8 @@ async function reprocessAllEmployeesToday() {
 
         const distFromCentroidM = haversineDistance({ lat: centroidLat, lng: centroidLng }, { lat, lng }) * 1000;
         const isPoorAccuracy = accuracy > 120;
-        const isInsideCentroidGeofence = distFromCentroidM < 45.0 && (effectiveSpeedKmh < 3.5 || reportedSpeedKmh < 1.0);
-        const isStationaryDrift = isPoorAccuracy || isInsideCentroidGeofence || (distM < 5.0) || (distM < 12.0 && effectiveSpeedKmh < 2.2);
+        const isInsideCentroidGeofence = distFromCentroidM < 15.0 && (effectiveSpeedKmh < 2.2 || reportedSpeedKmh < 1.0);
+        const isStationaryDrift = isPoorAccuracy || isInsideCentroidGeofence || (distM < 4.0) || (distM < 10.0 && effectiveSpeedKmh < 1.8);
         const isTeleportation = effectiveSpeedKmh > 180.0;
         const isMathematicallyValidMovement = !isStationaryDrift && !isTeleportation && dRawKm > 0 && dt <= 1800;
 

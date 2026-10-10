@@ -185,7 +185,7 @@ async function reopenIfAutoClosed(sessionId, employeeId) {
   );
   if (!doc) return false;
   await User.findByIdAndUpdate(employeeId, { isTracking: true, isOnline: true });
-  const today = new Date().toISOString().slice(0, 10);
+  const today = getBusinessDate(new Date(), 'Asia/Kolkata');
   await Attendance.findOneAndUpdate({ employee: employeeId, date: today }, { $unset: { checkOut: 1 } }).catch(() => {});
   console.log(`[tracking] Auto-reactivated session ${sessionId} for employee ${employeeId}`);
   return true;
@@ -226,7 +226,7 @@ exports.updateLocation = async (req, res) => {
               altitude: Number(c.altitude) || 0,
               provider: c.provider || 'gps',
               processingStatus: 'PENDING',
-              algorithmVersion: 'AGTRIE-X-v7-DURABLE'
+              algorithmVersion: 'AGTRIE-X-v10.0-PRO',
             }
           },
           upsert: true
@@ -460,7 +460,47 @@ exports.updateLocation = async (req, res) => {
       // 4. Geodetic 2D Kalman Filter Update
       const R = Math.pow(Math.max(accuracy, 5) / 111320, 2);
       if (dt > 1800) {
-        // ── 30-MINUTE / LONG STATIONARY RE-ANCHORING ────────────────────────────
+        // ── 30-MINUTE / LONG STATIONARY RE-ANCHORING & GAP RECOVERY ────────────
+        // Check if genuine travel occurred during the time gap (e.g. phone slept in pocket while riding)
+        const dGapKm = prevValid
+          ? haversineDistance(
+              { lat: prevValid.latRaw ?? prevValid.lat, lng: prevValid.lngRaw ?? prevValid.lng },
+              { lat, lng }
+            )
+          : 0;
+        const gapSpeedKmh = dGapKm > 0 ? (dGapKm / (dt / 3600)) : 0;
+        const toKmh = (s) => (Number(s) > 0 ? (Number(s) <= 60 ? Number(s) * 3.6 : Number(s)) : 0);
+        const reportedSpeedKmh = toKmh(coord.speed);
+
+        // If employee moved >= 0.15 km at a realistic speed (1.5 km/h to 140 km/h) with acceptable accuracy <= 300m, recover the travel!
+        if (dGapKm >= 0.15 && gapSpeedKmh >= 1.5 && gapSpeedKmh <= 140.0 && accuracy <= 300) {
+          acceptedPoints++;
+          acceptedEventIds.push(eventId);
+          prevTimestamp = tMs;
+
+          const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
+          ledgerSegments.push({
+            organizationId: orgId,
+            employee: req.user._id,
+            sessionId,
+            fromEventId: safeFromEventId,
+            toEventId: eventId,
+            fromTimestamp: new Date(lastTrustedMs),
+            toTimestamp: timestamp,
+            fromLat: prevValid?.latRaw ?? lastValidLat,
+            fromLng: prevValid?.lngRaw ?? lastValidLng,
+            toLat: lat,
+            toLng: lng,
+            distanceMeters: Math.round(dGapKm * 1000),
+            distanceKm: Math.round(dGapKm * 1000) / 1000,
+            classification: 'ACCEPTED',
+            reason: 'AGTRIE_X_GAP_TRAVEL_RECOVERED',
+            algorithmVersion: 'AGTRIE-X-v10.0-PRO'
+          });
+
+          console.log(`📍 [GAP_RECOVERY] Recovered +${dGapKm.toFixed(2)} km across ${(dt / 60).toFixed(0)} min gap at ${gapSpeedKmh.toFixed(1)} km/h`);
+        }
+
         // Reset filter directly on fresh observation to eliminate covariance lag.
         filterLat = lat;
         filterLng = lng;
@@ -474,9 +514,6 @@ exports.updateLocation = async (req, res) => {
         centroidLat = lat;
         centroidLng = lng;
 
-        const toKmh = (s) => (Number(s) > 0 ? (Number(s) <= 60 ? Number(s) * 3.6 : Number(s)) : 0);
-        const reportedSpeedKmh = toKmh(coord.speed);
-
         prev2Valid = prevValid;
         prevValid = {
           lat: filterLat,
@@ -484,7 +521,7 @@ exports.updateLocation = async (req, res) => {
           latRaw: lat,
           lngRaw: lng,
           accuracy,
-          speedKmh: reportedSpeedKmh,
+          speedKmh: gapSpeedKmh > 0 ? gapSpeedKmh : reportedSpeedKmh,
           timestamp: timestamp.toISOString(),
           heading: coord.heading
         };
@@ -521,13 +558,13 @@ exports.updateLocation = async (req, res) => {
         batchMaxSpeed = effectiveSpeedKmh;
       }
 
-      // 6. High-Fidelity Movement vs Stationary Centroid Micro-Geofence Gate (AGTRIE-X v7)
+      // 6. High-Fidelity Movement vs Stationary Centroid Micro-Geofence Gate (AGTRIE-X v10.0)
       const distFromCentroidM = haversineDistance({ lat: centroidLat, lng: centroidLng }, { lat, lng }) * 1000;
-      const isPoorAccuracy = accuracy > 120;
-      const isInsideCentroidGeofence = distFromCentroidM < 45.0 && (effectiveSpeedKmh < 3.5 || reportedSpeedKmh < 1.0);
-      const isStationaryDrift = isPoorAccuracy || isInsideCentroidGeofence || (distM < 5.0) || (distM < 12.0 && effectiveSpeedKmh < 2.2);
+      const isPoorAccuracy = accuracy > 250;
+      const isInsideCentroidGeofence = distFromCentroidM < 12.0 && (effectiveSpeedKmh < 2.0 || reportedSpeedKmh < 1.0);
+      const isStationaryDrift = (isPoorAccuracy && effectiveSpeedKmh < 3.0) || isInsideCentroidGeofence || (distM < 3.0) || (distM < 10.0 && effectiveSpeedKmh < 1.8);
       const isTeleportation = effectiveSpeedKmh > 180.0;
-      const isMathematicallyValidMovement = !isStationaryDrift && !isTeleportation && dRawKm > 0 && dt <= 1800;
+      const isMathematicallyValidMovement = !isStationaryDrift && !isTeleportation && dRawKm > 0;
 
       if (isMathematicallyValidMovement) {
         acceptedPoints++;
@@ -661,7 +698,7 @@ exports.updateLocation = async (req, res) => {
         ? Math.hypot(lastCoord.lat - lastGeocodeLat, lastCoord.lng - lastGeocodeLng) * 111320
         : 9999;
 
-      if (distFromLastGeo >= 250 || (nowMs - lastGeocodeTs) >= 5 * 60 * 1000) {
+      if (distFromLastGeo >= 200 || (nowMs - lastGeocodeTs >= 15 * 60 * 1000 && distFromLastGeo >= 80)) {
         shouldGeocode = true;
         lastGeocodeTs = nowMs;
         lastGeocodeLat = lastCoord.lat;
@@ -693,7 +730,7 @@ exports.updateLocation = async (req, res) => {
       const lastCoord = validCoords[validCoords.length - 1];
       const tagged = validCoords.map((coord) => ({ ...coord, address: coord.address || '' }));
       await LiveLocation.findOneAndUpdate(
-        { sessionId, employee: req.user._id, isActive: true },
+        { sessionId, employee: req.user._id },
         {
           $push: { 
             coordinates: { $each: tagged, $slice: -500 }, 
@@ -709,6 +746,8 @@ exports.updateLocation = async (req, res) => {
             maxSpeed: batchMaxSpeed,
           },
           $set: {
+            isActive: true,
+            autoClosed: false,
             totalDistance: currentTotalDistance,
             officialDistance: currentTotalDistance,
             acceptedDistance: currentTotalDistance,
@@ -717,8 +756,9 @@ exports.updateLocation = async (req, res) => {
             lastActivity: new Date(),
             motionState: currentMotionState,
             averageAccuracy: runningAvgAccuracy,
-            algorithmVersion: 'AGTRIE-X-v7.2-DURABLE',
-          }
+            algorithmVersion: 'AGTRIE-X-v10.0-PRO',
+          },
+          $unset: { endTime: 1 }
         },
         { runValidators: true }
       );
@@ -727,7 +767,7 @@ exports.updateLocation = async (req, res) => {
         reverseGeocode(lastCoord.lat, lastCoord.lng).then((address) => {
           if (!address) return;
           return LiveLocation.updateOne(
-            { sessionId, employee: req.user._id, isActive: true },
+            { sessionId, employee: req.user._id },
             { $set: { 'coordinates.$[point].address': address } },
             { arrayFilters: [{ 'point.eventId': lastCoord.eventId }] }
           );
@@ -735,27 +775,32 @@ exports.updateLocation = async (req, res) => {
       }
     } else {
       await LiveLocation.findOneAndUpdate(
-        { sessionId, employee: req.user._id, isActive: true },
+        { sessionId, employee: req.user._id },
         {
           $set: {
+            isActive: true,
+            autoClosed: false,
             totalDistance: currentTotalDistance,
             officialDistance: currentTotalDistance,
             manualDistanceAdded: dbManualAdded,
             lastActivity: new Date(),
-          }
+          },
+          $unset: { endTime: 1 }
         },
         { runValidators: true }
       ).catch(() => {});
     }
 
-    // Reconcile and update Attendance.totalDistanceTraveled from authoritative clean trajectory distance
-    const targetDate = sessionState.date || dbLiveDoc?.date || new Date().toISOString().slice(0, 10);
+    // Reconcile and update Attendance.totalDistanceTraveled and strictly prevent false check-out
+    const targetDate = sessionState.date || dbLiveDoc?.date || getBusinessDate(new Date(), 'Asia/Kolkata');
     const roundedDayKm = currentTotalDistance;
 
     await Attendance.findOneAndUpdate(
       { employee: req.user._id, date: targetDate },
-      { $set: { totalDistanceTraveled: roundedDayKm } }
+      { $unset: { checkOut: 1 }, $set: { totalDistanceTraveled: roundedDayKm } }
     ).catch(() => {});
+
+    await User.findByIdAndUpdate(req.user._id, { isTracking: true, isOnline: true, lastSeen: new Date() }).catch(() => {});
 
     const io = req.app.get('io');
     io.to('admins').emit('employee_location', {
@@ -836,8 +881,8 @@ exports.stopTracking = async (req, res) => {
     );
     const gpsKm = Math.round(baseGpsKm * 100) / 100;
 
-    // Zero extra tolerance addition — strict 1:1 GPS distance policy
-    const TOLERANCE_PCT = Number(process.env.PUNCH_OUT_TOLERANCE_PCT ?? 0);
+    // Automatic 10% punch-out tolerance addition
+    const TOLERANCE_PCT = Number(process.env.PUNCH_OUT_TOLERANCE_PCT ?? 10);
     const toleranceKm = (gpsKm > 0 && TOLERANCE_PCT > 0) ? Math.round(gpsKm * (TOLERANCE_PCT / 100) * 100) / 100 : 0;
     const finalOfficialKm = Math.round((gpsKm + toleranceKm) * 100) / 100;
 
@@ -1133,26 +1178,8 @@ exports.getLiveEmployees = async (req, res) => {
     const today = getBusinessDate(new Date(), 'Asia/Kolkata');
     const todayStartMs = new Date(`${today}T00:00:00.000Z`).getTime();
 
-    // Auto-heal abandoned single-point sessions (where phone failed to start background tracking task)
-    const activeLocations = [];
-    const nowMs = Date.now();
-
-    for (let i = 0; i < locations.length; i++) {
-      const loc = locations[i];
-      const coordCount = loc.coordinates ? loc.coordinates.length : 0;
-      const lastActMs = new Date(loc.lastActivity || loc.startTime || loc.createdAt || 0).getTime();
-
-      // If a session has <= 1 coordinate and no background points for > 15 mins, auto-close it
-      if (coordCount <= 1 && (nowMs - lastActMs) > 15 * 60 * 1000) {
-        console.log(`🛡️ [AUTO_HEAL] Closing abandoned 1-point session for ${loc.employee?.name || loc.employee}`);
-        LiveLocation.updateOne({ _id: loc._id }, { $set: { isActive: false, endTime: new Date() } }).catch(() => {});
-        if (loc.employee?._id || loc.employee) {
-          User.findByIdAndUpdate(loc.employee._id || loc.employee, { isTracking: false }).catch(() => {});
-        }
-        continue; // Exclude from active live locations list
-      }
-      activeLocations.push(loc);
-    }
+    // Retain all active tracking sessions (Zero Data Loss Policy: shifts are never auto-closed)
+    const activeLocations = locations;
 
     for (let i = 0; i < activeLocations.length; i++) {
       const loc = activeLocations[i];
@@ -1393,13 +1420,10 @@ const recalculateSessionFromPoints = async (sessionId) => {
 };
 exports.recalculateSessionFromPoints = recalculateSessionFromPoints;
 
-// @desc Continuous background worker to reconcile all active sessions in MongoDB (NON-DESTRUCTIVE SYNC)
+// @desc Continuous background worker to reconcile active sessions in MongoDB (NON-DESTRUCTIVE SYNC)
 exports.reconcileAllActiveSessions = async () => {
   try {
-    const today = new Date().toISOString().slice(0, 10);
-    const activeSessions = await LiveLocation.find({
-      $or: [{ date: today }, { isActive: true }]
-    });
+    const activeSessions = await LiveLocation.find({ isActive: true });
 
     for (const session of activeSessions) {
       // Non-destructive audit: calculate official distance strictly from DistanceLedger ACCEPTED sum
@@ -1409,10 +1433,13 @@ exports.reconcileAllActiveSessions = async () => {
       ]);
 
       const officialKm = Math.round((ledgerAgg[0]?.totalKm || 0) * 100) / 100;
-      if (officialKm > 0 && Math.abs((session.totalDistance || 0) - officialKm) > 0.05) {
+      const targetKm = Math.round((officialKm + (Number(session.manualDistanceAdded) || 0)) * 100) / 100;
+
+      // Monotonic guard: only update if ledger has caught up and distance is strictly higher
+      if (targetKm > (session.totalDistance || 0) && (targetKm - (session.totalDistance || 0)) > 0.05) {
         await LiveLocation.updateOne(
           { sessionId: session.sessionId },
-          { $set: { totalDistance: officialKm, officialDistance: officialKm, acceptedDistance: officialKm } }
+          { $set: { totalDistance: targetKm, officialDistance: targetKm, acceptedDistance: officialKm } }
         );
       }
     }

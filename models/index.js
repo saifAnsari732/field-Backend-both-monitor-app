@@ -46,7 +46,7 @@ const liveLocationSchema = new mongoose.Schema({
   averageAccuracy:     { type: Number, default: 0 },     // Average GPS accuracy in meters
   worstAccuracy:       { type: Number, default: 0 },     // Worst single GPS accuracy
   maxSpeed:            { type: Number, default: 0 },     // Maximum recorded speed in km/h
-  algorithmVersion:    { type: String, default: 'AGTRIE-X-v7-DURABLE' },
+  algorithmVersion:    { type: String, default: 'AGTRIE-X-v10.0-PRO' },
   motionState:         { type: String, enum: ['STATIONARY', 'WALKING', 'RUNNING', 'BIKE', 'VEHICLE', 'GPS_LOST', 'UNKNOWN'], default: 'STATIONARY' },
   rejectionReasons:    [{ timestamp: Date, reason: String, lat: Number, lng: Number, accuracy: Number, speed: Number }],
   isActive:            { type: Boolean, default: true },
@@ -79,7 +79,7 @@ const trackingPointSchema = new mongoose.Schema({
     enum: ['PENDING', 'ACCEPTED', 'RECOVERED', 'UNVERIFIED', 'REJECTED', 'DUPLICATE'], 
     default: 'PENDING' 
   },
-  algorithmVersion: { type: String, default: 'AGTRIE-X-v7-DURABLE' }
+  algorithmVersion: { type: String, default: 'AGTRIE-X-v10.0-PRO' }
 }, { timestamps: true });
 
 trackingPointSchema.index({ sessionId: 1, eventId: 1 }, { unique: true });
@@ -107,7 +107,7 @@ const distanceLedgerSchema = new mongoose.Schema({
     default: 'ACCEPTED' 
   },
   reason:           { type: String, default: 'NORMAL_TRAJECTORY' },
-  algorithmVersion: { type: String, default: 'AGTRIE-X-v7-DURABLE' }
+  algorithmVersion: { type: String, default: 'AGTRIE-X-v10.0-PRO' }
 }, { timestamps: true });
 
 distanceLedgerSchema.index({ sessionId: 1, fromTimestamp: 1 });
