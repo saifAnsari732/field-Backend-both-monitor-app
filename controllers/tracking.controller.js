@@ -355,6 +355,10 @@ exports.updateLocation = async (req, res) => {
     let filterPLat = Number(sessionState.pLat) || 0.00000001;
     let filterPLng = Number(sessionState.pLng) || 0.00000001;
 
+    // Centroid Micro-Geofence anchor for AGTRIE-X v7
+    let centroidLat = Number(sessionState.centroidLat) || filterLat;
+    let centroidLng = Number(sessionState.centroidLng) || filterLng;
+
     // Reconcile any Admin Manual Adjustment from MongoDB in real-time
     const dbLiveDoc = await LiveLocation.findOne(
       { sessionId, employee: req.user._id, isActive: true },
@@ -395,7 +399,7 @@ exports.updateLocation = async (req, res) => {
     let prev2Valid = null;
     let prevValid = { lat: lastValidLat, lng: lastValidLng, timestamp: new Date(prevTimestamp || Date.now()).toISOString(), heading: null };
 
-    // Forward Geodetic Bayesian Kinematic Filtering Pass (AGTRIE-X 5.0)
+    // Forward Geodetic Bayesian Kinematic Filtering Pass (AGTRIE-X 7.0)
     for (let i = 0; i < nonDuplicateCoordinates.length; i++) {
       const coord = nonDuplicateCoordinates[i];
       const lat = Number(coord?.lat);
@@ -443,7 +447,7 @@ exports.updateLocation = async (req, res) => {
       const lastTrustedMs = prevValid?.timestamp ? new Date(prevValid.timestamp).getTime() : (prevTimestamp || tMs - 1000);
       const dt = Math.max((tMs - lastTrustedMs) / 1000, 0.5);
 
-      // 3. Master Bayesian GPS Scoring (AGTRIE-X 5.0)
+      // 3. Master Bayesian GPS Scoring (AGTRIE-X 7.0)
       const bayesianResult = BayesianGPSScorer.scorePoint(
         { lat, lng, accuracy, speed: coord.speed, heading: coord.heading, timestamp: coord.timestamp },
         prevValid,
@@ -458,8 +462,6 @@ exports.updateLocation = async (req, res) => {
       if (dt > 1800) {
         // ── 30-MINUTE / LONG STATIONARY RE-ANCHORING ────────────────────────────
         // Reset filter directly on fresh observation to eliminate covariance lag.
-        // CRITICAL P0 FIX: Advance prevValid & prev2Valid to establish the new trusted anchor,
-        // preventing infinite loop of dt > 1800 on subsequent 10s telemetry updates!
         filterLat = lat;
         filterLng = lng;
         filterPLat = R;
@@ -468,6 +470,9 @@ exports.updateLocation = async (req, res) => {
         lastValidLng = lng;
         lastEventId = eventId;
         prevTimestamp = tMs;
+
+        centroidLat = lat;
+        centroidLng = lng;
 
         const toKmh = (s) => (Number(s) > 0 ? (Number(s) <= 60 ? Number(s) * 3.6 : Number(s)) : 0);
         const reportedSpeedKmh = toKmh(coord.speed);
@@ -516,9 +521,11 @@ exports.updateLocation = async (req, res) => {
         batchMaxSpeed = effectiveSpeedKmh;
       }
 
-      // 6. High-Fidelity Movement vs Stationary Drift Gate
-      // Stationary jitter: displacement < 3.0m
-      const isStationaryDrift = (distM < 3.0);
+      // 6. High-Fidelity Movement vs Stationary Centroid Micro-Geofence Gate (AGTRIE-X v7)
+      const distFromCentroidM = haversineDistance({ lat: centroidLat, lng: centroidLng }, { lat, lng }) * 1000;
+      const isPoorAccuracy = accuracy > 120;
+      const isInsideCentroidGeofence = distFromCentroidM < 45.0 && (effectiveSpeedKmh < 3.5 || reportedSpeedKmh < 1.0);
+      const isStationaryDrift = isPoorAccuracy || isInsideCentroidGeofence || (distM < 5.0) || (distM < 12.0 && effectiveSpeedKmh < 2.2);
       const isTeleportation = effectiveSpeedKmh > 180.0;
       const isMathematicallyValidMovement = !isStationaryDrift && !isTeleportation && dRawKm > 0 && dt <= 1800;
 
@@ -544,30 +551,24 @@ exports.updateLocation = async (req, res) => {
           distanceMeters: Math.round(dRawKm * 1000),
           distanceKm: Math.round(dRawKm * 1000) / 1000,
           classification: 'ACCEPTED',
-          reason: 'AGTRIE_X_V10_RAW_GEODESIC_ACCEPTED',
-          algorithmVersion: 'AGTRIE-X-v10.0-PRO'
+          reason: 'AGTRIE_X_V7_CENTROID_GEODESIC_ACCEPTED',
+          algorithmVersion: 'AGTRIE-X-v7.0-PRO'
         });
 
+        centroidLat = lat;
+        centroidLng = lng;
         prev2Valid = prevValid;
         prevValid = { lat: filterLat, lng: filterLng, latRaw: lat, lngRaw: lng, accuracy, speedKmh: reportedSpeedKmh, timestamp: timestamp.toISOString(), heading: coord.heading };
         lastValidLat = filterLat;
         lastValidLng = filterLng;
         lastEventId = eventId;
       } else if (isStationaryDrift) {
-        // Advance anchor position and timestamp without adding distance to prevent stuck anchor drift
+        // Update centroid via exponential moving average to track slight true shift without jumping anchor
+        centroidLat = centroidLat * 0.95 + lat * 0.05;
+        centroidLng = centroidLng * 0.95 + lng * 0.05;
         lastValidLat = filterLat;
         lastValidLng = filterLng;
         lastEventId = eventId;
-        if (prevValid) {
-          prevValid = {
-            ...prevValid,
-            timestamp: timestamp.toISOString(),
-            lat: filterLat,
-            lng: filterLng,
-            latRaw: lat,
-            lngRaw: lng
-          };
-        }
         prevTimestamp = tMs;
         acceptedEventIds.push(eventId);
       } else {
@@ -675,6 +676,8 @@ exports.updateLocation = async (req, res) => {
       date: sessionState.date || dbLiveDoc?.date,
       lastLat: lastValidLat,
       lastLng: lastValidLng,
+      centroidLat,
+      centroidLng,
       lastTs: new Date(prevValid?.timestamp || sessionState.lastTs || Date.now()).toISOString(),
       lastEventId,
       pLat: filterPLat,
@@ -1465,7 +1468,7 @@ exports.getLiveLocations = async (req, res) => {
       const latestCoord = session.coordinates[session.coordinates.length - 1] || {};
       let displayDistance = 0;
       const ledgerAgg = await DistanceLedger.aggregate([
-        { $match: { sessionId: session.sessionId, classification: 'ACCEPTED' } },
+        { $match: { sessionId: session.sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
         { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
       ]);
       if (ledgerAgg && ledgerAgg.length > 0 && typeof ledgerAgg[0].totalKm === 'number' && ledgerAgg[0].totalKm > 0) {
@@ -1484,7 +1487,7 @@ exports.getLiveLocations = async (req, res) => {
         {
           $match: {
             employee: session.employee._id,
-            classification: 'ACCEPTED',
+            classification: { $in: ['ACCEPTED', 'RECOVERED'] },
             toTimestamp: { $gte: new Date(todayStartMs) }
           }
         },

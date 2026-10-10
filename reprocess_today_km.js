@@ -73,6 +73,8 @@ async function reprocessAllEmployeesToday() {
       let filterPLng = 0.00000001;
       let lastValidLat = filterLat;
       let lastValidLng = filterLng;
+      let centroidLat = filterLat;
+      let centroidLng = filterLng;
       let lastEventId = null;
       let prevTimestamp = new Date(rawPoints[0].timestamp).getTime();
 
@@ -81,7 +83,7 @@ async function reprocessAllEmployeesToday() {
         lat: filterLat,
         lng: filterLng,
         latRaw: filterLat,
-        lngRaw: filterLng,
+        lngRaw: filterLat,
         accuracy: Number(rawPoints[0].accuracy) || 20,
         speedKmh: (Number(rawPoints[0].speed) || 0) * 3.6,
         timestamp: new Date(rawPoints[0].timestamp).toISOString(),
@@ -118,6 +120,8 @@ async function reprocessAllEmployeesToday() {
           filterPLng = R;
           lastValidLat = lat;
           lastValidLng = lng;
+          centroidLat = lat;
+          centroidLng = lng;
           lastEventId = eventId;
           prevTimestamp = tMs;
 
@@ -152,7 +156,10 @@ async function reprocessAllEmployeesToday() {
         const rawCalcSpeedKmh = dt > 0 ? (dRawKm / dt) * 3600 : 0;
         const effectiveSpeedKmh = reportedSpeedKmh > 0 ? Math.max(reportedSpeedKmh, rawCalcSpeedKmh) : rawCalcSpeedKmh;
 
-        const isStationaryDrift = distM < 3.0;
+        const distFromCentroidM = haversineDistance({ lat: centroidLat, lng: centroidLng }, { lat, lng }) * 1000;
+        const isPoorAccuracy = accuracy > 120;
+        const isInsideCentroidGeofence = distFromCentroidM < 45.0 && (effectiveSpeedKmh < 3.5 || reportedSpeedKmh < 1.0);
+        const isStationaryDrift = isPoorAccuracy || isInsideCentroidGeofence || (distM < 5.0) || (distM < 12.0 && effectiveSpeedKmh < 2.2);
         const isTeleportation = effectiveSpeedKmh > 180.0;
         const isMathematicallyValidMovement = !isStationaryDrift && !isTeleportation && dRawKm > 0 && dt <= 1800;
 
@@ -174,11 +181,13 @@ async function reprocessAllEmployeesToday() {
               distanceMeters: Math.round(dRawKm * 1000),
               distanceKm: Math.round(dRawKm * 1000) / 1000,
               classification: 'ACCEPTED',
-              reason: 'REPROCESSOR_P0_LONG_GAP_FIXED',
-              algorithmVersion: 'AGTRIE-X-v10.0-PRO'
+              reason: 'AGTRIE_X_V7_CENTROID_GEODESIC_ACCEPTED',
+              algorithmVersion: 'AGTRIE-X-v7.0-PRO'
             });
           }
 
+          centroidLat = lat;
+          centroidLng = lng;
           prev2Valid = prevValid;
           prevValid = {
             lat: filterLat,
@@ -195,12 +204,11 @@ async function reprocessAllEmployeesToday() {
           lastEventId = eventId;
           prevTimestamp = tMs;
         } else if (isStationaryDrift) {
+          centroidLat = centroidLat * 0.95 + lat * 0.05;
+          centroidLng = centroidLng * 0.95 + lng * 0.05;
           lastValidLat = filterLat;
           lastValidLng = filterLng;
           lastEventId = eventId;
-          if (prevValid) {
-            prevValid = { ...prevValid, timestamp: timestamp.toISOString(), lat: filterLat, lng: filterLng, latRaw: lat, lngRaw: lng };
-          }
           prevTimestamp = tMs;
         }
       }
