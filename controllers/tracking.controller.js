@@ -309,6 +309,19 @@ exports.updateLocation = async (req, res) => {
       await saveSessionState(sessionId, sessionState);
     }
 
+    // Safety Fallback: Ensure memory anchor is not older than the most recent committed DistanceLedger segment
+    const latestLedger = await DistanceLedger.findOne({ sessionId }).sort({ toTimestamp: -1 }).select('toTimestamp toLat toLng toEventId').lean();
+    if (latestLedger && latestLedger.toTimestamp) {
+      const ledgerTs = new Date(latestLedger.toTimestamp).getTime();
+      const currentTs = sessionState.lastTs ? new Date(sessionState.lastTs).getTime() : 0;
+      if (ledgerTs > currentTs) {
+        sessionState.lastTs = new Date(latestLedger.toTimestamp).toISOString();
+        sessionState.lastLat = latestLedger.toLat;
+        sessionState.lastLng = latestLedger.toLng;
+        sessionState.lastEventId = latestLedger.toEventId;
+      }
+    }
+
     // Step 1: Chronological Sorting & Durable Idempotency Gate
     const orderedCoordinates = [...coordinates].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
     
