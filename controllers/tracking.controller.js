@@ -623,6 +623,8 @@ exports.updateLocation = async (req, res) => {
         // Update centroid via exponential moving average to track slight true shift without jumping anchor
         centroidLat = centroidLat * 0.95 + lat * 0.05;
         centroidLng = centroidLng * 0.95 + lng * 0.05;
+        filterLat = centroidLat;
+        filterLng = centroidLng;
         lastValidLat = filterLat;
         lastValidLng = filterLng;
         lastEventId = eventId;
@@ -641,13 +643,18 @@ exports.updateLocation = async (req, res) => {
         });
       }
 
-      validCoords.push({
-        ...coord,
-        eventId,
-        lat: filterLat,
-        lng: filterLng,
-        timestamp: timestamp.toISOString()
-      });
+      // Suppress adding duplicate stationary jitter coordinates to map polyline
+      const lastSaved = validCoords[validCoords.length - 1];
+      const distFromLastSavedM = lastSaved ? haversineDistance({ lat: lastSaved.lat, lng: lastSaved.lng }, { lat: filterLat, lng: filterLng }) * 1000 : 999;
+      if (!isStationaryDrift || distFromLastSavedM >= 15.0 || validCoords.length === 0) {
+        validCoords.push({
+          ...coord,
+          eventId,
+          lat: filterLat,
+          lng: filterLng,
+          timestamp: timestamp.toISOString()
+        });
+      }
     }
 
     // Persist DistanceLedger segments to MongoDB (Immutable Audit Ledger)
@@ -886,6 +893,14 @@ exports.stopTracking = async (req, res) => {
     }
 
     const effectiveSessionId = session.sessionId || sessionId;
+
+    // Stale Stop Guard: If the session received active GPS telemetry within the last 2 minutes, ignore stale queued stop requests!
+    const lastActMs = session.lastActivity ? new Date(session.lastActivity).getTime() : 0;
+    const nowMs = Date.now();
+    if (nowMs - lastActMs < 2 * 60 * 1000 && req.body.force !== true) {
+      console.log(`🛡️ [STALE_STOP_GUARD] Suppressed stale stop request for active session ${effectiveSessionId} (last activity ${Math.round((nowMs - lastActMs)/1000)}s ago)`);
+      return res.json({ success: true, totalDistance: session.totalDistance || 0, message: 'Session is active with live GPS telemetry. Stop ignored.' });
+    }
 
     // Get final authoritative distance from Redis before clearing
     const cachedState = await getSessionState(effectiveSessionId);
