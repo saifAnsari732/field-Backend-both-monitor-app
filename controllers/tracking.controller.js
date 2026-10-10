@@ -498,6 +498,13 @@ exports.updateLocation = async (req, res) => {
             algorithmVersion: 'AGTRIE-X-v10.0-PRO'
           });
 
+          ActivityLog.create({
+            employee: req.user._id,
+            action: 'TRAVEL_RESUMED',
+            description: `Travel resumed after stationary stop. Recovered +${dGapKm.toFixed(2)} km (${gapSpeedKmh.toFixed(1)} km/h).`,
+            metadata: { sessionId, distanceKm: dGapKm, gapMinutes: Math.round(dt / 60) }
+          }).catch(() => {});
+
           console.log(`📍 [GAP_RECOVERY] Recovered +${dGapKm.toFixed(2)} km across ${(dt / 60).toFixed(0)} min gap at ${gapSpeedKmh.toFixed(1)} km/h`);
         }
 
@@ -977,22 +984,24 @@ exports.heartbeat = async (req, res) => {
     if (!sessionId) return res.status(400).json({ success: false, message: 'sessionId required' });
 
     let updated = await LiveLocation.findOneAndUpdate(
-      { sessionId, employee: req.user._id, isActive: true },
-      { $set: { lastActivity: new Date() } },
+      { sessionId, employee: req.user._id },
+      { 
+        $set: { lastActivity: new Date(), isActive: true, autoClosed: false },
+        $unset: { endTime: 1 }
+      },
       { new: true, select: 'totalDistance isActive' }
     );
 
-    if (!updated && await reopenIfAutoClosed(sessionId, req.user._id)) {
-      updated = await LiveLocation.findOne({ sessionId, employee: req.user._id, isActive: true }).select('totalDistance isActive');
-    }
-
     if (!updated) {
-      // Session was closed (auto-stop or manual) — tell the app
       return res.json({ success: false, sessionClosed: true, message: 'Session is no longer active.' });
     }
 
-    // Keep user marked as online
-    await User.findByIdAndUpdate(req.user._id, { isOnline: true, lastSeen: new Date() });
+    // Keep user marked as tracking & online
+    await User.findByIdAndUpdate(req.user._id, { isTracking: true, isOnline: true, lastSeen: new Date() }).catch(() => {});
+    await Attendance.findOneAndUpdate(
+      { employee: req.user._id, date: updated.date || new Date().toISOString().slice(0, 10) },
+      { $unset: { checkOut: 1 } }
+    ).catch(() => {});
 
     // Return cached distance so mobile can sync its local display
     const sessionState = await getSessionState(sessionId);
