@@ -266,16 +266,20 @@ exports.updateLocation = async (req, res) => {
     if (!activeDoc) {
       activeDoc = await LiveLocation.findOne({ employee: req.user._id, isActive: true, date: today }).sort({ createdAt: -1 });
       if (!activeDoc) {
+        const freshSessionId = uuidv4();
+        sessionId = freshSessionId;
         activeDoc = await LiveLocation.create({
           organizationId: orgId,
           employee: req.user._id,
-          sessionId: sessionId,
+          sessionId: freshSessionId,
           coordinates: [],
           isActive: true,
           date: today,
           startTime: new Date(),
           startAddress: 'Auto-Adopted Live Shift'
         });
+      } else {
+        sessionId = activeDoc.sessionId;
       }
     }
 
@@ -1312,16 +1316,31 @@ function haversineDistance(p1, p2) {
 function toRad(deg) { return deg * (Math.PI / 180); }
 
 // @desc Auto-recalculate session distance safely from validated TrackingPoints
-// @desc Auto-recalculate session distance safely from validated TrackingPoints
-const recalculateSessionFromPoints = async (sessionId) => {
+const recalculateSessionFromPoints = async (sessionId, sessionDate, sessionDocId) => {
   try {
-    const session = await LiveLocation.findOne({ sessionId });
+    const query = sessionDocId ? { _id: sessionDocId } : { sessionId };
+    const session = await LiveLocation.findOne(query);
     if (!session) return 0;
 
-    let points = await TrackingPoint.find({ 
-      sessionId, 
-      processingStatus: { $ne: 'REJECTED' } 
-    }).sort({ timestamp: 1 }).lean();
+    const actualSessionId = session.sessionId || sessionId;
+    const sessionDay = session.date || sessionDate;
+
+    // Filter points strictly by sessionId AND date/timestamp if available, or session.coordinates
+    let points = [];
+    if (sessionDay) {
+      const dayStart = new Date(`${sessionDay}T00:00:00.000Z`);
+      const dayEnd = new Date(`${sessionDay}T23:59:59.999Z`);
+      points = await TrackingPoint.find({ 
+        sessionId: actualSessionId,
+        timestamp: { $gte: dayStart, $lte: dayEnd },
+        processingStatus: { $ne: 'REJECTED' } 
+      }).sort({ timestamp: 1 }).lean();
+    } else {
+      points = await TrackingPoint.find({ 
+        sessionId: actualSessionId, 
+        processingStatus: { $ne: 'REJECTED' } 
+      }).sort({ timestamp: 1 }).lean();
+    }
 
     if (!points || points.length < 2) {
       points = (session.coordinates || []).filter(c => c && c.lat && c.lng);
@@ -1383,9 +1402,9 @@ const recalculateSessionFromPoints = async (sessionId) => {
           ledgerSegments.push({
             organizationId: session.organizationId,
             employee: session.employee,
-            sessionId,
-            fromEventId: prevPoint.eventId || `${sessionId}:${ts1}`,
-            toEventId: pt.eventId || `${sessionId}:${ts2}`,
+            sessionId: actualSessionId,
+            fromEventId: prevPoint.eventId || `${actualSessionId}:${ts1}`,
+            toEventId: pt.eventId || `${actualSessionId}:${ts2}`,
             fromTimestamp: new Date(ts1),
             toTimestamp: new Date(ts2),
             fromLat: prevPoint.lat,
@@ -1410,17 +1429,17 @@ const recalculateSessionFromPoints = async (sessionId) => {
     totalDistKm = Math.round(totalDistKm * 100) / 100;
 
     // Persist clean ledger and session totals
-    await DistanceLedger.deleteMany({ sessionId });
+    await DistanceLedger.deleteMany({ sessionId: actualSessionId });
     if (ledgerSegments.length > 0) {
       try {
         await DistanceLedger.insertMany(ledgerSegments, { ordered: false });
       } catch (insertErr) {
-        console.error(`[recalculateSessionFromPoints] Ledger insert warning for ${sessionId}:`, insertErr.message);
+        console.error(`[recalculateSessionFromPoints] Ledger insert warning for ${actualSessionId}:`, insertErr.message);
       }
     }
 
     await LiveLocation.updateOne(
-      { sessionId },
+      { _id: session._id },
       { 
         $set: { 
           totalDistance: totalDistKm, 
@@ -1433,15 +1452,18 @@ const recalculateSessionFromPoints = async (sessionId) => {
 
     const targetDate = session.date || new Date().toISOString().slice(0, 10);
     const allEmpSessions = await LiveLocation.find({ employee: session.employee, date: targetDate });
-    const empDayTotal = allEmpSessions.reduce((sum, s) => sum + (s.sessionId === sessionId ? totalDistKm : (s.totalDistance || 0)), 0);
+    const empDayTotal = allEmpSessions.reduce((sum, s) => {
+      const isCurrent = s._id.toString() === session._id.toString();
+      return sum + (isCurrent ? totalDistKm : (s.totalDistance || 0));
+    }, 0);
 
     await Attendance.updateOne(
       { employee: session.employee, date: targetDate },
       { $set: { totalDistanceTraveled: Math.round(empDayTotal * 100) / 100 } }
     ).catch(() => {});
 
-    const currentState = (await getSessionState(sessionId)) || {};
-    await saveSessionState(sessionId, {
+    const currentState = (await getSessionState(actualSessionId)) || {};
+    await saveSessionState(actualSessionId, {
       ...currentState,
       totalDistance: totalDistKm
     });
@@ -1520,9 +1542,9 @@ exports.getLiveLocations = async (req, res) => {
     const rawLocations = await Promise.all(activeSessions.map(async (session) => {
       if (!session.employee) return null;
 
-      // Auto-recalculate 0.0 KM sessions if raw points exist
-      if (!session.totalDistance || session.totalDistance === 0) {
-        const recalculated = await recalculateSessionFromPoints(session.sessionId);
+      // Auto-recalculate 0.0 KM sessions only if genuine raw points exist
+      if ((!session.totalDistance || session.totalDistance === 0) && Array.isArray(session.coordinates) && session.coordinates.length >= 2) {
+        const recalculated = await recalculateSessionFromPoints(session.sessionId, session.date, session._id);
         if (recalculated > 0) session.totalDistance = recalculated;
       }
 

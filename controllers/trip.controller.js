@@ -84,6 +84,8 @@ exports.confirmTrip = async (req, res) => {
       origin,
       destination,
       distanceKm,
+      plannedDistanceKm,
+      actualCoordinates,
       durationMins,
       polyline,
       purpose,
@@ -153,19 +155,33 @@ exports.confirmTrip = async (req, res) => {
 
     // 2. Create standalone completed LiveLocation credit session for today
     const tripSessionId = `TRIP-${uuidv4()}`;
-    const sampleCoords = Array.isArray(polyline) && polyline.length > 0
-      ? polyline.filter((_, idx) => idx % 5 === 0 || idx === polyline.length - 1).map(pt => ({
-          lat: pt.latitude,
-          lng: pt.longitude,
-          speed: 30,
-          accuracy: 10,
-          address: destination.address,
-          timestamp: new Date(),
+    const sampleCoords = Array.isArray(actualCoordinates) && actualCoordinates.length > 0
+      ? actualCoordinates.map(pt => ({
+          lat: Number(pt.lat || pt.latitude) || 0,
+          lng: Number(pt.lng || pt.longitude) || 0,
+          speed: Number(pt.speed) || 25,
+          accuracy: Number(pt.accuracy) || 10,
+          address: pt.address || (destination ? destination.address : ''),
+          timestamp: pt.timestamp ? new Date(pt.timestamp) : new Date(),
         }))
-      : [
-          { lat: Number(origin.lat) || 0, lng: Number(origin.lng) || 0, address: origin.address, timestamp: new Date() },
-          { lat: Number(destination.lat) || 0, lng: Number(destination.lng) || 0, address: destination.address, timestamp: new Date() },
-        ];
+      : (Array.isArray(polyline) && polyline.length > 0
+          ? polyline.filter((_, idx) => idx % 5 === 0 || idx === polyline.length - 1).map(pt => ({
+              lat: pt.latitude,
+              lng: pt.longitude,
+              speed: 30,
+              accuracy: 10,
+              address: destination.address,
+              timestamp: new Date(),
+            }))
+          : [
+              { lat: Number(origin.lat) || 0, lng: Number(origin.lng) || 0, address: origin.address, timestamp: new Date() },
+              { lat: Number(destination.lat) || 0, lng: Number(destination.lng) || 0, address: destination.address, timestamp: new Date() },
+            ]);
+
+    const isPartial = plannedDistanceKm && km < Number(plannedDistanceKm) * 0.9;
+    const adjustmentReason = isPartial
+      ? `Trip Route Claim (Partial Actual Moved): ${km} km out of ${plannedDistanceKm} km (${origin.address} -> ${destination.address})`
+      : `Trip Route Claim: ${km} km (${origin.address} -> ${destination.address})`;
 
     const session = await LiveLocation.create({
       organizationId: orgId,
@@ -175,7 +191,7 @@ exports.confirmTrip = async (req, res) => {
       totalDistance: km,
       officialDistance: km,
       manualDistanceAdded: km,
-      manualAdjustmentReason: `Trip Route Claim: ${origin.address} -> ${destination.address}`,
+      manualAdjustmentReason: adjustmentReason,
       startAddress: origin.address,
       endAddress: destination.address,
       isActive: false, // credited standalone session

@@ -570,9 +570,9 @@ exports.getTrackingHistory = async (req, res) => {
         const verifiedKm = Math.round(ledgerAgg[0].totalKm * 100) / 100;
         s.totalDistance = verifiedKm;
         s.officialDistance = verifiedKm;
-      } else if (!s.totalDistance || s.totalDistance === 0) {
+      } else if ((!s.totalDistance || s.totalDistance === 0) && Array.isArray(s.coordinates) && s.coordinates.length >= 2) {
         try {
-          const recalculated = await trackingController.recalculateSessionFromPoints(s.sessionId);
+          const recalculated = await trackingController.recalculateSessionFromPoints(s.sessionId, s.date, s._id);
           if (recalculated > 0) {
             s.totalDistance = recalculated;
             s.officialDistance = recalculated;
