@@ -280,11 +280,21 @@ exports.updateLocation = async (req, res) => {
     }
 
     if (!activeDoc.isActive) {
+      if (activeDoc.endTime && !activeDoc.autoClosed) {
+        console.log(`🛑 [SESSION_CLOSED] Received GPS telemetry for manually stopped session ${sessionId}. Dropping trailing points.`);
+        if (releaseSessionLock) await releaseSessionLock().catch(() => {});
+        return res.json({ 
+          success: true, 
+          message: 'Session already ended by employee.', 
+          sessionClosed: true, 
+          totalDistance: activeDoc.totalDistance || 0 
+        });
+      }
       activeDoc.isActive = true;
       activeDoc.autoClosed = false;
       activeDoc.lastActivity = new Date();
       await activeDoc.save();
-      console.log(`🛡️ [AUTO_RESUME] Auto-reactivated session ${sessionId} for ${req.user.name || req.user._id}`);
+      console.log(`🛡️ [AUTO_RESUME] Auto-reactivated inactivity-closed session ${sessionId} for ${req.user.name || req.user._id}`);
     }
     await User.findByIdAndUpdate(req.user._id, { isTracking: true, isOnline: true, lastSeen: new Date() });
 
@@ -894,13 +904,8 @@ exports.stopTracking = async (req, res) => {
 
     const effectiveSessionId = session.sessionId || sessionId;
 
-    // Stale Stop Guard: If the session received active GPS telemetry within the last 2 minutes, ignore stale queued stop requests!
-    const lastActMs = session.lastActivity ? new Date(session.lastActivity).getTime() : 0;
-    const nowMs = Date.now();
-    if (nowMs - lastActMs < 2 * 60 * 1000 && req.body.force !== true) {
-      console.log(`🛡️ [STALE_STOP_GUARD] Suppressed stale stop request for active session ${effectiveSessionId} (last activity ${Math.round((nowMs - lastActMs)/1000)}s ago)`);
-      return res.json({ success: true, totalDistance: session.totalDistance || 0, message: 'Session is active with live GPS telemetry. Stop ignored.' });
-    }
+    // Manual stop is authoritative: Always end shift immediately without suppression
+    session.autoClosed = false;
 
     // Get final authoritative distance from Redis before clearing
     const cachedState = await getSessionState(effectiveSessionId);
