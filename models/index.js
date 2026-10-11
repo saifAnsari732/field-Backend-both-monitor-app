@@ -279,5 +279,6 @@ module.exports = {
   Task: mongoose.model('Task', taskSchema),
   Lead: mongoose.model('Lead', leadSchema),
   TravelLog: mongoose.model('TravelLog', travelLogSchema),
+  TripRouteClaim: require('./TripRouteClaim.model'),
 };
 

@@ -126,6 +126,7 @@ app.use('/api/admin', require('./routes/admin.routes'));
 app.use('/api/notifications', require('./routes/notification.routes'));
 app.use('/api/leaves', require('./routes/leave.routes'));
 app.use('/api/tasks', require('./routes/task.routes'));
+app.use('/api/trips', require('./routes/trip.routes'));
 const { protect } = require('./middleware/auth.middleware');
 const { LiveLocation, Meeting } = require('./models');
 
