@@ -916,19 +916,11 @@ exports.stopTracking = async (req, res) => {
     );
     const gpsKm = Math.round(baseGpsKm * 100) / 100;
 
-    // Automatic 10% punch-out tolerance addition
-    const TOLERANCE_PCT = Number(process.env.PUNCH_OUT_TOLERANCE_PCT ?? 10);
-    const toleranceKm = (gpsKm > 0 && TOLERANCE_PCT > 0) ? Math.round(gpsKm * (TOLERANCE_PCT / 100) * 100) / 100 : 0;
-    const finalOfficialKm = Math.round((gpsKm + toleranceKm) * 100) / 100;
-
-    session.acceptedDistance = gpsKm;       // pure GPS km
+    // Pure GPS distance — no tolerance/inflation added (AGTRIE-X v7 strict mode)
+    session.acceptedDistance = gpsKm;
     session.rawGpsDistance = gpsKm;
-    session.totalDistance = finalOfficialKm;
-    session.officialDistance = finalOfficialKm;
-    if (toleranceKm > 0) {
-      session.manualDistanceAdded = Math.round(((Number(session.manualDistanceAdded) || 0) + toleranceKm) * 100) / 100;
-      session.manualAdjustmentReason = `${TOLERANCE_PCT}% Punch Out tolerance: GPS ${gpsKm} km + ${toleranceKm} km = ${finalOfficialKm} km`;
-    }
+    session.totalDistance = gpsKm;
+    session.officialDistance = gpsKm;
 
     // Get end address from last coordinate
     if (session.coordinates && session.coordinates.length > 0) {
