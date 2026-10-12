@@ -257,13 +257,22 @@ exports.updateLocation = async (req, res) => {
     let activeDoc = await LiveLocation.findOne({ sessionId, employee: req.user._id });
     
     // Multi-Day Zombie Session Auto-Close Guard:
-    // If activeDoc belongs to a previous date, auto-close yesterday's shift and start a fresh session for today!
+    // If activeDoc belongs to a previous date, auto-close yesterday's shift and tell mobile app to stop!
     if (activeDoc && activeDoc.date && activeDoc.date !== today) {
-      activeDoc.isActive = false;
-      activeDoc.endTime = activeDoc.lastActivity || new Date(`${activeDoc.date}T23:59:59.999Z`);
-      await activeDoc.save();
-      console.log(`🛡️ [DATE_ROLLOVER] Auto-closed yesterday session ${sessionId} from ${activeDoc.date} for employee ${req.user._id}`);
-      activeDoc = null;
+      if (activeDoc.isActive) {
+        activeDoc.isActive = false;
+        activeDoc.autoClosed = true;
+        activeDoc.endTime = activeDoc.lastActivity || new Date(`${activeDoc.date}T23:59:59.999Z`);
+        await activeDoc.save();
+        console.log(`🛡️ [DATE_ROLLOVER] Auto-closed yesterday session ${sessionId} from ${activeDoc.date} for employee ${req.user._id}`);
+      }
+      if (releaseSessionLock) await releaseSessionLock().catch(() => {});
+      return res.json({
+        success: true,
+        sessionClosed: true,
+        message: `Shift from ${activeDoc.date} has ended. Please punch in for today.`,
+        totalDistance: activeDoc.totalDistance || 0
+      });
     }
 
     if (!activeDoc) {
@@ -1034,18 +1043,34 @@ exports.heartbeat = async (req, res) => {
     const { sessionId } = req.body;
     if (!sessionId) return res.status(400).json({ success: false, message: 'sessionId required' });
 
+    const today = getBusinessDate(new Date(), 'Asia/Kolkata');
+    const existing = await LiveLocation.findOne({ sessionId, employee: req.user._id });
+    if (!existing) {
+      return res.json({ success: false, sessionClosed: true, message: 'Session is no longer active.' });
+    }
+
+    if (existing.date && existing.date !== today) {
+      if (existing.isActive) {
+        existing.isActive = false;
+        existing.autoClosed = true;
+        existing.endTime = existing.lastActivity || new Date(`${existing.date}T23:59:59.999Z`);
+        await existing.save().catch(() => {});
+      }
+      return res.json({ success: false, sessionClosed: true, message: 'Session from previous day has ended.' });
+    }
+
+    if (!existing.isActive) {
+      return res.json({ success: false, sessionClosed: true, message: 'Session is no longer active.' });
+    }
+
     let updated = await LiveLocation.findOneAndUpdate(
-      { sessionId, employee: req.user._id },
+      { sessionId, employee: req.user._id, isActive: true },
       { 
-        $set: { lastActivity: new Date(), isActive: true, autoClosed: false },
+        $set: { lastActivity: new Date(), autoClosed: false },
         $unset: { endTime: 1 }
       },
       { new: true, select: 'totalDistance isActive' }
     );
-
-    if (!updated) {
-      return res.json({ success: false, sessionClosed: true, message: 'Session is no longer active.' });
-    }
 
     // Keep user marked as tracking & online
     await User.findByIdAndUpdate(req.user._id, { isTracking: true, isOnline: true, lastSeen: new Date() }).catch(() => {});
