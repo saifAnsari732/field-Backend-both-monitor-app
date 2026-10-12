@@ -20,6 +20,9 @@ function getBusinessDate(date = new Date(), timeZone = 'Asia/Kolkata') {
   }).format(date);
 }
 
+// In-memory throttle for closed session drop logs (max 1 log per 60s per session)
+const closedSessionLogThrottle = new Map();
+
 // @desc Start tracking session
 exports.startTracking = async (req, res) => {
   try {
@@ -168,7 +171,7 @@ const {
 
 // ─── Motion State Classifier (AGTRIE-X v7) ────────────────────────────────
 function classifyMotionState(speedKmh) {
-  if (speedKmh < 1) return 'STATIONARY';
+  if (speedKmh < 3) return 'STATIONARY';
   if (speedKmh < 7) return 'WALKING';
   if (speedKmh < 15) return 'RUNNING';
   if (speedKmh < 40) return 'BIKE';
@@ -285,7 +288,17 @@ exports.updateLocation = async (req, res) => {
 
     if (!activeDoc.isActive) {
       if (activeDoc.endTime && !activeDoc.autoClosed) {
-        console.log(`🛑 [SESSION_CLOSED] Received GPS telemetry for manually stopped session ${sessionId}. Dropping trailing points.`);
+        const lastLog = closedSessionLogThrottle.get(sessionId) || 0;
+        if (Date.now() - lastLog > 60000) {
+          closedSessionLogThrottle.set(sessionId, Date.now());
+          console.log(`🛑 [SESSION_CLOSED] Received GPS telemetry for manually stopped session ${sessionId}. Dropping trailing points (throttled 60s).`);
+          if (closedSessionLogThrottle.size > 500) {
+            const cutoff = Date.now() - 300000;
+            for (const [id, ts] of closedSessionLogThrottle.entries()) {
+              if (ts < cutoff) closedSessionLogThrottle.delete(id);
+            }
+          }
+        }
         if (releaseSessionLock) await releaseSessionLock().catch(() => {});
         return res.json({ 
           success: true, 
@@ -592,11 +605,19 @@ exports.updateLocation = async (req, res) => {
         batchMaxSpeed = effectiveSpeedKmh;
       }
 
-      // 6. High-Fidelity Movement vs Stationary Centroid Micro-Geofence Gate (AGTRIE-X v10.0)
+      // 6. High-Fidelity Movement vs Stationary Centroid Geofence Gate (AGTRIE-X v10.0)
       const distFromCentroidM = haversineDistance({ lat: centroidLat, lng: centroidLng }, { lat, lng }) * 1000;
-      const isPoorAccuracy = accuracy > 250;
-      const isInsideCentroidGeofence = distFromCentroidM < 12.0 && (effectiveSpeedKmh < 2.0 || reportedSpeedKmh < 1.0);
-      const isStationaryDrift = (isPoorAccuracy && effectiveSpeedKmh < 3.0) || isInsideCentroidGeofence || (distM < 3.0) || (distM < 10.0 && effectiveSpeedKmh < 1.8);
+      const isPoorAccuracy = accuracy > 180;
+      const centroidGeofenceRadiusM = Math.max(30.0, Math.min(50.0, accuracy * 1.0));
+
+      // A point is stationary drift if:
+      // 1. It is within the stationary centroid bubble (< 35-65m) AND speed is below brisk outdoor travel (< 6.0 km/h)
+      // 2. OR step distance from previous fix is micro (< 8.0m)
+      // 3. OR poor accuracy with sub-travel speed (< 5.0 km/h)
+      // 4. OR step distance < 25m and effective speed < 3.5 km/h
+      const isInsideCentroidGeofence = distFromCentroidM < centroidGeofenceRadiusM && effectiveSpeedKmh < 6.0;
+      const isMicroStep = distM < 8.0;
+      const isStationaryDrift = isInsideCentroidGeofence || isMicroStep || (isPoorAccuracy && effectiveSpeedKmh < 5.0) || (distM < 25.0 && effectiveSpeedKmh < 3.5);
       const isTeleportation = effectiveSpeedKmh > 180.0;
       const isMathematicallyValidMovement = !isStationaryDrift && !isTeleportation && dRawKm > 0;
 
@@ -634,9 +655,9 @@ exports.updateLocation = async (req, res) => {
         lastValidLng = filterLng;
         lastEventId = eventId;
       } else if (isStationaryDrift) {
-        // Update centroid via exponential moving average to track slight true shift without jumping anchor
-        centroidLat = centroidLat * 0.95 + lat * 0.05;
-        centroidLng = centroidLng * 0.95 + lng * 0.05;
+        // Softly converge centroid via exponential moving average to track slight true shift without jumping anchor
+        centroidLat = centroidLat * 0.98 + lat * 0.02;
+        centroidLng = centroidLng * 0.98 + lng * 0.02;
         filterLat = centroidLat;
         filterLng = centroidLng;
         lastValidLat = filterLat;
@@ -722,8 +743,9 @@ exports.updateLocation = async (req, res) => {
       ).catch(() => {});
     }
 
-    const finalSpeedKmh = Math.min(batchMaxSpeed, 220);
-    const currentMotionState = classifyMotionState(finalSpeedKmh);
+    const hasTravelOccurred = ledgerSegments.length > 0;
+    const finalSpeedKmh = hasTravelOccurred ? Math.min(batchMaxSpeed, 220) : 0;
+    const currentMotionState = hasTravelOccurred ? classifyMotionState(finalSpeedKmh) : 'STATIONARY';
     const runningAvgAccuracy = sumAccuracy / (totalRawPoints || 1);
 
     // Throttle reverse geocoding: only resolve address if movement >= 250m or >= 5 minutes since last geocode

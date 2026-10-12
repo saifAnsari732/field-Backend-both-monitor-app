@@ -28,19 +28,45 @@ exports.register = async (req, res) => {
   }
 };
 
-// @desc Login
+// Build a regex that matches a stored phone number regardless of formatting
+// (spaces, dashes, +91 / 0 prefix) using its last 10 digits.
+const phoneRegexFromDigits = (last10) =>
+  new RegExp(last10.split('').join('\\D*') + '\\D*$');
+
+// @desc Login — accepts email OR phone number (employee / manager / admin / org admin)
 exports.login = async (req, res) => {
   try {
-    const { email, password } = req.body;
-    const user = await User.findOne({ email }).populate('manager', 'name email').populate('organizationId');
-    if (!user || !(await user.matchPassword(password)))
+    const { email, identifier, phone, mobile, password } = req.body;
+    const rawId = String(identifier || email || phone || mobile || '').trim();
+    if (!rawId || !password)
+      return res.status(400).json({ success: false, message: 'Email/Phone and password are required' });
+
+    let candidates = [];
+    if (rawId.includes('@')) {
+      candidates = await User.find({ email: rawId.toLowerCase() })
+        .populate('manager', 'name email').populate('organizationId');
+    } else {
+      const digits = rawId.replace(/\D/g, '');
+      if (digits.length < 10)
+        return res.status(401).json({ success: false, message: 'Invalid credentials' });
+      const last10 = digits.slice(-10);
+      candidates = await User.find({ phone: { $regex: phoneRegexFromDigits(last10) } })
+        .populate('manager', 'name email').populate('organizationId');
+    }
+
+    // Same phone may exist on more than one account: pick the one whose password matches
+    let user = null;
+    for (const c of candidates) {
+      if (await c.matchPassword(password)) { user = c; break; }
+    }
+    if (!user)
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     if (user.isBlocked)
       return res.status(403).json({ success: false, message: 'Account blocked. Contact HR.' });
 
 
     await User.findByIdAndUpdate(user._id, { isOnline: true, lastSeen: new Date() });
-    await ActivityLog.create({ employee: user._id, action: 'LOGIN', description: 'User logged in', ip: req.ip });
+    await ActivityLog.create({ employee: user._id, action: 'LOGIN', description: `User logged in (${rawId.includes('@') ? 'email' : 'phone'})`, ip: req.ip });
 
     const token = generateToken(user._id);
     res.json({ success: true, token, user });
