@@ -79,48 +79,63 @@ const upstashRestCall = async (commandArr) => {
   }
 };
 
-// ─── Generic Cache Helpers ────────────────────────────────────────────────────
+// ─── Generic Cache Helpers (L1 In-Memory 0ms + L2 Redis Sync) ─────────────────
 const getCache = async (key) => {
+  // 1. L1 RAM Cache check (0ms latency)
+  const localVal = memCache.get(key);
+  if (localVal !== undefined) {
+    return localVal;
+  }
+
+  // 2. L2 Redis TCP check
   if (redisAvailable && redisClient) {
     try {
       const data = await redisClient.get(key);
-      return data ? JSON.parse(data) : null;
+      if (data) {
+        const parsed = JSON.parse(data);
+        memCache.set(key, parsed, 30);
+        return parsed;
+      }
     } catch { /* fall through */ }
   }
+
+  // 3. L2 Upstash REST fallback
   if (useRest) {
     try {
       const data = await upstashRestCall(['get', key]);
-      return data ? JSON.parse(data) : null;
+      if (data) {
+        const parsed = JSON.parse(data);
+        memCache.set(key, parsed, 30);
+        return parsed;
+      }
     } catch { /* fall through */ }
   }
-  const val = memCache.get(key);
-  return val !== undefined ? val : null;
+
+  return null;
 };
 
 const setCache = async (key, value, ttl = 60) => {
+  // 1. Write immediately to L1 RAM cache (0ms)
+  memCache.set(key, value, ttl);
+
+  // 2. Sync to L2 Redis asynchronously (non-blocking for API response speed)
   if (redisAvailable && redisClient) {
-    try {
-      await redisClient.set(key, JSON.stringify(value), 'EX', ttl);
-      return;
-    } catch { /* fall through */ }
+    redisClient.set(key, JSON.stringify(value), 'EX', ttl).catch(() => {});
+    return;
   }
   if (useRest) {
-    try {
-      await upstashRestCall(['set', key, JSON.stringify(value), 'EX', String(ttl)]);
-      return;
-    } catch { /* fall through */ }
+    upstashRestCall(['set', key, JSON.stringify(value), 'EX', String(ttl)]).catch(() => {});
   }
-  memCache.set(key, value, ttl);
 };
 
 const deleteCache = async (key) => {
+  memCache.del(key);
   if (redisAvailable && redisClient) {
-    try { await redisClient.del(key); } catch { /* ignore */ }
+    redisClient.del(key).catch(() => {});
   }
   if (useRest) {
-    try { await upstashRestCall(['del', key]); } catch { /* ignore */ }
+    upstashRestCall(['del', key]).catch(() => {});
   }
-  memCache.del(key);
 };
 
 // ─── Distance Tracking Helpers (Redis-native atomic increment) ────────────────

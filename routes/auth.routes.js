@@ -7,9 +7,12 @@ module.exports = (() => {
   r.post('/register', c.register);
   r.post('/login', c.login);
   r.post('/refresh-token', c.refreshToken);
+  r.post('/verify-reset-email', c.verifyResetEmail);
+  r.post('/reset-password-direct', c.resetPasswordDirect);
   r.post('/logout', protect, c.logout);
   r.get('/me', protect, c.getMe);
   r.put('/profile', protect, c.updateProfile);
   r.put('/change-password', protect, c.changePassword);
   return r;
 })();
+

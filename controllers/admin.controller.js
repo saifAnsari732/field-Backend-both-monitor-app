@@ -194,6 +194,16 @@ exports.getAllEmployees = async (req, res) => {
     const isSuperAdmin = ['SUPER_ADMIN', 'SUPERADMIN'].includes(userRole);
     const orgId = req.user?.organizationId?._id || req.user?.organizationId;
 
+    const canCache = !search && !department && isActive === undefined && (!role || role === 'all') && Number(page) === 1;
+    const cacheKey = `admin_employees_${userRole}_${isSuperAdmin ? 'super' : (userRole === 'MANAGER' ? req.user._id : orgId || req.user._id)}_${limit}`;
+
+    if (canCache) {
+      const cached = await liveCache.get(cacheKey);
+      if (cached) {
+        return res.json({ ...cached, fromCache: true });
+      }
+    }
+
     const filter = {};
     if (!isSuperAdmin && orgId) {
       filter.organizationId = orgId;
@@ -229,15 +239,18 @@ exports.getAllEmployees = async (req, res) => {
     if (department) filter.department = department;
     if (isActive !== undefined) filter.isActive = isActive === 'true';
 
-    const employees = await User.find(filter)
-      .populate('manager', 'name')
-      .sort({ isTracking: -1, isOnline: -1, createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(+limit);
+    const [employees, total] = await Promise.all([
+      User.find(filter)
+        .select('-password')
+        .populate('manager', 'name')
+        .sort({ isTracking: -1, isOnline: -1, createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(+limit)
+        .lean(),
+      User.countDocuments(filter)
+    ]);
 
-    const total = await User.countDocuments(filter);
-
-    // Enrich employees with today's real attendance distance and live location metrics
+    // Enrich employees with today's real attendance distance and live location metrics (WITHOUT coordinates array!)
     const empIds = employees.map(e => e._id);
     const today = new Date().toISOString().slice(0, 10);
     const startOfToday = new Date();
@@ -248,10 +261,13 @@ exports.getAllEmployees = async (req, res) => {
         employee: { $in: empIds }, 
         $or: [{ date: today }, { createdAt: { $gte: startOfToday } }] 
       }).lean(),
-      LiveLocation.find({ 
-        employee: { $in: empIds }, 
-        $or: [{ date: today }, { createdAt: { $gte: startOfToday } }, { isActive: true }] 
-      }).lean()
+      LiveLocation.find(
+        { 
+          employee: { $in: empIds }, 
+          $or: [{ date: today }, { createdAt: { $gte: startOfToday } }, { isActive: true }] 
+        },
+        { coordinates: 0, rejectionReasons: 0 }
+      ).lean()
     ]);
 
     const attMap = new Map();
@@ -306,7 +322,12 @@ exports.getAllEmployees = async (req, res) => {
       };
     });
 
-    res.json({ success: true, employees: enrichedEmployees, total, pages: Math.ceil(total / limit) });
+    const payload = { success: true, employees: enrichedEmployees, total, pages: Math.ceil(total / limit) };
+    if (canCache) {
+      await liveCache.set(cacheKey, payload, 12);
+    }
+
+    res.json(payload);
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -351,23 +372,40 @@ exports.getManagers = async (req, res) => {
     const userRole = (req.user?.role || '').toUpperCase();
     const isSuperAdmin = ['SUPER_ADMIN', 'SUPERADMIN'].includes(userRole);
     const orgId = req.user?.organizationId?._id || req.user?.organizationId;
+    const cacheKey = `admin_managers_${isSuperAdmin ? 'super' : orgId || req.user?._id}`;
+
+    const cached = await liveCache.get(cacheKey);
+    if (cached) {
+      return res.json({ success: true, managers: cached, fromCache: true });
+    }
 
     const filter = { role: { $in: ['manager', 'MANAGER'] } };
     if (!isSuperAdmin && orgId) {
       filter.organizationId = orgId;
     }
 
-    const managers = await User.find(filter).select('name email designation employeeId department role allocatedArea address isActive isOnline isTracking isApproved isBlocked salary TA').sort({ name: 1 });
+    const managers = await User.find(filter)
+      .select('name email designation employeeId department role allocatedArea address isActive isOnline isTracking isApproved isBlocked salary TA avatar emp_profile_pic managerPro_pic')
+      .sort({ name: 1 })
+      .lean();
+
+    await liveCache.set(cacheKey, managers, 30);
     res.json({ success: true, managers });
   } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
-// Helper to scope employee IDs by tenant and role
+// Helper to scope employee IDs by tenant and role (cached for 30s to avoid duplicate DB lookups across parallel requests)
 const getScopedEmployeeIds = async (user) => {
   const userRole = (user?.role || '').toUpperCase();
   if (['SUPER_ADMIN', 'SUPERADMIN'].includes(userRole)) return null;
 
   const orgId = user?.organizationId?._id || user?.organizationId;
+  const cacheKey = `scoped_emp_ids_${userRole}_${userRole === 'MANAGER' || userRole === 'EMPLOYEE' ? user._id : (orgId || user._id)}`;
+  const cachedIds = await liveCache.get(cacheKey);
+  if (Array.isArray(cachedIds)) {
+    return cachedIds;
+  }
+
   const userScope = {};
   if (orgId) {
     userScope.organizationId = orgId;
@@ -382,8 +420,10 @@ const getScopedEmployeeIds = async (user) => {
     return null;
   }
 
-  const scopedUsers = await User.find(userScope).select('_id');
-  return scopedUsers.map(u => u._id);
+  const scopedUsers = await User.find(userScope).select('_id').lean();
+  const ids = scopedUsers.map(u => u._id);
+  await liveCache.set(cacheKey, ids, 30);
+  return ids;
 };
 
 exports.approveExpense = async (req, res) => {
@@ -601,14 +641,23 @@ exports.getOrganizationSettings = async (req, res) => {
   try {
     const Organization = require('../models/Organization.model');
     let orgId = req.organizationId || req.user?.organizationId?._id || req.user?.organizationId;
+    const cacheKey = `org_settings_${orgId || 'default'}`;
+
+    const cached = await liveCache.get(cacheKey);
+    if (cached) {
+      return res.json({ success: true, organization: cached, fromCache: true });
+    }
+
     let organization = null;
     if (orgId) {
-      organization = await Organization.findById(orgId);
+      organization = await Organization.findById(orgId).lean();
     }
     if (!organization) {
-      organization = await Organization.findOne();
+      organization = await Organization.findOne().lean();
     }
     if (!organization) return res.status(404).json({ success: false, message: 'Organization record not found' });
+
+    await liveCache.set(cacheKey, organization, 60);
     res.json({ success: true, organization });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -645,6 +694,8 @@ exports.updateOrganizationSettings = async (req, res) => {
       { $set: updateData },
       { new: true }
     );
+    await liveCache.set(`org_settings_${orgId}`, organization, 60);
+    await liveCache.set('org_settings_default', organization, 60);
     res.json({ success: true, organization, message: 'Organization settings updated successfully' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

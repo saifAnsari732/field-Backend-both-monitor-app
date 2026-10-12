@@ -626,15 +626,30 @@ exports.updateLocation = async (req, res) => {
       // 6. High-Fidelity Movement vs Stationary Centroid Geofence Gate (AGTRIE-X v10.0)
       const distFromCentroidM = haversineDistance({ lat: centroidLat, lng: centroidLng }, { lat, lng }) * 1000;
       const isCoarseJump = accuracy > 100;
-      const centroidGeofenceRadiusM = Math.max(30.0, Math.min(50.0, accuracy * 1.0));
+      const centroidGeofenceRadiusM = Math.max(40.0, Math.min(65.0, accuracy * 1.2));
+      const prevWasMoving = (Number(prevValid?.speedKmh) || 0) >= 3.5;
+
+      // Single-spike indoor multipath guard:
+      // If hardware GPS Doppler speed is 0 (< 2.5 km/h) AND previous state was stationary (!prevWasMoving),
+      // require either a confirmed progressive second point or displacement >= 85m before counting distance.
+      let isUnconfirmedSingleSpike = false;
+      if (!prevWasMoving && reportedSpeedKmh < 2.5 && distFromCentroidM < 85.0) {
+        if (prevValid?.candidateDistM && distFromCentroidM >= prevValid.candidateDistM + 12) {
+          // Second consecutive point progressed at least 12m further from centroid -> confirmed departure!
+          isUnconfirmedSingleSpike = false;
+        } else {
+          isUnconfirmedSingleSpike = true;
+        }
+      }
 
       // A point is stationary drift if:
-      // 1. It is within the stationary centroid bubble (< 30-50m) AND speed is below brisk outdoor travel (< 6.0 km/h)
-      // 2. OR step distance from previous fix is micro (< 8.0m)
-      // 3. OR step distance < 25m and effective speed < 3.5 km/h
+      // 1. It is within the stationary centroid bubble (< 40-65m) AND speed is below brisk outdoor travel (< 6.0 km/h)
+      // 2. OR it is a single unconfirmed indoor spike with 0 hardware Doppler speed
+      // 3. OR step distance from previous fix is micro (< 8.0m)
+      // 4. OR step distance < 25m and effective speed < 3.5 km/h
       const isInsideCentroidGeofence = distFromCentroidM < centroidGeofenceRadiusM && effectiveSpeedKmh < 6.0;
       const isMicroStep = distM < 8.0;
-      const isStationaryDrift = !isCoarseJump && (isInsideCentroidGeofence || isMicroStep || (distM < 25.0 && effectiveSpeedKmh < 3.5));
+      const isStationaryDrift = !isCoarseJump && (isInsideCentroidGeofence || isUnconfirmedSingleSpike || isMicroStep || (distM < 25.0 && effectiveSpeedKmh < 3.5));
       const isTeleportation = effectiveSpeedKmh > 180.0 || isCoarseJump;
       const isMathematicallyValidMovement = !isStationaryDrift && !isTeleportation && dRawKm > 0;
 
@@ -678,7 +693,8 @@ exports.updateLocation = async (req, res) => {
           latRaw: lat,
           lngRaw: lng,
           accuracy,
-          speedKmh: reportedSpeedKmh,
+          speedKmh: Math.max(reportedSpeedKmh, 4.0),
+          candidateDistM: 0,
           timestamp: timestamp.toISOString(),
           heading: coord.heading
         };
@@ -695,7 +711,9 @@ exports.updateLocation = async (req, res) => {
           ...prevValid,
           latRaw: anchorLat,
           lngRaw: anchorLng,
-          timestamp: timestamp.toISOString()
+          speedKmh: 0,
+          candidateDistM: distFromCentroidM >= 35.0 ? distFromCentroidM : 0,
+          timestamp: prevValid?.timestamp || timestamp.toISOString()
         };
         acceptedEventIds.push(eventId);
       } else {
@@ -1582,15 +1600,15 @@ exports.reconcileAllActiveSessions = async () => {
   }
 };
 
-// @desc Get live locations (optimized with server-side caching & tenant isolation)
+// @desc Get live locations (optimized with server-side caching, $slice: -1 projection & batched ledger aggregation)
 exports.getLiveLocations = async (req, res) => {
   try {
     const userRole = (req.user?.role || '').toUpperCase();
     const isSuperAdmin = ['SUPER_ADMIN', 'SUPERADMIN'].includes(userRole);
     const orgId = req.user?.organizationId?._id || req.user?.organizationId;
-    const cacheKey = `live_locations_${isSuperAdmin ? 'all' : orgId || req.user?._id}`;
+    const cacheKey = `live_locations_${userRole}_${isSuperAdmin ? 'all' : (userRole === 'MANAGER' ? req.user?._id : orgId || req.user?._id)}`;
     
-    // Check cache (3s TTL)
+    // Check L1/L2 cache (6s TTL)
     const cachedData = await liveCache.get(cacheKey);
     if (cachedData) {
       return res.json({ success: true, ...cachedData, fromCache: true });
@@ -1602,65 +1620,71 @@ exports.getLiveLocations = async (req, res) => {
       userScope.$or = [{ managerId: req.user._id }, { manager: req.user._id }, { _id: req.user._id }];
     }
 
-    const orgEmployees = await User.find(userScope).select('_id');
+    const orgEmployees = await User.find(userScope).select('_id').lean();
     const empIds = orgEmployees.map(e => e._id);
 
-    // Get active tracking sessions within last 14h cutoff (avoids timezone date dropping)
+    // Get active tracking sessions within last 14h cutoff — ONLY fetch the last 1 coordinate ($slice: -1)
     const cutoff = new Date(Date.now() - 14 * 60 * 60 * 1000);
-    const activeSessions = await LiveLocation.find({
-      isActive: true,
-      employee: { $in: empIds },
-      $or: [
-        { lastActivity: { $gte: cutoff } },
-        { lastActivity: null, updatedAt: { $gte: cutoff } }
-      ]
-    }).populate('employee', 'name employeeId avatar department organizationId isOnline lastSeen');
+    const activeSessions = await LiveLocation.find(
+      {
+        isActive: true,
+        employee: { $in: empIds },
+        $or: [
+          { lastActivity: { $gte: cutoff } },
+          { lastActivity: null, updatedAt: { $gte: cutoff } }
+        ]
+      },
+      { coordinates: { $slice: -1 }, rejectionReasons: 0 }
+    )
+      .populate('employee', 'name employeeId avatar department organizationId isOnline lastSeen')
+      .lean();
 
-    // Format for frontend
+    if (!activeSessions.length) {
+      const emptyRes = { locations: [], count: 0 };
+      await liveCache.set(cacheKey, emptyRes, 6);
+      return res.json({ success: true, ...emptyRes });
+    }
+
+    // Batch-aggregate session & today distances in 2 single MongoDB queries instead of 2*N queries!
+    const sessionIds = activeSessions.map(s => s.sessionId).filter(Boolean);
+    const activeEmpIds = activeSessions.map(s => s.employee?._id).filter(Boolean);
+    const today = getBusinessDate(new Date(), 'Asia/Kolkata');
+    const todayStartMs = new Date(`${today}T00:00:00.000Z`).getTime();
+
+    const [sessionLedgerAggs, empTodayLedgerAggs] = await Promise.all([
+      DistanceLedger.aggregate([
+        { $match: { sessionId: { $in: sessionIds }, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
+        { $group: { _id: '$sessionId', totalKm: { $sum: '$distanceKm' } } }
+      ]),
+      DistanceLedger.aggregate([
+        {
+          $match: {
+            employee: { $in: activeEmpIds },
+            classification: { $in: ['ACCEPTED', 'RECOVERED'] },
+            toTimestamp: { $gte: new Date(todayStartMs) }
+          }
+        },
+        { $group: { _id: '$employee', totalKm: { $sum: '$distanceKm' } } }
+      ])
+    ]);
+
+    const sessionKmMap = new Map(sessionLedgerAggs.map(a => [String(a._id), Math.round((a.totalKm || 0) * 100) / 100]));
+    const empTodayKmMap = new Map(empTodayLedgerAggs.map(a => [String(a._id), Math.round((a.totalKm || 0) * 100) / 100]));
+
     const rawLocations = await Promise.all(activeSessions.map(async (session) => {
       if (!session.employee) return null;
 
-      // Auto-recalculate 0.0 KM sessions only if genuine raw points exist
-      if ((!session.totalDistance || session.totalDistance === 0) && Array.isArray(session.coordinates) && session.coordinates.length >= 2) {
-        const recalculated = await recalculateSessionFromPoints(session.sessionId, session.date, session._id);
-        if (recalculated > 0) session.totalDistance = recalculated;
-      }
+      const latestCoord = (session.coordinates && session.coordinates[session.coordinates.length - 1]) || {};
+      let displayDistance = sessionKmMap.get(String(session.sessionId)) || 0;
 
-      const latestCoord = session.coordinates[session.coordinates.length - 1] || {};
-      let displayDistance = 0;
-      const ledgerAgg = await DistanceLedger.aggregate([
-        { $match: { sessionId: session.sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
-        { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
-      ]);
-      if (ledgerAgg && ledgerAgg.length > 0 && typeof ledgerAgg[0].totalKm === 'number' && ledgerAgg[0].totalKm > 0) {
-        displayDistance = Math.round(ledgerAgg[0].totalKm * 100) / 100;
-      } else {
+      if (displayDistance <= 0) {
         const sessionState = await getSessionState(session.sessionId);
         const sessionDist = sessionState?.totalDistance ?? session.totalDistance ?? 0;
         displayDistance = Math.round(sessionDist * 100) / 100;
       }
 
-      // Calculate today's full cumulative accepted KM across all today's sessions for this employee
-      const today = getBusinessDate(new Date(), 'Asia/Kolkata');
-      const todayStartMs = new Date(`${today}T00:00:00.000Z`).getTime();
-
-      const empTodayLedgerAgg = await DistanceLedger.aggregate([
-        {
-          $match: {
-            employee: session.employee._id,
-            classification: { $in: ['ACCEPTED', 'RECOVERED'] },
-            toTimestamp: { $gte: new Date(todayStartMs) }
-          }
-        },
-        { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
-      ]);
-
-      let todayTotalKm = 0;
-      if (empTodayLedgerAgg && empTodayLedgerAgg.length > 0 && typeof empTodayLedgerAgg[0].totalKm === 'number' && empTodayLedgerAgg[0].totalKm > 0) {
-        todayTotalKm = Math.round(empTodayLedgerAgg[0].totalKm * 100) / 100;
-      } else {
-        todayTotalKm = displayDistance;
-      }
+      const empTodayKm = empTodayKmMap.get(String(session.employee._id)) || 0;
+      const todayTotalKm = empTodayKm > 0 ? Math.max(empTodayKm, displayDistance) : displayDistance;
 
       return {
         employeeId: session.employee._id,
@@ -1671,7 +1695,7 @@ exports.getLiveLocations = async (req, res) => {
         lat: latestCoord.lat,
         lng: latestCoord.lng,
         speed: latestCoord.speed || 0,
-        address: latestCoord.address,
+        address: latestCoord.address || session.currentAddress,
         totalDistance: todayTotalKm,
         sessionTotalDistance: displayDistance,
         sessionId: session.sessionId,
@@ -1683,8 +1707,8 @@ exports.getLiveLocations = async (req, res) => {
     const locations = rawLocations.filter(Boolean);
     const responseData = { locations, count: locations.length };
     
-    // Store in cache for 2 seconds for near-instant dashboard distance updates
-    await liveCache.set(cacheKey, responseData, 2);
+    // Store in L1/L2 cache for 6 seconds
+    await liveCache.set(cacheKey, responseData, 6);
 
     res.json({ success: true, ...responseData });
   } catch (err) {

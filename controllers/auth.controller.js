@@ -209,3 +209,101 @@ exports.changePassword = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
+
+// Helper: Find user by email, phone number, or employeeId
+async function findUserByIdentifier(rawInput) {
+  const rawId = String(rawInput || '').trim();
+  if (!rawId) return null;
+
+  if (rawId.includes('@')) {
+    return User.findOne({ email: rawId.toLowerCase() });
+  }
+
+  const digits = rawId.replace(/\D/g, '');
+  const orClauses = [];
+  if (digits.length >= 10) {
+    const last10 = digits.slice(-10);
+    orClauses.push({ phone: { $regex: phoneRegexFromDigits(last10) } });
+    orClauses.push({ phone: last10 });
+    if (!isNaN(Number(last10))) {
+      orClauses.push({ phone: Number(last10) });
+    }
+  }
+  orClauses.push({ phone: rawId });
+  orClauses.push({ employeeId: { $regex: new RegExp(`^${rawId}$`, 'i') } });
+  orClauses.push({ email: rawId.toLowerCase() });
+
+  return User.findOne({ $or: orClauses });
+}
+
+// @desc Step 1 of Forgot Password: Verify registered email or phone number
+exports.verifyResetEmail = async (req, res) => {
+  try {
+    const rawId = req.body?.email || req.body?.identifier || req.body?.phone || '';
+    if (!String(rawId).trim()) {
+      return res.json({ success: false, message: 'Please enter your registered email address or mobile number.' });
+    }
+
+    const user = await findUserByIdentifier(rawId);
+    if (!user) {
+      return res.json({ success: false, message: 'No registered account found with this email or mobile number.' });
+    }
+    if (user.isBlocked) {
+      return res.json({ success: false, message: 'Account is blocked. Please contact your administrator.' });
+    }
+
+    return res.json({
+      success: true,
+      user: {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        role: user.role,
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// @desc Step 2 of Forgot Password: Reset password directly after account verification
+exports.resetPasswordDirect = async (req, res) => {
+  try {
+    const rawId = req.body?.email || req.body?.identifier || req.body?.phone || '';
+    const { newPassword } = req.body || {};
+
+    if (!String(rawId).trim() || !newPassword) {
+      return res.json({ success: false, message: 'Email/phone and new password are required.' });
+    }
+    if (String(newPassword).length < 6) {
+      return res.json({ success: false, message: 'Password must be at least 6 characters long.' });
+    }
+
+    const user = await findUserByIdentifier(rawId);
+    if (!user) {
+      return res.json({ success: false, message: 'Account not found.' });
+    }
+    if (user.isBlocked) {
+      return res.json({ success: false, message: 'Account is blocked. Please contact your administrator.' });
+    }
+
+    user.password = newPassword;
+    await user.save();
+
+    await ActivityLog.create({
+      employee: user._id,
+      action: 'PASSWORD_RESET',
+      description: 'Password reset via self-service verification',
+      ip: req.ip,
+    }).catch(() => {});
+
+    return res.json({
+      success: true,
+      message: 'Password updated successfully! You can now sign in.',
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+

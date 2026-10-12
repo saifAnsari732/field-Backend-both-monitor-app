@@ -98,7 +98,7 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Health check endpoint (placed BEFORE rate limiter so uptime monitors and CI/CD never get blocked)
-app.get('/api/health', (req, res) => res.json({ status: '1 OK AWS Working CI-CD Live Test', timestamp: new Date() }));
+app.get('/api/health', (req, res) => res.json({ status: '2 OK AWS Working CI-CD Live Test', timestamp: new Date() }));
 
 // Rate limitingertbetbfghmfh
 const limiter = rateLimit({
@@ -129,10 +129,17 @@ app.use('/api/tasks', require('./routes/task.routes'));
 app.use('/api/trips', require('./routes/trip.routes'));
 const { protect } = require('./middleware/auth.middleware');
 const { LiveLocation, Meeting } = require('./models');
+const { liveCache } = require('./services/cache.service');
 
-// Dashboard stats route for employee
+// Dashboard stats route for employee & manager (optimized projection + L1/L2 cache)
 app.get('/api/dashboard/stats', protect, async (req, res) => {
   try {
+    const cacheKey = `emp_dashboard_stats_${req.user._id}`;
+    const cached = await liveCache.get(cacheKey);
+    if (cached) {
+      return res.json({ success: true, stats: cached, fromCache: true });
+    }
+
     const todayDateObj = new Date();
     todayDateObj.setHours(0, 0, 0, 0);
     
@@ -141,31 +148,44 @@ app.get('/api/dashboard/stats', protect, async (req, res) => {
     const day = String(todayDateObj.getDate()).padStart(2, '0');
     const dateStr = `${year}-${month}-${day}`;
 
-    // Get all tracking sessions
-    const allSessions = await LiveLocation.find({ employee: req.user._id });
-    const totalDistanceAllDates = allSessions.reduce((acc, s) => acc + (s.totalDistance || 0), 0);
-    
-    // Today's sessions
-    const todaySessions = allSessions.filter(s => s.date === dateStr);
-    const distanceToday = todaySessions.reduce((acc, s) => acc + (s.totalDistance || 0), 0);
+    // Project ONLY totalDistance & date (NEVER download coordinates arrays!) and run in parallel
+    const [allSessions, meetingCount] = await Promise.all([
+      LiveLocation.find(
+        { employee: req.user._id },
+        { totalDistance: 1, officialDistance: 1, date: 1 }
+      ).lean(),
+      Meeting.countDocuments({ 
+        employee: req.user._id, 
+        date: { $gte: todayDateObj } 
+      })
+    ]);
 
-    // Today's meetings
-    const meetingCount = await Meeting.countDocuments({ 
-      employee: req.user._id, 
-      date: { $gte: todayDateObj } 
-    });
+    const totalDistanceAllDates = allSessions.reduce(
+      (acc, s) => acc + (Number(s.totalDistance || s.officialDistance) || 0),
+      0
+    );
+    
+    const todaySessions = allSessions.filter(s => s.date === dateStr);
+    const distanceToday = todaySessions.reduce(
+      (acc, s) => acc + (Number(s.totalDistance || s.officialDistance) || 0),
+      0
+    );
+
+    const statsPayload = {
+      distanceToday: distanceToday.toFixed(2),
+      totalDistanceAllDates: totalDistanceAllDates.toFixed(2),
+      meetingCount,
+      travelRate: req.user.TA || req.user.travelRate || 0,
+      todayAttendance: { status: 'present' },
+      monthlyAttendance: { present: 20, absent: 2, leave: 1 },
+      totalExpenses: 0
+    };
+
+    await liveCache.set(cacheKey, statsPayload, 15);
 
     res.json({
       success: true,
-      stats: {
-        distanceToday: distanceToday.toFixed(2),
-        totalDistanceAllDates: totalDistanceAllDates.toFixed(2),
-        meetingCount,
-        travelRate: req.user.TA || req.user.travelRate || 0,
-        todayAttendance: { status: 'present' },
-        monthlyAttendance: { present: 20, absent: 2, leave: 1 },
-        totalExpenses: 0
-      }
+      stats: statsPayload
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
