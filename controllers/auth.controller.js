@@ -47,10 +47,20 @@ exports.login = async (req, res) => {
         .populate('manager', 'name email').populate('organizationId');
     } else {
       const digits = rawId.replace(/\D/g, '');
-      if (digits.length < 10)
-        return res.status(401).json({ success: false, message: 'Invalid credentials' });
-      const last10 = digits.slice(-10);
-      candidates = await User.find({ phone: { $regex: phoneRegexFromDigits(last10) } })
+      const orClauses = [];
+      if (digits.length >= 10) {
+        const last10 = digits.slice(-10);
+        orClauses.push({ phone: { $regex: phoneRegexFromDigits(last10) } });
+        orClauses.push({ phone: last10 });
+        if (!isNaN(Number(last10))) {
+          orClauses.push({ phone: Number(last10) });
+        }
+      }
+      orClauses.push({ phone: rawId });
+      orClauses.push({ employeeId: { $regex: new RegExp(`^${rawId.trim()}$`, 'i') } });
+      orClauses.push({ email: rawId.toLowerCase() });
+
+      candidates = await User.find({ $or: orClauses })
         .populate('manager', 'name email').populate('organizationId');
     }
 
