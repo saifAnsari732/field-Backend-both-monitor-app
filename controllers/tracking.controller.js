@@ -345,16 +345,18 @@ exports.updateLocation = async (req, res) => {
       await saveSessionState(sessionId, sessionState);
     }
 
-    // Safety Fallback: Ensure memory anchor is not older than the most recent committed DistanceLedger segment
+    // Safety Fallback: Ensure memory anchor always matches the exact coordinate of the most recent committed DistanceLedger segment
     const latestLedger = await DistanceLedger.findOne({ sessionId }).sort({ toTimestamp: -1 }).select('toTimestamp toLat toLng toEventId').lean();
     if (latestLedger && latestLedger.toTimestamp) {
       const ledgerTs = new Date(latestLedger.toTimestamp).getTime();
       const currentTs = sessionState.lastTs ? new Date(sessionState.lastTs).getTime() : 0;
-      if (ledgerTs > currentTs) {
-        sessionState.lastTs = new Date(latestLedger.toTimestamp).toISOString();
+      if (Number.isFinite(latestLedger.toLat) && Number.isFinite(latestLedger.toLng)) {
         sessionState.lastLat = latestLedger.toLat;
         sessionState.lastLng = latestLedger.toLng;
         sessionState.lastEventId = latestLedger.toEventId;
+      }
+      if (ledgerTs > currentTs) {
+        sessionState.lastTs = new Date(latestLedger.toTimestamp).toISOString();
       }
     }
 
@@ -446,7 +448,14 @@ exports.updateLocation = async (req, res) => {
     let batchWorstAccuracy = 0;
 
     let prev2Valid = null;
-    let prevValid = { lat: lastValidLat, lng: lastValidLng, timestamp: new Date(prevTimestamp || Date.now()).toISOString(), heading: null };
+    let prevValid = {
+      lat: lastValidLat,
+      lng: lastValidLng,
+      latRaw: lastValidLat,
+      lngRaw: lastValidLng,
+      timestamp: new Date(prevTimestamp || Date.now()).toISOString(),
+      heading: null
+    };
 
     // Forward Geodetic Bayesian Kinematic Filtering Pass (AGTRIE-X 7.0)
     for (let i = 0; i < nonDuplicateCoordinates.length; i++) {
@@ -596,13 +605,13 @@ exports.updateLocation = async (req, res) => {
         filterPLng = (1 - kLng) * predPLng;
       }
 
-      // 5. Raw Segment Distance & Kinematic Calculations
-      const dRawKm = prevValid
-        ? haversineDistance(
-            { lat: prevValid.latRaw ?? prevValid.lat, lng: prevValid.lngRaw ?? prevValid.lng },
-            { lat, lng }
-          )
-        : 0;
+      // 5. Raw Segment Distance & Kinematic Calculations (strictly from last committed anchor)
+      const anchorLat = prevValid?.latRaw ?? lastValidLat;
+      const anchorLng = prevValid?.lngRaw ?? lastValidLng;
+      const dRawKm = haversineDistance(
+        { lat: anchorLat, lng: anchorLng },
+        { lat, lng }
+      );
       const distM = dRawKm * 1000;
 
       const toKmh = (s) => (Number(s) > 0 ? (Number(s) <= 60 ? Number(s) * 3.6 : Number(s)) : 0);
@@ -616,18 +625,17 @@ exports.updateLocation = async (req, res) => {
 
       // 6. High-Fidelity Movement vs Stationary Centroid Geofence Gate (AGTRIE-X v10.0)
       const distFromCentroidM = haversineDistance({ lat: centroidLat, lng: centroidLng }, { lat, lng }) * 1000;
-      const isPoorAccuracy = accuracy > 180;
+      const isCoarseJump = accuracy > 100;
       const centroidGeofenceRadiusM = Math.max(30.0, Math.min(50.0, accuracy * 1.0));
 
       // A point is stationary drift if:
-      // 1. It is within the stationary centroid bubble (< 35-65m) AND speed is below brisk outdoor travel (< 6.0 km/h)
+      // 1. It is within the stationary centroid bubble (< 30-50m) AND speed is below brisk outdoor travel (< 6.0 km/h)
       // 2. OR step distance from previous fix is micro (< 8.0m)
-      // 3. OR poor accuracy with sub-travel speed (< 5.0 km/h)
-      // 4. OR step distance < 25m and effective speed < 3.5 km/h
+      // 3. OR step distance < 25m and effective speed < 3.5 km/h
       const isInsideCentroidGeofence = distFromCentroidM < centroidGeofenceRadiusM && effectiveSpeedKmh < 6.0;
       const isMicroStep = distM < 8.0;
-      const isStationaryDrift = isInsideCentroidGeofence || isMicroStep || (isPoorAccuracy && effectiveSpeedKmh < 5.0) || (distM < 25.0 && effectiveSpeedKmh < 3.5);
-      const isTeleportation = effectiveSpeedKmh > 180.0;
+      const isStationaryDrift = !isCoarseJump && (isInsideCentroidGeofence || isMicroStep || (distM < 25.0 && effectiveSpeedKmh < 3.5));
+      const isTeleportation = effectiveSpeedKmh > 180.0 || isCoarseJump;
       const isMathematicallyValidMovement = !isStationaryDrift && !isTeleportation && dRawKm > 0;
 
       if (isMathematicallyValidMovement) {
@@ -645,8 +653,8 @@ exports.updateLocation = async (req, res) => {
           toEventId: eventId,
           fromTimestamp: new Date(lastTrustedMs),
           toTimestamp: timestamp,
-          fromLat: prevValid?.latRaw ?? lastValidLat,
-          fromLng: prevValid?.lngRaw ?? lastValidLng,
+          fromLat: anchorLat,
+          fromLng: anchorLng,
           toLat: lat,
           toLng: lng,
           distanceMeters: Math.round(dRawKm * 1000),
@@ -659,30 +667,49 @@ exports.updateLocation = async (req, res) => {
         centroidLat = lat;
         centroidLng = lng;
         prev2Valid = prevValid;
-        prevValid = { lat: filterLat, lng: filterLng, latRaw: lat, lngRaw: lng, accuracy, speedKmh: reportedSpeedKmh, timestamp: timestamp.toISOString(), heading: coord.heading };
-        lastValidLat = filterLat;
-        lastValidLng = filterLng;
+        // CRITICAL FIX: Keep lastValidLat/lastValidLng & prevValid.latRaw/lngRaw identical to the committed toLat/toLng
+        // so subsequent HTTP batches never re-measure the Kalman filter lag!
+        lastValidLat = lat;
+        lastValidLng = lng;
         lastEventId = eventId;
+        prevValid = {
+          lat: filterLat,
+          lng: filterLng,
+          latRaw: lat,
+          lngRaw: lng,
+          accuracy,
+          speedKmh: reportedSpeedKmh,
+          timestamp: timestamp.toISOString(),
+          heading: coord.heading
+        };
       } else if (isStationaryDrift) {
-        // Softly converge centroid via exponential moving average to track slight true shift without jumping anchor
+        // Softly converge centroid via exponential moving average, but DO NOT move the committed distance anchor (lastValidLat/lastValidLng)
         centroidLat = centroidLat * 0.98 + lat * 0.02;
         centroidLng = centroidLng * 0.98 + lng * 0.02;
-        filterLat = centroidLat;
-        filterLng = centroidLng;
-        lastValidLat = filterLat;
-        lastValidLng = filterLng;
-        lastEventId = eventId;
+        filterLat = snap.lat;
+        filterLng = snap.lng;
+        filterPLat = snap.pLat;
+        filterPLng = snap.pLng;
         prevTimestamp = tMs;
+        prevValid = {
+          ...prevValid,
+          latRaw: anchorLat,
+          lngRaw: anchorLng,
+          timestamp: timestamp.toISOString()
+        };
         acceptedEventIds.push(eventId);
       } else {
-        // GPS outlier / teleportation > 180 km/h: REJECT without contaminating trusted anchor
-        lastValidLat = filterLat;
-        lastValidLng = filterLng;
+        // GPS outlier / teleportation > 180 km/h or coarse accuracy > 100m:
+        // Restore Kalman snapshot completely so the outlier NEVER contaminates the anchor!
+        filterLat = snap.lat;
+        filterLng = snap.lng;
+        filterPLat = snap.pLat;
+        filterPLng = snap.pLng;
         rejectedPoints++;
         rejectedEventIds.push(eventId);
         rejectionReasons.push({
           timestamp,
-          reason: 'TELEPORTATION_OR_STEP_LIMIT_EXCEEDED',
+          reason: isCoarseJump ? 'LOW_ACCURACY_COARSE_JUMP' : 'TELEPORTATION_OR_STEP_LIMIT_EXCEEDED',
           lat, lng, accuracy, speed: effectiveSpeedKmh
         });
       }
@@ -1407,6 +1434,7 @@ const recalculateSessionFromPoints = async (sessionId, sessionDate, sessionDocId
       const lng = Number(pt.lng);
       if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < 6 || lat > 38 || lng < 68 || lng > 98) continue;
       if (pt.mocked === true || pt.isMock === true) continue;
+      const accuracy = Number(pt.accuracy) || 25;
 
       if (prevPoint) {
         const dRawKm = haversineDistance(
@@ -1416,11 +1444,17 @@ const recalculateSessionFromPoints = async (sessionId, sessionDate, sessionDocId
 
         const ts1 = new Date(prevPoint.timestamp).getTime();
         const ts2 = new Date(pt.timestamp).getTime();
+        if (ts2 <= ts1) continue;
         const dt = Math.max((ts2 - ts1) / 1000, 0.5);
 
         // Gap Re-Anchoring Policy: Time gaps > 30 minutes indicate offline/rest period. Re-anchor.
         if (dt > 1800) {
           prevPoint = pt;
+          continue;
+        }
+
+        // Reject coarse low-accuracy jumps (> 100m) without moving prevPoint anchor
+        if (accuracy > 100) {
           continue;
         }
 
@@ -1431,20 +1465,19 @@ const recalculateSessionFromPoints = async (sessionId, sessionDate, sessionDocId
           : 0;
         const effectiveSpeed = Math.max(stepSpeed, reportedSpeedKmh);
 
-        // 1. Infeasible teleport (> 160 km/h) -> skip distance, advance anchor
-        if (stepSpeed > 160 && dRawKm > 0.05) {
-          prevPoint = pt;
+        // 1. Infeasible teleport (> 160 km/h) -> skip distance and DO NOT move anchor to outlier
+        if (stepSpeed > 160) {
           continue;
         }
 
-        // 2. Stationary jitter gate: low speed & displacement < 40m -> skip distance, advance anchor
-        if (effectiveSpeed < 2.0 && distM < 40.0) {
-          prevPoint = pt;
+        // 2. Stationary jitter gate: low speed & displacement < 35m or micro-step < 8m -> keep anchor coordinates, update timestamp
+        if (distM < 8.0 || (effectiveSpeed < 3.5 && distM < 35.0)) {
+          prevPoint = { ...prevPoint, timestamp: pt.timestamp };
           continue;
         }
 
         // 3. Genuine movement step
-        if (distM >= 3.0 && stepSpeed <= 160) {
+        if (distM >= 8.0 && stepSpeed <= 160) {
           totalDistKm += dRawKm;
           ledgerSegments.push({
             organizationId: session.organizationId,
@@ -1465,10 +1498,8 @@ const recalculateSessionFromPoints = async (sessionId, sessionDate, sessionDocId
             algorithmVersion: 'AGTRIE-X-v10.0-CLEAN'
           });
           prevPoint = pt;
-        } else {
-          prevPoint = pt;
         }
-      } else {
+      } else if (accuracy <= 120) {
         prevPoint = pt;
       }
     }
