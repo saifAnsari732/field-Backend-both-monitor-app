@@ -988,57 +988,13 @@ exports.updateLocation = async (req, res) => {
 
     // Derive authoritative session total directly from immutable DistanceLedger (ACCEPTED + RECOVERED segments)
     const ledgerAgg = await DistanceLedger.aggregate([
-      { $match: { sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
+      { $match: { sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] }, reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' } } },
       { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
     ]);
     let ledgerKm = Math.round((ledgerAgg[0]?.totalKm || 0) * 100) / 100;
-    const prevDist = Math.max(Number(sessionState.totalDistance) || 0, Number(activeDoc?.totalDistance) || 0);
 
-    // ─── AUTHORITATIVE SCREEN-TO-SERVER TELEMETRY DISTANCE RECONCILIATION ─────
-    // When the employee's Live Tracking screen (TrackingScreen.js) has verified movement
-    // (e.g. 0.14 km on screen) that exceeds the server's current ledger total within a realistic step bound (<= 2.5 km),
-    // commit the delta into DistanceLedger so phone screen KM and server KM never diverge!
-    const maxScreenDistKm = Math.max(
-      0,
-      Number(req.body?.screenDistanceKm) || 0,
-      ...nonDuplicateCoordinates.map((c) => Number(c?.screenDistanceKm) || 0)
-    );
-    const baseAuthoritativeKm = Math.max(prevDist, ledgerKm);
-    const isConfirmedMovingSession = batchMaxSpeed >= 2.5 || (Number(sessionState.lastSpeed) || 0) >= 2.5;
-    if (isConfirmedMovingSession && maxScreenDistKm > baseAuthoritativeKm + 0.008 && (maxScreenDistKm - baseAuthoritativeKm) <= 2.5) {
-      const screenDeltaKm = Math.round((maxScreenDistKm - baseAuthoritativeKm) * 1000) / 1000;
-      const lastCoordInBatch = nonDuplicateCoordinates[nonDuplicateCoordinates.length - 1] || {};
-      const syncToLat = Number(lastCoordInBatch.lat) || lastValidLat;
-      const syncToLng = Number(lastCoordInBatch.lng) || lastValidLng;
-      const syncEventId = `${sessionId}:screensync:${Date.now()}`;
-      await DistanceLedger.create({
-        organizationId: orgId,
-        employee: req.user._id,
-        sessionId,
-        fromEventId: lastEventId || `${sessionId}:screen_prev`,
-        toEventId: syncEventId,
-        fromTimestamp: new Date(prevTimestamp || Date.now() - 5000),
-        toTimestamp: new Date(),
-        fromLat: lastValidLat || syncToLat,
-        fromLng: lastValidLng || syncToLng,
-        toLat: syncToLat,
-        toLng: syncToLng,
-        distanceMeters: Math.round(screenDeltaKm * 1000),
-        distanceKm: screenDeltaKm,
-        classification: 'ACCEPTED',
-        reason: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC',
-        algorithmVersion: 'AGTRIE-X-v12.0-PRO'
-      }).catch(() => {});
-      ledgerKm = Math.round((ledgerKm + screenDeltaKm) * 100) / 100;
-      lastValidLat = syncToLat;
-      lastValidLng = syncToLng;
-      centroidLat = syncToLat;
-      centroidLng = syncToLng;
-      lastEventId = syncEventId;
-    }
-
-    // Monotonic non-decreasing guarantee: distance can NEVER drop to 0 if travel has occurred
-    currentTotalDistance = Math.round(Math.max(prevDist, ledgerKm, maxScreenDistKm <= baseAuthoritativeKm + 2.5 ? maxScreenDistKm : 0) * 100) / 100;
+    // Strict Pure GPS Authority: Distance is derived solely from verified geodesic GPS segments
+    currentTotalDistance = ledgerKm;
 
     // Bulk update TrackingPoint statuses
     if (acceptedEventIds.length > 0) {
@@ -1672,18 +1628,16 @@ exports.getTodaySessions = async (req, res) => {
       }
 
       const ledgerAgg = await DistanceLedger.aggregate([
-        { $match: { sessionId: s.sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
+        { $match: { sessionId: s.sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] }, reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' } } },
         { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
       ]);
       let sessionDist = 0;
-      if (ledgerAgg && ledgerAgg.length > 0 && typeof ledgerAgg[0].totalKm === 'number' && ledgerAgg[0].totalKm > 0) {
+      if (ledgerAgg && ledgerAgg.length > 0 && typeof ledgerAgg[0].totalKm === 'number') {
         sessionDist = Math.round(ledgerAgg[0].totalKm * 100) / 100;
-      } else {
-        sessionDist = Math.round((Number(s.totalDistance) || 0) * 100) / 100;
       }
-      s.totalDistance = Math.max(sessionDist, Math.round((Number(s.totalDistance) || 0) * 100) / 100);
-      s.officialDistance = s.totalDistance;
-      totalDistanceToday += s.totalDistance;
+      s.totalDistance = sessionDist;
+      s.officialDistance = sessionDist;
+      totalDistanceToday += sessionDist;
       return s;
     }));
     totalDistanceToday = Math.round(totalDistanceToday * 100) / 100;
@@ -2194,7 +2148,7 @@ exports.getLiveLocations = async (req, res) => {
 
     const [sessionLedgerAggs, empTodayLedgerAggs] = await Promise.all([
       DistanceLedger.aggregate([
-        { $match: { sessionId: { $in: sessionIds }, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
+        { $match: { sessionId: { $in: sessionIds }, classification: { $in: ['ACCEPTED', 'RECOVERED'] }, reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' } } },
         { $group: { _id: '$sessionId', totalKm: { $sum: '$distanceKm' } } }
       ]),
       DistanceLedger.aggregate([
@@ -2202,6 +2156,7 @@ exports.getLiveLocations = async (req, res) => {
           $match: {
             employee: { $in: activeEmpIds },
             classification: { $in: ['ACCEPTED', 'RECOVERED'] },
+            reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' },
             toTimestamp: { $gte: new Date(todayStartMs) }
           }
         },
@@ -2388,8 +2343,8 @@ exports.reconcileSession = async (req, res) => {
     const sessionId = req.params.id || req.body.sessionId;
     if (!sessionId) return res.status(400).json({ success: false, message: 'sessionId required' });
 
-    // Aggregate from DistanceLedger
-    const segments = await DistanceLedger.find({ sessionId }).lean();
+    // Aggregate from DistanceLedger (excluding fake screen sync)
+    const segments = await DistanceLedger.find({ sessionId, reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' } }).lean();
     
     let acceptedKm = 0;
     let recoveredKm = 0;
