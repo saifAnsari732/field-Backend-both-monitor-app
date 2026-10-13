@@ -727,10 +727,12 @@ exports.updateLocation = async (req, res) => {
 
       const toKmh = (s) => (Number(s) > 0 ? (Number(s) <= 60 ? Number(s) * 3.6 : Number(s)) : 0);
       const reportedSpeedKmh = toKmh(coord.speed);
-      const rawCalcSpeedKmh = dt > 0 ? (dRawKm / dt) * 3600 : 0;
+      const isClientStationary = coord.motionState === 'STATIONARY' || coord.screenMoving === false;
+      // Do NOT calculate artificial speed from dividing small sub-25m indoor noise by small seconds!
+      const rawCalcSpeedKmh = (dt > 0 && (distM >= 25.0 || reportedSpeedKmh >= 2.0)) ? (dRawKm / dt) * 3600 : 0;
       const prevWasMoving = (Number(prevValid?.speedKmh) || 0) >= 3.0;
       const stepWindowSecs = Math.min(dt, Math.max(stepDt, 4.0), 20.0);
-      const stepCalcSpeedKmh = (!prevWasMoving && distM >= 12.0 && stepWindowSecs > 0)
+      const stepCalcSpeedKmh = (!prevWasMoving && distM >= 25.0 && stepWindowSecs > 0)
         ? Math.min((dRawKm / stepWindowSecs) * 3600, 65.0)
         : 0;
       const effectiveSpeedKmh = Math.max(reportedSpeedKmh, rawCalcSpeedKmh, stepCalcSpeedKmh);
@@ -776,15 +778,17 @@ exports.updateLocation = async (req, res) => {
         }
       }
 
-      // CRITICAL FIX:
-      // - When STATIONARY (!prevWasMoving), apply the 6-40m centroid geofence bubble + 2-point spike guard.
-      // - When ALREADY MOVING (prevWasMoving === true), never block active road movement with the stationary bubble!
-      // - When prevWasMoving === true and a traffic/corner pause (< 180s / 3 min) has distM < 8.0m, hold the anchor AND preserve
-      //   prevWasMoving (speedKmh) + prevTimestamp so brief stops NEVER reset movement to STATIONARY or break the route!
-      const isInsideCentroidGeofence = !prevWasMoving && !hasDopplerTravel && distFromCentroidM < centroidGeofenceRadiusM && effectiveSpeedKmh < 3.6;
+      // 🛑 STRICT STATIONARY SPOT LOCK:
+      // While employee is at a spot (distFromCentroidM < 35m or |latDiff| < 0.000300) and Doppler speed is < 2.5 km/h,
+      // distance addition is 100% BLOCKED. Zero fake KM accumulation while sitting/standing still!
+      const latDiffCentroid = Math.abs(lat - centroidLat);
+      const lngDiffCentroid = Math.abs(lng - centroidLng);
+      const is3DigitJitterAtSpot = distFromCentroidM < 35.0 || (latDiffCentroid < 0.000300 && lngDiffCentroid < 0.000300);
+      const isStationaryAtSpot = is3DigitJitterAtSpot && (reportedSpeedKmh < 2.5 || isClientStationary);
+      const isInsideCentroidGeofence = isStationaryAtSpot || (!prevWasMoving && !hasDopplerTravel && distFromCentroidM < centroidGeofenceRadiusM && effectiveSpeedKmh < 3.6);
       const isMicroStep = distM < (coord.screenMoving ? 2.5 : 5.0);
       const isSlowStopStep = prevWasMoving ? (distM < 5.0 && effectiveSpeedKmh < 1.4) : (distM < 8.0 && effectiveSpeedKmh < 1.4 && !hasDopplerTravel);
-      const isStationaryDrift = !isCoarseJump && (isInsideCentroidGeofence || isUnconfirmedSingleSpike || isMicroStep || isSlowStopStep);
+      const isStationaryDrift = isStationaryAtSpot || (!isCoarseJump && (isInsideCentroidGeofence || isUnconfirmedSingleSpike || isMicroStep || isSlowStopStep));
       const isTeleportation = effectiveSpeedKmh > 180.0 || isCoarseJump;
       const isMathematicallyValidMovement = !isStationaryDrift && !isTeleportation && dRawKm > 0;
 
@@ -827,13 +831,13 @@ exports.updateLocation = async (req, res) => {
           latRaw: lat,
           lngRaw: lng,
           accuracy,
-          speedKmh: Math.max(reportedSpeedKmh, rawCalcSpeedKmh, 4.0),
+          speedKmh: Math.max(reportedSpeedKmh, (distM >= 25 ? rawCalcSpeedKmh : 0)),
           candidateDistM: 0,
           timestamp: timestamp.toISOString(),
           heading: coord.heading
         };
       } else if (isStationaryDrift) {
-        if (prevWasMoving && dt < 180) {
+        if (prevWasMoving && dt < 180 && !isStationaryAtSpot) {
           // Brief traffic stop or sub-8m tick while actively moving (< 180s / 3 min since last accepted coordinate):
           // Hold lastValidLat/Lng, lastTrustedMs, and prevValid.speedKmh intact so the next road step accumulates with ZERO route break!
           acceptedEventIds.push(eventId);
@@ -1000,7 +1004,8 @@ exports.updateLocation = async (req, res) => {
       ...nonDuplicateCoordinates.map((c) => Number(c?.screenDistanceKm) || 0)
     );
     const baseAuthoritativeKm = Math.max(prevDist, ledgerKm);
-    if (maxScreenDistKm > baseAuthoritativeKm + 0.008 && (maxScreenDistKm - baseAuthoritativeKm) <= 2.5) {
+    const isConfirmedMovingSession = batchMaxSpeed >= 2.5 || (Number(sessionState.lastSpeed) || 0) >= 2.5;
+    if (isConfirmedMovingSession && maxScreenDistKm > baseAuthoritativeKm + 0.008 && (maxScreenDistKm - baseAuthoritativeKm) <= 2.5) {
       const screenDeltaKm = Math.round((maxScreenDistKm - baseAuthoritativeKm) * 1000) / 1000;
       const lastCoordInBatch = nonDuplicateCoordinates[nonDuplicateCoordinates.length - 1] || {};
       const syncToLat = Number(lastCoordInBatch.lat) || lastValidLat;
