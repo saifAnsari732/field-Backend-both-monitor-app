@@ -1,3 +1,4 @@
+const jwt = require('jsonwebtoken');
 const User = require('../models/User.model');
 const { ActivityLog } = require('../models/index');
 const { generateToken } = require('../middleware/auth.middleware');

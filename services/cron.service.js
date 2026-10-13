@@ -7,9 +7,9 @@ const { autoStopInactiveSessions, reconcileAllActiveSessions } = require('../con
  * @param {Object} io - Socket.io instance for emitting real-time events
  */
 const initCronJobs = (io) => {
-  // ─── Continuous Background Autonomous Sentinel Worker ────────────────────
-  // Scans active sessions every 10 minutes to repair any KM discrepancies in MongoDB
-  cron.schedule('*/10 * * * *', async () => {
+  // ─── Continuous Background Autonomous Sentinel Worker (Runs Every 1 Min) ──
+  // Reverses any legacy TRACKING_AUTO_STOPPED closures & reconciles KM discrepancies in MongoDB
+  cron.schedule('* * * * *', async () => {
     try {
       if (typeof reconcileAllActiveSessions === 'function') {
         await reconcileAllActiveSessions();

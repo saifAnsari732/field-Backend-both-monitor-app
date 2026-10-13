@@ -9,8 +9,14 @@ const protect = async (req, res, next) => {
   }
   if (!token) return res.status(401).json({ success: false, message: 'Not authorized' });
 
+  let decoded;
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    decoded = jwt.verify(token, process.env.JWT_SECRET);
+  } catch (err) {
+    return res.status(401).json({ success: false, message: 'Token invalid or expired' });
+  }
+
+  try {
     const cacheKey = `auth_user_${decoded.id}`;
     let user = await liveCache.get(cacheKey);
     if (!user) {
@@ -24,8 +30,8 @@ const protect = async (req, res, next) => {
     if (!req.user) return res.status(401).json({ success: false, message: 'User not found' });
     if (req.user.isBlocked) return res.status(403).json({ success: false, message: 'Account blocked' });
     next();
-  } catch (err) {
-    res.status(401).json({ success: false, message: 'Token invalid or expired' });
+  } catch (dbErr) {
+    return res.status(503).json({ success: false, message: 'Temporary database error, please retry' });
   }
 };
 
