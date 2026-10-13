@@ -1212,11 +1212,12 @@ exports.updateLocation = async (req, res) => {
     await User.findByIdAndUpdate(req.user._id, { isTracking: true, isOnline: true, lastSeen: new Date() }).catch(() => {});
 
     const io = req.app.get('io');
-    io.to('admins').emit('employee_location', {
+    const locationPayload = {
       employeeId: req.user._id,
       name: req.user.name,
       avatar: req.user.avatar,
       department: req.user.department,
+      organizationId: orgId,
       lat: lastValidLat,
       lng: lastValidLng,
       speed: Math.round(finalSpeedKmh),
@@ -1225,7 +1226,11 @@ exports.updateLocation = async (req, res) => {
       sessionDistance: currentTotalDistance,
       sessionId,
       motionState: currentMotionState
-    });
+    };
+    io.to('admins').emit('employee_location', locationPayload);
+    if (orgId) {
+      io.to(`org_admins_${orgId}`).to(`org:${orgId}:admins`).to('superadmins').emit('employee_location', locationPayload);
+    }
 
     // Invalidate live location & dashboard caches so admin/manager UI updates instantly
     if (orgId) {
@@ -2230,11 +2235,12 @@ exports.getLiveLocations = async (req, res) => {
         department: session.employee.department,
         lat: latestCoord.lat,
         lng: latestCoord.lng,
-        speed: latestCoord.speed || 0,
+        speed: (session.motionState === 'STATIONARY') ? 0 : (latestCoord.speed || 0),
         address: latestCoord.address || session.currentAddress,
         totalDistance: todayTotalKm,
         sessionTotalDistance: displayDistance,
         sessionId: session.sessionId,
+        motionState: session.motionState || 'STATIONARY',
         startTime: session.startTime,
         updatedAt: latestCoord.timestamp || session.updatedAt,
       };
