@@ -759,38 +759,32 @@ exports.updateLocation = async (req, res) => {
 
       // 6. High-Fidelity Movement vs Stationary Centroid Geofence Gate (AGTRIE-X v12.0)
       const distFromCentroidM = haversineDistance({ lat: centroidLat, lng: centroidLng }, { lat, lng }) * 1000;
-      const isCoarseJump = accuracy > ((effectiveSpeedKmh >= 3.2 && distM >= 22.0) || coord.screenMoving === true ? 300 : 240);
-      const centroidGeofenceRadiusM = coord.screenMoving === true ? 6.0 : Math.max(25.0, Math.min(40.0, accuracy * 0.85));
-      const hasDopplerTravel = (reportedSpeedKmh >= 3.5 && distFromCentroidM >= 20.0 && accuracy <= 220) ||
-        (effectiveSpeedKmh >= 4.0 && distFromCentroidM >= 30.0 && accuracy <= 260) ||
-        (coord.screenMoving === true && (distFromCentroidM >= 6.0 || effectiveSpeedKmh >= 1.5) && accuracy <= 300);
-
-      // Single-spike indoor multipath guard (ONLY when transitioning out of STATIONARY state):
-      let isUnconfirmedSingleSpike = false;
-      if (!prevWasMoving && !hasDopplerTravel && reportedSpeedKmh < 3.0 && distFromCentroidM < 42.0) {
-        if (coord.screenMoving === true && distFromCentroidM >= 6.0) {
-          isUnconfirmedSingleSpike = false;
-        } else if (prevValid?.candidateDistM && distFromCentroidM >= prevValid.candidateDistM + 7 && distFromCentroidM >= 25.0) {
-          // Second consecutive point progressed at least 7m further from first candidate -> confirmed departure!
-          isUnconfirmedSingleSpike = false;
-        } else {
-          isUnconfirmedSingleSpike = true;
-        }
-      }
-
-      // 🛑 STRICT STATIONARY SPOT LOCK:
-      // While employee is at a spot (distFromCentroidM < 35m or |latDiff| < 0.000300) and Doppler speed is < 2.5 km/h,
-      // distance addition is 100% BLOCKED. Zero fake KM accumulation while sitting/standing still!
       const latDiffCentroid = Math.abs(lat - centroidLat);
       const lngDiffCentroid = Math.abs(lng - centroidLng);
-      const is3DigitJitterAtSpot = distFromCentroidM < 35.0 || (latDiffCentroid < 0.000300 && lngDiffCentroid < 0.000300);
-      const isStationaryAtSpot = is3DigitJitterAtSpot && (reportedSpeedKmh < 2.5 || isClientStationary);
-      const isInsideCentroidGeofence = isStationaryAtSpot || (!prevWasMoving && !hasDopplerTravel && distFromCentroidM < centroidGeofenceRadiusM && effectiveSpeedKmh < 3.6);
-      const isMicroStep = distM < (coord.screenMoving ? 2.5 : 5.0);
-      const isSlowStopStep = prevWasMoving ? (distM < 5.0 && effectiveSpeedKmh < 1.4) : (distM < 8.0 && effectiveSpeedKmh < 1.4 && !hasDopplerTravel);
-      const isStationaryDrift = isStationaryAtSpot || (!isCoarseJump && (isInsideCentroidGeofence || isUnconfirmedSingleSpike || isMicroStep || isSlowStopStep));
+      const isCoarseJump = accuracy > (coord.screenMoving === true ? 300 : 240);
+
+      // 🛑 STRICT 85M STATIONARY SPOT & PING-PONG JITTER LOCK:
+      // Phone cell tower / Wi-Fi jitter jumps 50m-75m between towers while user is stationary.
+      // Any point within 85m (or |latDelta| < 0.000750 && |lngDelta| < 0.000850) or flagged stationary
+      // is 100% BLOCKED from distance accumulation! Strictly zero fake KM!
+      const isAtStationarySpot = distFromCentroidM < 85.0 || (latDiffCentroid < 0.000750 && lngDiffCentroid < 0.000850) || isClientStationary;
+
+      const hasGenuineRoadTravel = !isAtStationarySpot &&
+        distFromCentroidM >= 85.0 &&
+        (reportedSpeedKmh >= 2.8 || effectiveSpeedKmh >= 3.5 || coord.screenMoving === true) &&
+        accuracy <= 260;
+
+      const isMicroStep = distM < 6.0;
+      const isStationaryDrift = isAtStationarySpot || !hasGenuineRoadTravel || isMicroStep;
       const isTeleportation = effectiveSpeedKmh > 180.0 || isCoarseJump;
       const isMathematicallyValidMovement = !isStationaryDrift && !isTeleportation && dRawKm > 0;
+
+      if (!isMathematicallyValidMovement) {
+        // Soft EMA anchor convergence without chasing noisy cell tower jumps:
+        centroidLat = 0.98 * centroidLat + 0.02 * lat;
+        centroidLng = 0.98 * centroidLng + 0.02 * lng;
+        lastValidTimestamp = Math.max(lastValidTimestamp, tMs);
+      }
 
       if (isMathematicallyValidMovement) {
         acceptedPoints++;
