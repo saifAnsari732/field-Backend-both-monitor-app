@@ -1884,8 +1884,6 @@ exports.getLiveEmployees = async (req, res) => {
       loc.officialDistance = finalKm;
     }
 
-    const activeEmpIdSet = new Set(activeLocations.map(l => String(l.employee?._id || l.employee)));
-
     // Auto-reconcile desynced User.isTracking flags
     const employees = [];
     scopedUsers.forEach(u => {
@@ -1899,7 +1897,7 @@ exports.getLiveEmployees = async (req, res) => {
       }
     });
 
-    res.json({ success: true, employees, locations: activeLocations });
+    res.json({ success: true, employees, locations });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
