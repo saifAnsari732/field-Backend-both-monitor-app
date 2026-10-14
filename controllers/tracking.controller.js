@@ -369,27 +369,25 @@ exports.updateLocation = async (req, res) => {
       // If employee already has a newer active session today (e.g. re-punched in), transparently switch to it!
       const newerActiveDoc = await LiveLocation.findOne(
         { employee: req.user._id, isActive: true, date: today, _id: { $ne: activeDoc._id } },
-        { sessionId: 1, isActive: 1, autoClosed: 1, date: 1, endTime: 1, lastActivity: 1, totalDistance: 1, manualDistanceAdded: 1, coordinates: { $slice: -1 } }
+        { sessionId: 1, isActive: 1, autoClosed: 1, manuallyStopped: 1, date: 1, endTime: 1, lastActivity: 1, totalDistance: 1, manualDistanceAdded: 1, coordinates: { $slice: -1 } }
       ).sort({ createdAt: -1 });
 
       if (newerActiveDoc) {
         activeDoc = newerActiveDoc;
         sessionId = newerActiveDoc.sessionId;
       } else {
-        const msSinceEnd = activeDoc.endTime ? (Date.now() - new Date(activeDoc.endTime).getTime()) : 999999;
-        const wasExplicitManualStop = !activeDoc.autoClosed && msSinceEnd < 20000 &&
-          await ActivityLog.exists({ action: 'TRACKING_STOP', 'metadata.sessionId': sessionId });
+        const isManuallyStopped = activeDoc.manuallyStopped || !activeDoc.autoClosed || Boolean(activeDoc.endTime);
 
-        if (wasExplicitManualStop) {
+        if (isManuallyStopped) {
           const lastLog = closedSessionLogThrottle.get(sessionId) || 0;
           if (Date.now() - lastLog > 60000) {
             closedSessionLogThrottle.set(sessionId, Date.now());
-            console.log(`🛑 [SESSION_CLOSED] Received trailing GPS telemetry within 20s of manual Punch Out for ${sessionId}.`);
+            console.log(`🛑 [SESSION_CLOSED] Received trailing GPS telemetry for manually ended session ${sessionId}. Discarding.`);
           }
           if (releaseSessionLock) await releaseSessionLock().catch(() => {});
           return res.json({ 
             success: true, 
-            message: 'Session already ended by employee.', 
+            message: 'Session already ended by user.', 
             sessionClosed: true, 
             totalDistance: activeDoc.totalDistance || 0 
           });
@@ -501,6 +499,7 @@ exports.updateLocation = async (req, res) => {
     let lastValidLng = filterLng;
     let lastEventId = sessionState.lastEventId || null;
     let relockCandidate = sessionState.relockCandidate || null;
+    let currentMotionState = sessionState.motionState || activeDoc?.motionState || 'STATIONARY';
 
     const validCoords = [];
     const rejectionReasons = [];
@@ -757,109 +756,157 @@ exports.updateLocation = async (req, res) => {
         continue;
       }
 
-      // 6. High-Fidelity Movement vs Stationary Centroid Geofence Gate (AGTRIE-X v12.0)
-      const distFromCentroidM = haversineDistance({ lat: centroidLat, lng: centroidLng }, { lat, lng }) * 1000;
-      const latDiffCentroid = Math.abs(lat - centroidLat);
-      const lngDiffCentroid = Math.abs(lng - centroidLng);
+      // 6. Dual-State Geodesic Movement Engine (AGTRIE-X v14.0 PRO)
+      // State 1: STATIONARY (Sitting at desk / home / client meeting) -> Strict 45m Spot Geofence Lock + 0 Fake KM
+      // State 2: MOVING (Travelling on road) -> Continuous Step Geodesics (>= 5.0m) + Traffic Light Hold (90s)
+      const distFromStationaryAnchorM = haversineDistance({ lat: centroidLat, lng: centroidLng }, { lat, lng }) * 1000;
       const isCoarseJump = accuracy > (coord.screenMoving === true ? 300 : 240);
-
-      // 🛑 STRICT 85M STATIONARY SPOT & PING-PONG JITTER LOCK:
-      // Phone cell tower / Wi-Fi jitter jumps 50m-75m between towers while user is stationary.
-      // Any point within 85m (or |latDelta| < 0.000750 && |lngDelta| < 0.000850) or flagged stationary
-      // is 100% BLOCKED from distance accumulation! Strictly zero fake KM!
-      const isAtStationarySpot = distFromCentroidM < 85.0 || (latDiffCentroid < 0.000750 && lngDiffCentroid < 0.000850) || isClientStationary;
-
-      const hasGenuineRoadTravel = !isAtStationarySpot &&
-        distFromCentroidM >= 85.0 &&
-        (reportedSpeedKmh >= 2.8 || effectiveSpeedKmh >= 3.5 || coord.screenMoving === true) &&
-        accuracy <= 260;
-
-      const isMicroStep = distM < 6.0;
-      const isStationaryDrift = isAtStationarySpot || !hasGenuineRoadTravel || isMicroStep;
       const isTeleportation = effectiveSpeedKmh > 180.0 || isCoarseJump;
-      const isMathematicallyValidMovement = !isStationaryDrift && !isTeleportation && dRawKm > 0;
 
-      if (!isMathematicallyValidMovement) {
-        // Soft EMA anchor convergence without chasing noisy cell tower jumps:
-        centroidLat = 0.98 * centroidLat + 0.02 * lat;
-        centroidLng = 0.98 * centroidLng + 0.02 * lng;
-        lastValidTimestamp = Math.max(lastValidTimestamp, tMs);
-      }
+      if (currentMotionState === 'STATIONARY') {
+        // In STATIONARY state: Protect against indoor Wi-Fi/cell jitter (0.000 KM added)
+        // Breakout requires: displacement > 45m AND genuine hardware speed (>= 3.0 km/h) AND valid accuracy
+        const hasBreakoutTravel = distFromStationaryAnchorM > 45.0 &&
+          (reportedSpeedKmh >= 3.0 || effectiveSpeedKmh >= 3.5 || coord.screenMoving === true) &&
+          accuracy <= 260;
 
-      if (isMathematicallyValidMovement) {
-        acceptedPoints++;
-        acceptedEventIds.push(eventId);
-        prevTimestamp = tMs;
-        relockCandidate = null;
-
-        // Record into immutable DistanceLedger with guaranteed non-null fromEventId
-        const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
-        ledgerSegments.push({
-          organizationId: orgId,
-          employee: req.user._id,
-          sessionId,
-          fromEventId: safeFromEventId,
-          toEventId: eventId,
-          fromTimestamp: new Date(lastTrustedMs),
-          toTimestamp: timestamp,
-          fromLat: anchorLat,
-          fromLng: anchorLng,
-          toLat: lat,
-          toLng: lng,
-          distanceMeters: Math.round(dRawKm * 1000),
-          distanceKm: Math.round(dRawKm * 1000) / 1000,
-          classification: 'ACCEPTED',
-          reason: 'AGTRIE_X_V12_CENTROID_GEODESIC_ACCEPTED',
-          algorithmVersion: 'AGTRIE-X-v12.0-PRO'
-        });
-
-        centroidLat = lat;
-        centroidLng = lng;
-        prev2Valid = prevValid;
-        lastValidLat = lat;
-        lastValidLng = lng;
-        lastEventId = eventId;
-        prevValid = {
-          lat: filterLat,
-          lng: filterLng,
-          latRaw: lat,
-          lngRaw: lng,
-          accuracy,
-          speedKmh: Math.max(reportedSpeedKmh, (distM >= 25 ? rawCalcSpeedKmh : 0)),
-          candidateDistM: 0,
-          timestamp: timestamp.toISOString(),
-          heading: coord.heading
-        };
-      } else if (isStationaryDrift) {
-        if (prevWasMoving && dt < 180 && !isStationaryAtSpot) {
-          // Brief traffic stop or sub-8m tick while actively moving (< 180s / 3 min since last accepted coordinate):
-          // Hold lastValidLat/Lng, lastTrustedMs, and prevValid.speedKmh intact so the next road step accumulates with ZERO route break!
+        if (hasBreakoutTravel && !isTeleportation) {
+          // 🚗 DEPARTURE CONFIRMED: Transition from STATIONARY to MOVING!
+          currentMotionState = 'MOVING';
+          acceptedPoints++;
           acceptedEventIds.push(eventId);
+          prevTimestamp = tMs;
+          relockCandidate = null;
+
+          const departureDistKm = distFromStationaryAnchorM / 1000;
+          const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
+
+          if (departureDistKm >= 0.045 && departureDistKm <= 1.5) {
+            ledgerSegments.push({
+              organizationId: orgId,
+              employee: req.user._id,
+              sessionId,
+              fromEventId: safeFromEventId,
+              toEventId: eventId,
+              fromTimestamp: new Date(lastTrustedMs),
+              toTimestamp: timestamp,
+              fromLat: centroidLat,
+              fromLng: centroidLng,
+              toLat: lat,
+              toLng: lng,
+              distanceMeters: Math.round(departureDistKm * 1000),
+              distanceKm: Math.round(departureDistKm * 1000) / 1000,
+              classification: 'ACCEPTED',
+              reason: 'AGTRIE_X_V14_DEPARTURE_BREAKOUT_ACCEPTED',
+              algorithmVersion: 'AGTRIE-X-v14.0-PRO'
+            });
+          }
+
+          centroidLat = lat;
+          centroidLng = lng;
+          prev2Valid = prevValid;
+          lastValidLat = lat;
+          lastValidLng = lng;
+          lastEventId = eventId;
+          prevValid = {
+            lat: filterLat,
+            lng: filterLng,
+            latRaw: lat,
+            lngRaw: lng,
+            accuracy,
+            speedKmh: Math.max(reportedSpeedKmh, effectiveSpeedKmh),
+            candidateDistM: 0,
+            timestamp: timestamp.toISOString(),
+            heading: coord.heading
+          };
         } else {
-          // Softly converge centroid via exponential moving average, but DO NOT move the committed distance anchor
-          centroidLat = centroidLat * 0.98 + lat * 0.02;
-          centroidLng = centroidLng * 0.98 + lng * 0.02;
+          // Still at stationary spot: Softly converge centroid (EMA) to center the noise, strictly 0 KM added
+          centroidLat = 0.98 * centroidLat + 0.02 * lat;
+          centroidLng = 0.98 * centroidLng + 0.02 * lng;
           filterLat = snap.lat;
           filterLng = snap.lng;
           filterPLat = snap.pLat;
           filterPLng = snap.pLng;
           prevTimestamp = tMs;
-          // Preserve the FIRST candidateDistM (>= 16m) instead of overwriting it with larger intermediate values
-          const existingCandM = Number(prevValid?.candidateDistM) || 0;
-          const nextCandM = distFromCentroidM >= 16.0
-            ? (existingCandM > 0 ? Math.min(existingCandM, distFromCentroidM) : distFromCentroidM)
-            : 0;
-          prevValid = {
-            ...prevValid,
-            latRaw: anchorLat,
-            lngRaw: anchorLng,
-            speedKmh: 0,
-            candidateDistM: nextCandM,
-            timestamp: prevValid?.timestamp || timestamp.toISOString()
-          };
+          lastValidTimestamp = Math.max(lastValidTimestamp, tMs);
           acceptedEventIds.push(eventId);
         }
       } else {
+        // CURRENT STATE: MOVING ON ROAD
+        // While moving, consecutive road points are typically 10m-60m apart.
+        // Measure continuous geodesic step from last valid committed coordinate!
+        const stepDistM = distM;
+
+        if (isTeleportation) {
+          // Outlier jump > 180 km/h: discard
+          filterLat = snap.lat;
+          filterLng = snap.lng;
+          filterPLat = snap.pLat;
+          filterPLng = snap.pLng;
+          rejectedPoints++;
+          rejectedEventIds.push(eventId);
+          rejectionReasons.push({
+            timestamp,
+            reason: isCoarseJump ? 'LOW_ACCURACY_COARSE_JUMP' : 'TELEPORTATION_OR_STEP_LIMIT_EXCEEDED',
+            lat, lng, accuracy, speed: effectiveSpeedKmh
+          });
+        } else if (stepDistM < 5.0 || (reportedSpeedKmh < 1.5 && effectiveSpeedKmh < 1.8)) {
+          // Vehicle has slowed down or briefly stopped (Traffic light / turn / speed breaker)
+          if (dt < 90) {
+            // Traffic stop (< 90 seconds): Hold anchor and state intact so route NEVER breaks!
+            acceptedEventIds.push(eventId);
+          } else {
+            // Stopped for >= 90 seconds: Arrived at destination or prolonged stop!
+            currentMotionState = 'STATIONARY';
+            centroidLat = lat;
+            centroidLng = lng;
+            acceptedEventIds.push(eventId);
+          }
+        } else if (stepDistM >= 5.0 && stepDistM <= 2500) {
+          // Valid continuous road step!
+          acceptedPoints++;
+          acceptedEventIds.push(eventId);
+          prevTimestamp = tMs;
+          relockCandidate = null;
+
+          const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
+          ledgerSegments.push({
+            organizationId: orgId,
+            employee: req.user._id,
+            sessionId,
+            fromEventId: safeFromEventId,
+            toEventId: eventId,
+            fromTimestamp: new Date(lastTrustedMs),
+            toTimestamp: timestamp,
+            fromLat: anchorLat,
+            fromLng: anchorLng,
+            toLat: lat,
+            toLng: lng,
+            distanceMeters: Math.round(dRawKm * 1000),
+            distanceKm: Math.round(dRawKm * 1000) / 1000,
+            classification: 'ACCEPTED',
+            reason: 'AGTRIE_X_V14_ROAD_STEP_ACCEPTED',
+            algorithmVersion: 'AGTRIE-X-v14.0-PRO'
+          });
+
+          centroidLat = lat;
+          centroidLng = lng;
+          prev2Valid = prevValid;
+          lastValidLat = lat;
+          lastValidLng = lng;
+          lastEventId = eventId;
+          prevValid = {
+            lat: filterLat,
+            lng: filterLng,
+            latRaw: lat,
+            lngRaw: lng,
+            accuracy,
+            speedKmh: Math.max(reportedSpeedKmh, effectiveSpeedKmh),
+            candidateDistM: 0,
+            timestamp: timestamp.toISOString(),
+            heading: coord.heading
+          };
+        } else {
         // 2-Point Satellite/Network Consensus Relock (supports up to 240m accuracy):
         if (!isCoarseJump && accuracy <= 240 && relockCandidate && tMs > relockCandidate.tMs && (tMs - relockCandidate.tMs) <= 120000) {
           const dRelockKm = haversineDistance({ lat: relockCandidate.lat, lng: relockCandidate.lng }, { lat, lng });
@@ -940,11 +987,12 @@ exports.updateLocation = async (req, res) => {
           lat, lng, accuracy, speed: effectiveSpeedKmh
         });
       }
+    }
 
       // Suppress adding duplicate stationary jitter coordinates to map polyline
       const lastSaved = validCoords[validCoords.length - 1];
       const distFromLastSavedM = lastSaved ? haversineDistance({ lat: lastSaved.lat, lng: lastSaved.lng }, { lat: filterLat, lng: filterLng }) * 1000 : 999;
-      if (!isStationaryDrift || distFromLastSavedM >= 15.0 || validCoords.length === 0) {
+      if (currentMotionState !== 'STATIONARY' || distFromLastSavedM >= 15.0 || validCoords.length === 0) {
         validCoords.push({
           ...coord,
           eventId,
@@ -1005,8 +1053,12 @@ exports.updateLocation = async (req, res) => {
     }
 
     const hasTravelOccurred = ledgerSegments.length > 0 || (Number(prevValid?.speedKmh) || 0) >= 3.0;
-    const finalSpeedKmh = hasTravelOccurred ? Math.max(Math.min(batchMaxSpeed, 220), Number(prevValid?.speedKmh) || 0) : 0;
-    const currentMotionState = hasTravelOccurred ? classifyMotionState(finalSpeedKmh) : 'STATIONARY';
+    const finalSpeedKmh = (hasTravelOccurred || currentMotionState === 'MOVING') ? Math.max(Math.min(batchMaxSpeed, 220), Number(prevValid?.speedKmh) || 0) : 0;
+    if (currentMotionState === 'MOVING' || hasTravelOccurred) {
+      currentMotionState = finalSpeedKmh >= 3.0 ? classifyMotionState(finalSpeedKmh) : 'MOVING';
+    } else {
+      currentMotionState = 'STATIONARY';
+    }
     const runningAvgAccuracy = sumAccuracy / (totalRawPoints || 1);
 
     // Throttle reverse geocoding: only resolve address if movement >= 250m or >= 5 minutes since last geocode
@@ -1030,7 +1082,7 @@ exports.updateLocation = async (req, res) => {
       }
     }
 
-    // Persist Authoritative State to Redis (including lastTickTs, lastSpeed, candidateDistM, and relockCandidate!)
+    // Persist Authoritative State to Redis (including lastTickTs, lastSpeed, candidateDistM, motionState, and relockCandidate!)
     await saveSessionState(sessionId, {
       totalDistance: currentTotalDistance,
       manualDistanceAdded: dbManualAdded,
@@ -1046,6 +1098,7 @@ exports.updateLocation = async (req, res) => {
       pLng: filterPLng,
       lastSpeed: Number(prevValid?.speedKmh) || 0,
       candidateDistM: Number(prevValid?.candidateDistM) || 0,
+      motionState: currentMotionState,
       relockCandidate,
       lastGeocodeTs,
       lastGeocodeLat,
@@ -1181,6 +1234,8 @@ exports.updateLocation = async (req, res) => {
     if (orgId) {
       io.to(`org_admins_${orgId}`).to(`org:${orgId}:admins`).to('superadmins').emit('employee_location', locationPayload);
     }
+    // Also emit to employee's personal room so employee screen updates in real time
+    io.to('user_' + req.user._id).to(String(req.user._id)).emit('employee_location', locationPayload);
 
     // Invalidate live location & dashboard caches so admin/manager UI updates instantly
     if (orgId) {
@@ -1236,6 +1291,7 @@ exports.stopTracking = async (req, res) => {
 
     // Manual stop is authoritative: Always end shift immediately without suppression
     session.autoClosed = false;
+    session.manuallyStopped = true;
 
     // Get final authoritative distance from Redis before clearing
     const cachedState = await getSessionState(effectiveSessionId);
@@ -1265,12 +1321,13 @@ exports.stopTracking = async (req, res) => {
     await session.save();
 
     // Clear Redis session state — shift is over
+    await clearSessionState(effectiveSessionId).catch(() => {});
     await User.findByIdAndUpdate(req.user._id, { isTracking: false });
 
     // Ensure all active sessions for this employee are closed
     await LiveLocation.updateMany(
       { employee: req.user._id, isActive: true },
-      { $set: { isActive: false, endTime: new Date() } }
+      { $set: { isActive: false, autoClosed: false, manuallyStopped: true, endTime: new Date() } }
     );
 
     // Invalidate live location caches so dashboard immediately removes the stopped employee
@@ -1376,18 +1433,16 @@ exports.heartbeat = async (req, res) => {
     if (!existing.isActive) {
       const newerActive = await LiveLocation.findOne(
         { employee: req.user._id, isActive: true, date: today, _id: { $ne: existing._id } },
-        { sessionId: 1, isActive: 1, autoClosed: 1, date: 1, endTime: 1, lastActivity: 1, totalDistance: 1, manualDistanceAdded: 1, coordinates: { $slice: -1 } }
+        { sessionId: 1, isActive: 1, autoClosed: 1, manuallyStopped: 1, date: 1, endTime: 1, lastActivity: 1, totalDistance: 1, manualDistanceAdded: 1, coordinates: { $slice: -1 } }
       ).sort({ createdAt: -1 });
 
       if (newerActive) {
         existing = newerActive;
         sessionId = newerActive.sessionId;
       } else {
-        const msSinceEnd = existing.endTime ? (Date.now() - new Date(existing.endTime).getTime()) : 999999;
-        const wasExplicitManualStop = !existing.autoClosed && msSinceEnd < 20000 &&
-          await ActivityLog.exists({ action: 'TRACKING_STOP', 'metadata.sessionId': sessionId });
+        const isManuallyStopped = existing.manuallyStopped || !existing.autoClosed || Boolean(existing.endTime);
 
-        if (wasExplicitManualStop) {
+        if (isManuallyStopped) {
           return res.json({ success: false, sessionClosed: true, message: 'Session is no longer active.' });
         }
         await LiveLocation.updateOne(

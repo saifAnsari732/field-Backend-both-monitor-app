@@ -47,10 +47,11 @@ const liveLocationSchema = new mongoose.Schema({
   worstAccuracy:       { type: Number, default: 0 },     // Worst single GPS accuracy
   maxSpeed:            { type: Number, default: 0 },     // Maximum recorded speed in km/h
   algorithmVersion:    { type: String, default: 'AGTRIE-X-v10.0-PRO' },
-  motionState:         { type: String, enum: ['STATIONARY', 'WALKING', 'RUNNING', 'BIKE', 'VEHICLE', 'GPS_LOST', 'UNKNOWN'], default: 'STATIONARY' },
+  motionState:         { type: String, enum: ['STATIONARY', 'MOVING', 'WALKING', 'RUNNING', 'BIKE', 'VEHICLE', 'GPS_LOST', 'UNKNOWN'], default: 'STATIONARY' },
   rejectionReasons:    [{ timestamp: Date, reason: String, lat: Number, lng: Number, accuracy: Number, speed: Number }],
   isActive:            { type: Boolean, default: true },
   autoClosed:          { type: Boolean, default: false }, // true = closed by inactivity cron (resumable)
+  manuallyStopped:     { type: Boolean, default: false }, // true = closed by manual punch out (NEVER auto-resumed)
   date:                { type: String },                  // YYYY-MM-DD
   lastActivity:        { type: Date, default: Date.now }, // Updated on GPS update + heartbeat
 }, { timestamps: true });
