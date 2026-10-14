@@ -1789,20 +1789,38 @@ exports.getLiveEmployees = async (req, res) => {
     }
 
     // Active tracking sessions — strictly authoritative on isActive: true
-    const locations = await LiveLocation.find({
+    const activeLocations = await LiveLocation.find({
       isActive: true,
       employee: { $in: empIds }
     }).populate('employee', 'name employeeId avatar department isOnline lastSeen');
 
-    // Enrich active locations with real-time verified today trajectory distance
+    const activeEmpIdSet = new Set(activeLocations.map(l => String(l.employee?._id || l.employee)));
+
+    // Also fetch today's completed/inactive sessions so employees who traveled today don't show 0 KM
     const today = getBusinessDate(new Date(), 'Asia/Kolkata');
     const todayStartMs = new Date(`${today}T00:00:00.000Z`).getTime();
 
-    // Retain all active tracking sessions (Zero Data Loss Policy: shifts are never auto-closed)
-    const activeLocations = locations;
+    const inactiveTodaySessions = await LiveLocation.find({
+      date: today,
+      isActive: false,
+      employee: { $in: empIds }
+    }).sort({ updatedAt: -1 }).populate('employee', 'name employeeId avatar department isOnline lastSeen');
 
-    for (let i = 0; i < activeLocations.length; i++) {
-      const loc = activeLocations[i];
+    const seenEmpIds = new Set();
+    const inactiveToInclude = [];
+    for (const sess of inactiveTodaySessions) {
+      const empIdStr = String(sess.employee?._id || sess.employee);
+      if (!activeEmpIdSet.has(empIdStr) && !seenEmpIds.has(empIdStr)) {
+        seenEmpIds.add(empIdStr);
+        inactiveToInclude.push(sess);
+      }
+    }
+
+    const locations = [...activeLocations, ...inactiveToInclude];
+    const activeLocationsList = locations;
+
+    for (let i = 0; i < activeLocationsList.length; i++) {
+      const loc = activeLocationsList[i];
       let cleanKm = 0;
 
       // Primary: Authoritative DistanceLedger ACCEPTED + RECOVERED sum
