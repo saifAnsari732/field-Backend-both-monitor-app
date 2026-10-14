@@ -1492,44 +1492,9 @@ exports.heartbeat = async (req, res) => {
       ? req.body.currentAddress.trim()
       : '';
 
-    let hbDistKm = 0;
-    if (hasValidCoords && Number.isFinite(anchorLat) && Number.isFinite(anchorLng) && anchorLat > 0 && anchorLng > 0) {
-      hbDistKm = haversineDistance({ lat: anchorLat, lng: anchorLng }, { lat: hbLat, lng: hbLng });
-    }
-    const isHbMovement = hasValidCoords && hbDistKm >= 0.025 && hbDistKm <= 2.5 && hbAcc <= 300;
-    const hbEventId = `${sessionId}:hb:${Math.floor(now.getTime() / 60000)}`;
-
-    if (isHbMovement) {
-      const fromEvtId = sessionState?.lastEventId || `${sessionId}:hb_anchor:${Math.floor((new Date(lastCoordDb.timestamp || now).getTime()) / 1000)}`;
-      await DistanceLedger.updateOne(
-        { sessionId, fromEventId: fromEvtId, toEventId: hbEventId },
-        {
-          $setOnInsert: {
-            organizationId: orgId,
-            employee: req.user._id,
-            sessionId,
-            fromEventId: fromEvtId,
-            toEventId: hbEventId,
-            fromTimestamp: lastCoordDb.timestamp ? new Date(lastCoordDb.timestamp) : new Date(now.getTime() - 60000),
-            toTimestamp: now,
-            fromLat: anchorLat,
-            fromLng: anchorLng,
-            toLat: hbLat,
-            toLng: hbLng,
-            distanceMeters: Math.round(hbDistKm * 1000),
-            distanceKm: Math.round(hbDistKm * 1000) / 1000,
-            deltaSeconds: 60,
-            impliedSpeedKmh: Math.max((hbSpeed || 0) * 3.6, 5.0),
-            confidenceScore: 0.88,
-            classification: 'ACCEPTED',
-            filterState: 'ACCEPTED',
-            algorithmVersion: 'AGTRIE-X-v12.0-PRO'
-          }
-        },
-        { upsert: true }
-      ).catch(() => {});
-    }
-
+    // Heartbeat strictly maintains session liveness and keepalive timestamps.
+    // Distance accumulation is exclusively handled by updateLocation via the AGTRIE-X engine.
+    // Heartbeat NEVER adds fake distance from indoor stationary jitter!
     const updateOps = {
       $set: {
         lastActivity: now,
@@ -1539,45 +1504,6 @@ exports.heartbeat = async (req, res) => {
       },
       $unset: { endTime: 1 }
     };
-
-    // Seed initial coordinate, append when >=25m movement occurs, OR refresh keep-alive coordinate timestamp every 20m
-    // so legacy server checks on coordinates[last].timestamp NEVER auto-stop a stationary employee!
-    const lastCoordTsMs = lastCoordDb?.timestamp ? new Date(lastCoordDb.timestamp).getTime() : 0;
-    const needsCoordKeepAlive = (now.getTime() - lastCoordTsMs) > 20 * 60 * 1000;
-    const keepAliveLat = hasValidCoords ? hbLat : Number(lastCoordDb?.lat);
-    const keepAliveLng = hasValidCoords ? hbLng : Number(lastCoordDb?.lng);
-
-    if (
-      Number.isFinite(keepAliveLat) && Number.isFinite(keepAliveLng) &&
-      (!existing.coordinates || existing.coordinates.length === 0 || isHbMovement || needsCoordKeepAlive)
-    ) {
-      updateOps.$push = {
-        coordinates: {
-          lat: isHbMovement ? hbLat : (Number(lastCoordDb?.lat) || keepAliveLat),
-          lng: isHbMovement ? hbLng : (Number(lastCoordDb?.lng) || keepAliveLng),
-          accuracy: hbAcc,
-          speed: isHbMovement ? hbSpeed : 0,
-          timestamp: now,
-          address: hbAddress || lastCoordDb.address || ''
-        }
-      };
-    }
-
-    if (isHbMovement) {
-      const hbLedgerAgg = await DistanceLedger.aggregate([
-        { $match: { sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
-        { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
-      ]);
-      const ledgerDistKm = Math.round((hbLedgerAgg[0]?.totalKm || 0) * 100) / 100;
-      const manualAdded = Number(existing.manualDistanceAdded) || 0;
-      const authoritativeTotal = Number((ledgerDistKm + manualAdded).toFixed(2));
-      if (authoritativeTotal > (existing.totalDistance || 0)) {
-        updateOps.$set.totalDistance = authoritativeTotal;
-        updateOps.$set.officialDistance = authoritativeTotal;
-        updateOps.$set.acceptedDistance = Number(ledgerDistKm.toFixed(2));
-        updateOps.$set.rawGpsDistance = Number(ledgerDistKm.toFixed(2));
-      }
-    }
 
     let updated = await LiveLocation.findOneAndUpdate(
       { sessionId, employee: req.user._id },
