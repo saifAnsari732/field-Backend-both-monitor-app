@@ -686,8 +686,8 @@ exports.updateLocation = async (req, res) => {
 
         prev2Valid = prevValid;
         prevValid = {
-          lat: filterLat,
-          lng: filterLng,
+          lat,
+          lng,
           latRaw: lat,
           lngRaw: lng,
           accuracy,
@@ -702,8 +702,8 @@ exports.updateLocation = async (req, res) => {
         validCoords.push({
           ...coord,
           eventId,
-          lat: filterLat,
-          lng: filterLng,
+          lat,
+          lng,
           timestamp: timestamp.toISOString()
         });
 
@@ -841,9 +841,11 @@ exports.updateLocation = async (req, res) => {
           lastValidLat = lat;
           lastValidLng = lng;
           lastEventId = eventId;
+          filterLat = lat;
+          filterLng = lng;
           prevValid = {
-            lat: filterLat,
-            lng: filterLng,
+            lat,
+            lng,
             latRaw: lat,
             lngRaw: lng,
             accuracy,
@@ -947,9 +949,11 @@ exports.updateLocation = async (req, res) => {
           lastValidLat = lat;
           lastValidLng = lng;
           lastEventId = eventId;
+          filterLat = lat;
+          filterLng = lng;
           prevValid = {
-            lat: filterLat,
-            lng: filterLng,
+            lat,
+            lng,
             latRaw: lat,
             lngRaw: lng,
             accuracy,
@@ -1000,9 +1004,11 @@ exports.updateLocation = async (req, res) => {
             lastValidLat = lat;
             lastValidLng = lng;
             lastEventId = eventId;
+            filterLat = lat;
+            filterLng = lng;
             prevValid = {
-              lat: filterLat,
-              lng: filterLng,
+              lat,
+              lng,
               latRaw: lat,
               lngRaw: lng,
               accuracy,
@@ -1051,9 +1057,11 @@ exports.updateLocation = async (req, res) => {
                 algorithmVersion: 'AGTRIE-X-v12.0-PRO'
               });
             }
+            filterLat = lat;
+            filterLng = lng;
             prevValid = {
-              lat: filterLat,
-              lng: filterLng,
+              lat,
+              lng,
               latRaw: lat,
               lngRaw: lng,
               accuracy,
@@ -1066,8 +1074,8 @@ exports.updateLocation = async (req, res) => {
             validCoords.push({
               ...coord,
               eventId,
-              lat: filterLat,
-              lng: filterLng,
+              lat,
+              lng,
               timestamp: timestamp.toISOString()
             });
             acceptedEventIds.push(eventId);
@@ -1097,15 +1105,15 @@ exports.updateLocation = async (req, res) => {
 
       // Suppress adding duplicate stationary jitter coordinates to map polyline & checkpoints
       const lastSaved = validCoords[validCoords.length - 1];
-      const distFromLastSavedM = lastSaved ? haversineDistance({ lat: lastSaved.lat, lng: lastSaved.lng }, { lat: filterLat, lng: filterLng }) * 1000 : 999;
+      const distFromLastSavedM = lastSaved ? haversineDistance({ lat: lastSaved.lat, lng: lastSaved.lng }, { lat, lng }) * 1000 : 999;
       const isIdentical = distFromLastSavedM < 3.0;
 
       if (!isIdentical && (currentMotionState !== 'STATIONARY' || distFromLastSavedM >= 15.0 || validCoords.length === 0)) {
         validCoords.push({
           ...coord,
           eventId,
-          lat: filterLat,
-          lng: filterLng,
+          lat,
+          lng,
           timestamp: timestamp.toISOString()
         });
       }
