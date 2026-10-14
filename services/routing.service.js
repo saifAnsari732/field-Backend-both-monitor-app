@@ -12,6 +12,137 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+// In-memory cache for road distance pairs (1 hour TTL)
+const roadDistanceCache = new Map();
+
+function haversineStraightKm(fromLat, fromLng, toLat, toLng) {
+  const R = 6371;
+  const dLat = (toLat - fromLat) * Math.PI / 180;
+  const dLng = (toLng - fromLng) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(fromLat * Math.PI / 180) * Math.cos(toLat * Math.PI / 180) *
+    Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+/**
+ * Calculates real-world road travel distance from Point A to Point B
+ * Uses OSRM Road Network engine with Google Maps fallback & Geodesic Curvature fallback
+ * @param {number} fromLat 
+ * @param {number} fromLng 
+ * @param {number} toLat 
+ * @param {number} toLng 
+ * @returns {Promise<{ distanceKm: number, source: string, durationMinutes: number }>}
+ */
+async function getRoadDistance(fromLat, fromLng, toLat, toLng) {
+  const fLat = Number(fromLat);
+  const fLng = Number(fromLng);
+  const tLat = Number(toLat);
+  const tLng = Number(toLng);
+
+  if (!Number.isFinite(fLat) || !Number.isFinite(fLng) || !Number.isFinite(tLat) || !Number.isFinite(tLng)) {
+    return { distanceKm: 0, source: 'INVALID_COORDS', durationMinutes: 0 };
+  }
+
+  const straightDistKm = haversineStraightKm(fLat, fLng, tLat, tLng);
+
+  // Micro-movement (< 60 meters): return straight line distance directly
+  if (straightDistKm < 0.060) {
+    return {
+      distanceKm: Math.round(straightDistKm * 1000) / 1000,
+      source: 'STRAIGHT_MICRO',
+      durationMinutes: 0
+    };
+  }
+
+  // Cache key: rounded to ~100m grid for fast reuse
+  const cacheKey = `${fLat.toFixed(3)},${fLng.toFixed(3)}_${tLat.toFixed(3)},${tLng.toFixed(3)}`;
+  const cached = roadDistanceCache.get(cacheKey);
+  if (cached && (Date.now() - cached.ts) < 3600000) {
+    return cached.result;
+  }
+
+  // 1. Primary: OSRM Driving Road Network API
+  try {
+    const url = `https://router.project-osrm.org/route/v1/driving/${fLng},${fLat};${tLng},${tLat}?overview=false`;
+    const res = await fetch(url, { timeout: 4000 });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.routes && data.routes[0] && Number.isFinite(data.routes[0].distance)) {
+        const roadDistKm = Math.round((data.routes[0].distance / 1000) * 100) / 100;
+        const durationMin = Math.round((data.routes[0].duration / 60) * 10) / 10;
+        const result = {
+          distanceKm: roadDistKm,
+          durationMinutes: durationMin,
+          source: 'OSRM_ROAD_NETWORK'
+        };
+        roadDistanceCache.set(cacheKey, { ts: Date.now(), result });
+        return result;
+      }
+    }
+  } catch (err) {
+    // Network timeout or OSRM unavailable, proceed to fallback
+  }
+
+  // 2. Fallback: Haversine with empirical highway/road curve factor (1.20x for straight chords >= 1km)
+  const curveFactor = straightDistKm >= 1.0 ? 1.20 : 1.08;
+  const fallbackKm = Math.round(straightDistKm * curveFactor * 100) / 100;
+  const result = {
+    distanceKm: fallbackKm,
+    durationMinutes: Math.round((fallbackKm / 40) * 60), // assume 40 km/h average
+    source: 'ROAD_CURVATURE_MODEL'
+  };
+  roadDistanceCache.set(cacheKey, { ts: Date.now(), result });
+  return result;
+}
+
+/**
+ * Computes road distance across an entire sequence of checkpoints (Point A -> Point B -> Point C ...)
+ * @param {Array<{lat: number, lng: number, timestamp: Date}>} checkpoints
+ * @returns {Promise<{ totalRoadKm: number, segments: Array }>}
+ */
+async function computeRouteRoadDistance(checkpoints = []) {
+  if (!Array.isArray(checkpoints) || checkpoints.length < 2) {
+    return { totalRoadKm: 0, segments: [] };
+  }
+
+  // Filter valid points
+  const valid = checkpoints.filter(c => c && Number.isFinite(Number(c.lat)) && Number.isFinite(Number(c.lng)));
+  if (valid.length < 2) return { totalRoadKm: 0, segments: [] };
+
+  // Remove redundant stationary cluster points (< 40m apart)
+  const distinctStops = [valid[0]];
+  for (let i = 1; i < valid.length; i++) {
+    const prev = distinctStops[distinctStops.length - 1];
+    const curr = valid[i];
+    const distM = haversineStraightKm(prev.lat, prev.lng, curr.lat, curr.lng) * 1000;
+    if (distM >= 40.0 || i === valid.length - 1) {
+      distinctStops.push(curr);
+    }
+  }
+
+  let totalRoadKm = 0;
+  const segments = [];
+
+  for (let i = 1; i < distinctStops.length; i++) {
+    const from = distinctStops[i - 1];
+    const to = distinctStops[i];
+    const seg = await getRoadDistance(from.lat, from.lng, to.lat, to.lng);
+    totalRoadKm += seg.distanceKm;
+    segments.push({
+      from: { lat: from.lat, lng: from.lng, time: from.timestamp },
+      to: { lat: to.lat, lng: to.lng, time: to.timestamp },
+      distanceKm: seg.distanceKm,
+      source: seg.source
+    });
+  }
+
+  return {
+    totalRoadKm: Math.round(totalRoadKm * 100) / 100,
+    segments
+  };
+}
+
 /**
  * 1. Search places using Google Places Autocomplete API
  * Fallback to OpenStreetMap Nominatim if Google fails
@@ -197,4 +328,7 @@ module.exports = {
   getPlaceDetails,
   calculateDrivingRoute,
   haversineMeters,
+  getRoadDistance,
+  computeRouteRoadDistance,
+  haversineStraightKm
 };

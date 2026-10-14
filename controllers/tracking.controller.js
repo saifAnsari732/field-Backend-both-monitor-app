@@ -12,6 +12,7 @@ const {
   checkAndSetIdempotency,
   clearIdempotencyKey
 } = require('../services/cache.service');
+const { getRoadDistance, computeRouteRoadDistance } = require('../services/routing.service');
 
 // Business date (YYYY-MM-DD) in the given timezone (default IST)
 function getBusinessDate(date = new Date(), timeZone = 'Asia/Kolkata') {
@@ -770,10 +771,19 @@ exports.updateLocation = async (req, res) => {
 
       if (currentMotionState === 'STATIONARY') {
         // In STATIONARY state: Protect against indoor Wi-Fi/cell jitter (0.000 KM added)
-        // Breakout requires: displacement > 45m AND genuine hardware speed (>= 3.0 km/h) AND valid accuracy
-        const hasBreakoutTravel = distFromStationaryAnchorM > 45.0 &&
-          (reportedSpeedKmh >= 3.0 || effectiveSpeedKmh >= 3.5 || coord.screenMoving === true) &&
-          accuracy <= 260;
+        // Breakout requires:
+        // 1. Mobile screen confirmed moving with displacement >= 18m, OR
+        // 2. Genuine displacement >= 25m with speed >= 2.0 km/h, OR
+        // 3. Clear departure step >= 35m with acceptable accuracy
+        const isClientMoving = coord.screenMoving === true ||
+          coord.motionState === 'MOVING' || coord.motionState === 'WALKING' ||
+          coord.motionState === 'BIKE' || coord.motionState === 'VEHICLE';
+
+        const hasBreakoutTravel = (
+          (isClientMoving && distFromStationaryAnchorM >= 18.0) ||
+          (distFromStationaryAnchorM >= 25.0 && (reportedSpeedKmh >= 2.0 || effectiveSpeedKmh >= 2.2)) ||
+          (distFromStationaryAnchorM >= 35.0 && accuracy <= 280)
+        ) && accuracy <= 280;
 
         if (hasBreakoutTravel && !isTeleportation) {
           // 🚗 DEPARTURE CONFIRMED: Transition from STATIONARY to MOVING!
@@ -786,7 +796,14 @@ exports.updateLocation = async (req, res) => {
           const departureDistKm = distFromStationaryAnchorM / 1000;
           const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
 
-          if (departureDistKm >= 0.045 && departureDistKm <= 1.5) {
+          if (departureDistKm >= 0.020) {
+            let stepRoadKm = departureDistKm;
+            let stepReason = 'AGTRIE_X_V14_DEPARTURE_BREAKOUT_ACCEPTED';
+            if (departureDistKm > 1.5) {
+              const roadRes = await getRoadDistance(centroidLat, centroidLng, lat, lng);
+              stepRoadKm = roadRes.distanceKm > 0 ? roadRes.distanceKm : Math.round(departureDistKm * 1.20 * 100) / 100;
+              stepReason = 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED';
+            }
             ledgerSegments.push({
               organizationId: orgId,
               employee: req.user._id,
@@ -799,11 +816,11 @@ exports.updateLocation = async (req, res) => {
               fromLng: centroidLng,
               toLat: lat,
               toLng: lng,
-              distanceMeters: Math.round(departureDistKm * 1000),
-              distanceKm: Math.round(departureDistKm * 1000) / 1000,
+              distanceMeters: Math.round(stepRoadKm * 1000),
+              distanceKm: Math.round(stepRoadKm * 1000) / 1000,
               classification: 'ACCEPTED',
-              reason: 'AGTRIE_X_V14_DEPARTURE_BREAKOUT_ACCEPTED',
-              algorithmVersion: 'AGTRIE-X-v14.0-PRO'
+              reason: stepReason,
+              algorithmVersion: 'AGTRIE-X-v15.0-ROAD-PRO'
             });
           }
 
@@ -930,6 +947,60 @@ exports.updateLocation = async (req, res) => {
             timestamp: timestamp.toISOString(),
             heading: coord.heading
           };
+        } else if (stepDistM > 2500) {
+          // ── HIGHWAY / POCKET SLEEP GAP: POINT A TO POINT B ROAD RECOVERY ──
+          const gapDistKm = dRawKm;
+          const dtHours = dt / 3600;
+          const gapSpeedKmh = dtHours > 0 ? (gapDistKm / dtHours) : 0;
+          const isPlausibleHighwaySpeed = gapSpeedKmh <= 150.0 || dt >= 180;
+
+          if (isPlausibleHighwaySpeed && accuracy <= 350) {
+            const roadRes = await getRoadDistance(anchorLat, anchorLng, lat, lng);
+            const roadKm = roadRes.distanceKm > 0 ? roadRes.distanceKm : Math.round(gapDistKm * 1.20 * 100) / 100;
+
+            acceptedPoints++;
+            acceptedEventIds.push(eventId);
+            prevTimestamp = tMs;
+            relockCandidate = null;
+
+            const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
+            ledgerSegments.push({
+              organizationId: orgId,
+              employee: req.user._id,
+              sessionId,
+              fromEventId: safeFromEventId,
+              toEventId: eventId,
+              fromTimestamp: new Date(lastTrustedMs),
+              toTimestamp: timestamp,
+              fromLat: anchorLat,
+              fromLng: anchorLng,
+              toLat: lat,
+              toLng: lng,
+              distanceMeters: Math.round(roadKm * 1000),
+              distanceKm: roadKm,
+              classification: 'ACCEPTED',
+              reason: 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED',
+              algorithmVersion: 'AGTRIE-X-v15.0-ROAD-PRO'
+            });
+
+            centroidLat = lat;
+            centroidLng = lng;
+            prev2Valid = prevValid;
+            lastValidLat = lat;
+            lastValidLng = lng;
+            lastEventId = eventId;
+            prevValid = {
+              lat: filterLat,
+              lng: filterLng,
+              latRaw: lat,
+              lngRaw: lng,
+              accuracy,
+              speedKmh: Math.max(reportedSpeedKmh, effectiveSpeedKmh, 20.0),
+              candidateDistM: 0,
+              timestamp: timestamp.toISOString(),
+              heading: coord.heading
+            };
+          }
         } else {
         // 2-Point Satellite/Network Consensus Relock (supports up to 240m accuracy):
         if (!isCoarseJump && accuracy <= 240 && relockCandidate && tMs > relockCandidate.tMs && (tMs - relockCandidate.tMs) <= 120000) {
@@ -1332,10 +1403,29 @@ exports.stopTracking = async (req, res) => {
     session.isActive = false;
     session.endTime = new Date();
 
-    // Pure GPS distance from the AGTRIE-X engine (100% strict 1:1 GPS distance)
+    // Authoritative distance: take the maximum of session.totalDistance, redisTotalDist, and DistanceLedger accepted sum
+    const ledgerSegments = await DistanceLedger.find({ sessionId: effectiveSessionId, classification: 'ACCEPTED' }).lean();
+    let ledgerSumKm = 0;
+    ledgerSegments.forEach(seg => {
+      ledgerSumKm += Number(seg.distanceKm) || ((Number(seg.distanceMeters) || 0) / 1000);
+    });
+    ledgerSumKm = Math.round(ledgerSumKm * 100) / 100;
+
+    // Point A to Point B trajectory road network verification:
+    // Ensures highway gaps or pocket sleep are completely bridged upon punch out
+    let trajectoryRoadKm = 0;
+    if (session.coordinates && session.coordinates.length >= 2) {
+      try {
+        const routeRoadRes = await computeRouteRoadDistance(session.coordinates);
+        trajectoryRoadKm = routeRoadRes.totalRoadKm || 0;
+      } catch (_) {}
+    }
+
     const baseGpsKm = Math.max(
       Number(session.totalDistance) || 0,
-      Number(redisTotalDist) || 0
+      Number(redisTotalDist) || 0,
+      ledgerSumKm,
+      trajectoryRoadKm
     );
     const gpsKm = Math.round(baseGpsKm * 100) / 100;
 
@@ -2195,13 +2285,10 @@ exports.getLiveLocations = async (req, res) => {
       if (!session.employee) return null;
 
       const latestCoord = (session.coordinates && session.coordinates[session.coordinates.length - 1]) || {};
-      let displayDistance = sessionKmMap.get(String(session.sessionId)) || 0;
-
-      if (displayDistance <= 0) {
-        const sessionState = await getSessionState(session.sessionId);
-        const sessionDist = sessionState?.totalDistance ?? session.totalDistance ?? 0;
-        displayDistance = Math.round(sessionDist * 100) / 100;
-      }
+      const ledgerKm = sessionKmMap.get(String(session.sessionId)) || 0;
+      const sessionState = await getSessionState(session.sessionId);
+      const sessionDist = Number(sessionState?.totalDistance ?? session.totalDistance ?? 0);
+      let displayDistance = Math.max(ledgerKm, Math.round(sessionDist * 100) / 100);
 
       const empTodayKm = empTodayKmMap.get(String(session.employee._id)) || 0;
       const todayTotalKm = empTodayKm > 0 ? Math.max(empTodayKm, displayDistance) : displayDistance;
