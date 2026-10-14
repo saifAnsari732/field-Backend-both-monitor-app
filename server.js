@@ -132,6 +132,12 @@ const { protect } = require('./middleware/auth.middleware');
 const { LiveLocation, Meeting } = require('./models');
 const { liveCache } = require('./services/cache.service');
 
+function getBusinessDate(date = new Date(), timeZone = 'Asia/Kolkata') {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).format(date);
+}
+
 // Dashboard stats route for employee & manager (optimized projection + L1/L2 cache)
 app.get('/api/dashboard/stats', protect, async (req, res) => {
   try {
@@ -141,19 +147,15 @@ app.get('/api/dashboard/stats', protect, async (req, res) => {
       return res.json({ success: true, stats: cached, fromCache: true });
     }
 
+    const today = getBusinessDate(new Date(), 'Asia/Kolkata');
     const todayDateObj = new Date();
     todayDateObj.setHours(0, 0, 0, 0);
-    
-    const year = todayDateObj.getFullYear();
-    const month = String(todayDateObj.getMonth() + 1).padStart(2, '0');
-    const day = String(todayDateObj.getDate()).padStart(2, '0');
-    const dateStr = `${year}-${month}-${day}`;
 
-    // Project ONLY totalDistance & date (NEVER download coordinates arrays!) and run in parallel
+    // Project ONLY needed fields and run in parallel
     const [allSessions, meetingCount] = await Promise.all([
       LiveLocation.find(
         { employee: req.user._id },
-        { totalDistance: 1, officialDistance: 1, date: 1 }
+        { totalDistance: 1, officialDistance: 1, date: 1, isActive: 1, sessionId: 1 }
       ).lean(),
       Meeting.countDocuments({ 
         employee: req.user._id, 
@@ -166,11 +168,21 @@ app.get('/api/dashboard/stats', protect, async (req, res) => {
       0
     );
     
-    const todaySessions = allSessions.filter(s => s.date === dateStr);
-    const distanceToday = todaySessions.reduce(
-      (acc, s) => acc + (Number(s.totalDistance || s.officialDistance) || 0),
-      0
-    );
+    // Match today's business date OR any session currently active
+    const todaySessions = allSessions.filter(s => s.date === today || s.isActive === true);
+    let distanceToday = 0;
+    for (const s of todaySessions) {
+      let sDist = Number(s.totalDistance || s.officialDistance) || 0;
+      if (s.isActive && s.sessionId) {
+        try {
+          const redisState = await liveCache.get(`tracking_session_${s.sessionId}`);
+          if (redisState && Number(redisState.totalDistance) > sDist) {
+            sDist = Number(redisState.totalDistance);
+          }
+        } catch (_) {}
+      }
+      distanceToday += sDist;
+    }
 
     const statsPayload = {
       distanceToday: distanceToday.toFixed(2),
@@ -182,7 +194,7 @@ app.get('/api/dashboard/stats', protect, async (req, res) => {
       totalExpenses: 0
     };
 
-    await liveCache.set(cacheKey, statsPayload, 15);
+    await liveCache.set(cacheKey, statsPayload, 5);
 
     res.json({
       success: true,

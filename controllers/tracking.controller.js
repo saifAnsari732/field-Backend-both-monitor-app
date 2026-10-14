@@ -770,22 +770,34 @@ exports.updateLocation = async (req, res) => {
       const isTeleportation = effectiveSpeedKmh > 180.0 || isCoarseJump;
 
       if (currentMotionState === 'STATIONARY') {
+        const departureDistKm = distFromStationaryAnchorM / 1000;
+
+        // 🚗 POINT A TO POINT B HIGHWAY / POCKET-SLEEP GAP RECOVERY (>= 1.5 KM):
+        // If employee was stationary at Point A (e.g. morning home) and travels to Point B (e.g. 47 KM away in Maharajganj):
+        // Background heartbeats may have arrived with dt=60s, falsely calculating speed as 2800 km/h (teleportation).
+        // Check session elapsed duration since start: if overall average speed <= 160 km/h, this is genuine road travel!
+        const sessionStartTime = activeDoc?.startTime ? new Date(activeDoc.startTime).getTime() : (tMs - 3600000);
+        const sessionElapsedHours = Math.max((tMs - sessionStartTime) / 3600000, 0.25);
+        const overallAvgSpeedKmh = departureDistKm / sessionElapsedHours;
+        const isPointAToBHighwayTravel = departureDistKm >= 1.5 && overallAvgSpeedKmh <= 160.0 && accuracy <= 350;
+
         // In STATIONARY state: Protect against indoor Wi-Fi/cell jitter (0.000 KM added)
         // Breakout requires:
-        // 1. Mobile screen confirmed moving with displacement >= 18m, OR
-        // 2. Genuine displacement >= 25m with speed >= 2.0 km/h, OR
-        // 3. Clear departure step >= 35m with acceptable accuracy
+        // 1. Point A to Point B highway gap (>= 1.5 KM with plausible shift duration), OR
+        // 2. Mobile screen confirmed moving with displacement >= 18m, OR
+        // 3. Genuine displacement >= 25m with speed >= 2.0 km/h, OR
+        // 4. Clear departure step >= 35m with acceptable accuracy
         const isClientMoving = coord.screenMoving === true ||
           coord.motionState === 'MOVING' || coord.motionState === 'WALKING' ||
           coord.motionState === 'BIKE' || coord.motionState === 'VEHICLE';
 
-        const hasBreakoutTravel = (
+        const hasBreakoutTravel = isPointAToBHighwayTravel || ((
           (isClientMoving && distFromStationaryAnchorM >= 18.0) ||
           (distFromStationaryAnchorM >= 25.0 && (reportedSpeedKmh >= 2.0 || effectiveSpeedKmh >= 2.2)) ||
           (distFromStationaryAnchorM >= 35.0 && accuracy <= 280)
-        ) && accuracy <= 280;
+        ) && accuracy <= 280);
 
-        if (hasBreakoutTravel && !isTeleportation) {
+        if (hasBreakoutTravel && (!isTeleportation || isPointAToBHighwayTravel)) {
           // 🚗 DEPARTURE CONFIRMED: Transition from STATIONARY to MOVING!
           currentMotionState = 'MOVING';
           acceptedPoints++;
@@ -793,7 +805,6 @@ exports.updateLocation = async (req, res) => {
           prevTimestamp = tMs;
           relockCandidate = null;
 
-          const departureDistKm = distFromStationaryAnchorM / 1000;
           const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
 
           if (departureDistKm >= 0.020) {
@@ -1084,10 +1095,12 @@ exports.updateLocation = async (req, res) => {
       }
     }
 
-      // Suppress adding duplicate stationary jitter coordinates to map polylinetukt
+      // Suppress adding duplicate stationary jitter coordinates to map polyline & checkpoints
       const lastSaved = validCoords[validCoords.length - 1];
       const distFromLastSavedM = lastSaved ? haversineDistance({ lat: lastSaved.lat, lng: lastSaved.lng }, { lat: filterLat, lng: filterLng }) * 1000 : 999;
-      if (currentMotionState !== 'STATIONARY' || distFromLastSavedM >= 15.0 || validCoords.length === 0) {
+      const isIdentical = distFromLastSavedM < 3.0;
+
+      if (!isIdentical && (currentMotionState !== 'STATIONARY' || distFromLastSavedM >= 15.0 || validCoords.length === 0)) {
         validCoords.push({
           ...coord,
           eventId,
@@ -1135,7 +1148,7 @@ exports.updateLocation = async (req, res) => {
 
     // Dual-Screen Zero-Lag Bridge: If mobile device accumulated verified offline movement, reconcile to prevent any manager-employee lag
     const maxClientScreenKm = nonDuplicateCoordinates.reduce((max, c) => Math.max(max, Number(c?.screenDistanceKm) || 0), 0);
-    if (maxClientScreenKm > currentTotalDistance && (maxClientScreenKm - currentTotalDistance) <= 15.0) {
+    if (maxClientScreenKm > currentTotalDistance && (maxClientScreenKm - currentTotalDistance) <= 150.0) {
       currentTotalDistance = Math.round(maxClientScreenKm * 100) / 100;
     }
 
@@ -1153,9 +1166,9 @@ exports.updateLocation = async (req, res) => {
       ).catch(() => {});
     }
 
-    const hasTravelOccurred = ledgerSegments.length > 0 || (Number(prevValid?.speedKmh) || 0) >= 3.0;
+    const hasTravelOccurred = ledgerSegments.length > 0;
     const finalSpeedKmh = (hasTravelOccurred || currentMotionState === 'MOVING') ? Math.max(Math.min(batchMaxSpeed, 220), Number(prevValid?.speedKmh) || 0) : 0;
-    if (currentMotionState === 'MOVING' || hasTravelOccurred) {
+    if (hasTravelOccurred || finalSpeedKmh >= 2.0) {
       currentMotionState = finalSpeedKmh >= 3.0 ? classifyMotionState(finalSpeedKmh) : 'MOVING';
     } else {
       currentMotionState = 'STATIONARY';
@@ -1215,7 +1228,9 @@ exports.updateLocation = async (req, res) => {
     const validClientAddress = (
       rawClientAddress &&
       !rawClientAddress.toLowerCase().includes('inactive') &&
-      !rawClientAddress.toLowerCase().includes('searching for satellites')
+      !rawClientAddress.toLowerCase().includes('searching for satellites') &&
+      !rawClientAddress.toLowerCase().includes('location acquired') &&
+      !rawClientAddress.toLowerCase().includes('location unavailable')
     ) ? rawClientAddress : '';
 
     // Step 4: MongoDB Atomic Persistence with Full Audit Ledger
@@ -1246,7 +1261,7 @@ exports.updateLocation = async (req, res) => {
         { sessionId, employee: req.user._id },
         {
           $push: { 
-            coordinates: { $each: tagged, $slice: -500 }, 
+            coordinates: { $each: tagged, $slice: -2500 }, 
             rejectionReasons: { $each: rejectionReasons, $slice: -100 } 
           },
           $inc: {
@@ -1346,6 +1361,7 @@ exports.updateLocation = async (req, res) => {
       await deleteCache(`admin_dashboard_${orgId}`).catch(() => {});
     }
     await deleteCache(`live_locations_${req.user._id}`).catch(() => {});
+    await deleteCache(`emp_dashboard_stats_${req.user._id}`).catch(() => {});
     await deleteCache('live_locations_all').catch(() => {});
 
     res.json({ 
@@ -1456,6 +1472,7 @@ exports.stopTracking = async (req, res) => {
     const userOrgId = req.user.organizationId?._id || req.user.organizationId;
     if (userOrgId) await deleteCache(`live_locations_${userOrgId}`);
     await deleteCache(`live_locations_${req.user._id}`);
+    await deleteCache(`emp_dashboard_stats_${req.user._id}`).catch(() => {});
     await deleteCache('live_locations_all');
 
     // Use session.date so shifts spanning midnight attribute distance to correct attendance day
@@ -2655,61 +2672,36 @@ exports.reconcileAllActiveSessions = async () => {
         'metadata.sessionId': s.sessionId
       });
       if (wasAutoStopped && !wasManuallyStopped) {
-        const lastC = (s.coordinates && s.coordinates[s.coordinates.length - 1]) || null;
         const updateDoc = {
           $set: { isActive: true, autoClosed: false, lastActivity: now },
           $unset: { endTime: 1 }
         };
-        if (lastC && Number.isFinite(Number(lastC.lat)) && Number.isFinite(Number(lastC.lng))) {
-          // Append zero-distance keepalive coordinate with current timestamp so legacy server's
-          // coordinates[last].timestamp 1-hour check is permanently satisfied!
-          updateDoc.$push = {
-            coordinates: {
-              lat: Number(lastC.lat),
-              lng: Number(lastC.lng),
-              accuracy: Number(lastC.accuracy) || 15,
-              speed: 0,
-              timestamp: now,
-              address: lastC.address || ''
-            }
-          };
-        }
         await LiveLocation.updateOne({ _id: s._id }, updateDoc).catch(() => {});
         if (s.employee) {
           await User.findByIdAndUpdate(s.employee, { isTracking: true, isOnline: true, lastSeen: now }).catch(() => {});
           await Attendance.findOneAndUpdate({ employee: s.employee, date: today }, { $unset: { checkOut: 1 } }).catch(() => {});
         }
-        console.log(`🛡️ [SENTINEL_GUARDIAN] Restored auto-stopped session ${s.sessionId} back to ACTIVE with fresh coordinate anchor`);
+        console.log(`🛡️ [SENTINEL_GUARDIAN] Restored auto-stopped session ${s.sessionId} back to ACTIVE with keepalive`);
       }
     }
 
-    // 2. Proactive Shield: Keep lastActivity AND coordinates[last].timestamp within 25 minutes on all active today sessions
+    // 2. Proactive Shield: Keep lastActivity updated within 25 minutes on all active today sessions
     // so no legacy 1-hour inactivity cron can ever match or auto-stop an active shift!
+    // (Never pushes fake dummy coordinates to session.coordinates to prevent timeline clutter)
     const twentyFiveMinAgoMs = now.getTime() - 25 * 60 * 1000;
     const activeToday = await LiveLocation.find(
       { date: today, isActive: true },
-      { _id: 1, sessionId: 1, employee: 1, totalDistance: 1, manualDistanceAdded: 1, lastActivity: 1, coordinates: { $slice: -1 } }
+      { _id: 1, sessionId: 1, employee: 1, totalDistance: 1, manualDistanceAdded: 1, lastActivity: 1 }
     ).lean();
 
     for (const s of activeToday) {
-      const lastC = (s.coordinates && s.coordinates[s.coordinates.length - 1]) || null;
-      const lastCoordMs = lastC?.timestamp ? new Date(lastC.timestamp).getTime() : 0;
-      if (lastCoordMs < twentyFiveMinAgoMs && lastC && Number.isFinite(Number(lastC.lat)) && Number.isFinite(Number(lastC.lng))) {
+      const lastActMs = s.lastActivity ? new Date(s.lastActivity).getTime() : 0;
+      if (lastActMs < twentyFiveMinAgoMs) {
         await LiveLocation.updateOne(
           { _id: s._id },
           {
             $set: { lastActivity: now, autoClosed: false },
-            $unset: { endTime: 1 },
-            $push: {
-              coordinates: {
-                lat: Number(lastC.lat),
-                lng: Number(lastC.lng),
-                accuracy: Number(lastC.accuracy) || 15,
-                speed: 0,
-                timestamp: now,
-                address: lastC.address || ''
-              }
-            }
+            $unset: { endTime: 1 }
           }
         ).catch(() => {});
       }
