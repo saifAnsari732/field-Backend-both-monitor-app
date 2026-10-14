@@ -1084,7 +1084,7 @@ exports.updateLocation = async (req, res) => {
       }
     }
 
-      // Suppress adding duplicate stationary jitter coordinates to map polyline
+      // Suppress adding duplicate stationary jitter coordinates to map polylinetukt
       const lastSaved = validCoords[validCoords.length - 1];
       const distFromLastSavedM = lastSaved ? haversineDistance({ lat: lastSaved.lat, lng: lastSaved.lng }, { lat: filterLat, lng: filterLng }) * 1000 : 999;
       if (currentMotionState !== 'STATIONARY' || distFromLastSavedM >= 15.0 || validCoords.length === 0) {
