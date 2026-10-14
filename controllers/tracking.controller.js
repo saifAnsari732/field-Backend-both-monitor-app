@@ -64,6 +64,7 @@ exports.startTracking = async (req, res) => {
         const updateFields = {
           isActive: true,
           autoClosed: false,
+          manuallyStopped: false,
           lastActivity: new Date(),
         };
         if (selfieUrl) updateFields.selfieUrl = selfieUrl;
@@ -162,9 +163,17 @@ exports.startTracking = async (req, res) => {
     });
 
     const io = req.app.get('io');
-    io.to('admins').emit('employee_tracking_started', {
-      employeeId: req.user._id, name: req.user.name, lat, lng, sessionId: session.sessionId
-    });
+    if (io) {
+      io.to('admins').emit('employee_tracking_started', {
+        employeeId: req.user._id, name: req.user.name, lat, lng, sessionId: session.sessionId
+      });
+      const orgId = req.user.organizationId?._id || req.user.organizationId;
+      if (orgId) {
+        io.to(`org_admins_${orgId}`).to(`org:${orgId}:admins`).to('superadmins').emit('employee_tracking_started', {
+          employeeId: req.user._id, name: req.user.name, lat, lng, sessionId: session.sessionId
+        });
+      }
+    }
 
     // Calculate employee's total distance today across all sessions
     const allTodaySessions = await LiveLocation.find({ employee: req.user._id, date: today });
@@ -239,10 +248,25 @@ exports.updateLocation = async (req, res) => {
     if (!sessionId || sessionId === 'AUTO_RECOVER_SESSION') {
       let recoveredDoc = await LiveLocation.findOne(
         { employee: req.user._id, date: today },
-        { sessionId: 1, isActive: 1 }
+        { sessionId: 1, isActive: 1, manuallyStopped: 1, autoClosed: 1, endTime: 1 }
       ).sort({ isActive: -1, createdAt: -1 });
 
       if (!recoveredDoc) {
+        // If employee has a manually stopped session today and no active session, NEVER create a new shift!
+        const hasManuallyStoppedToday = await LiveLocation.exists({
+          employee: req.user._id,
+          date: today,
+          isActive: false,
+          $or: [{ manuallyStopped: true }, { endTime: { $exists: true, $ne: null } }]
+        });
+        if (hasManuallyStoppedToday) {
+          return res.json({
+            success: true,
+            sessionClosed: true,
+            message: 'Shift has ended. Employee has manually punched out.',
+            totalDistance: 0
+          });
+        }
         const freshSessionId = uuidv4();
         recoveredDoc = await LiveLocation.create({
           organizationId: orgId,
@@ -346,9 +370,24 @@ exports.updateLocation = async (req, res) => {
     if (!activeDoc) {
       activeDoc = await LiveLocation.findOne(
         { employee: req.user._id, isActive: true, date: today },
-        { sessionId: 1, isActive: 1, autoClosed: 1, date: 1, endTime: 1, lastActivity: 1, totalDistance: 1, manualDistanceAdded: 1, coordinates: { $slice: -1 } }
+        { sessionId: 1, isActive: 1, autoClosed: 1, manuallyStopped: 1, date: 1, endTime: 1, lastActivity: 1, totalDistance: 1, manualDistanceAdded: 1, coordinates: { $slice: -1 } }
       ).sort({ createdAt: -1 });
       if (!activeDoc) {
+        const hasManuallyStoppedToday = await LiveLocation.exists({
+          employee: req.user._id,
+          date: today,
+          isActive: false,
+          $or: [{ manuallyStopped: true }, { endTime: { $exists: true, $ne: null } }]
+        });
+        if (hasManuallyStoppedToday) {
+          if (releaseSessionLock) await releaseSessionLock().catch(() => {});
+          return res.json({
+            success: true,
+            sessionClosed: true,
+            message: 'Shift has ended. Employee has manually punched out.',
+            totalDistance: 0
+          });
+        }
         const freshSessionId = uuidv4();
         sessionId = freshSessionId;
         activeDoc = await LiveLocation.create({
@@ -737,7 +776,7 @@ exports.updateLocation = async (req, res) => {
       const rawCalcSpeedKmh = (dt > 0 && (distM >= 25.0 || reportedSpeedKmh >= 2.0)) ? (dRawKm / dt) * 3600 : 0;
       const prevWasMoving = (Number(prevValid?.speedKmh) || 0) >= 3.0;
       const stepWindowSecs = Math.min(dt, Math.max(stepDt, 4.0), 20.0);
-      const stepCalcSpeedKmh = (!prevWasMoving && distM >= 25.0 && stepWindowSecs > 0)
+      const stepCalcSpeedKmh = (!prevWasMoving && distM >= 12.0 && stepWindowSecs > 0)
         ? Math.min((dRawKm / stepWindowSecs) * 3600, 65.0)
         : 0;
       const effectiveSpeedKmh = Math.max(reportedSpeedKmh, rawCalcSpeedKmh, stepCalcSpeedKmh);
@@ -789,13 +828,14 @@ exports.updateLocation = async (req, res) => {
         // 4. Clear departure step >= 35m with acceptable accuracy
         const isClientMoving = coord.screenMoving === true ||
           coord.motionState === 'MOVING' || coord.motionState === 'WALKING' ||
-          coord.motionState === 'BIKE' || coord.motionState === 'VEHICLE';
+          coord.motionState === 'BIKE' || coord.motionState === 'VEHICLE' ||
+          effectiveSpeedKmh >= 1.5;
 
         const hasBreakoutTravel = isPointAToBHighwayTravel || ((
-          (isClientMoving && distFromStationaryAnchorM >= 18.0) ||
-          (distFromStationaryAnchorM >= 25.0 && (reportedSpeedKmh >= 2.0 || effectiveSpeedKmh >= 2.2)) ||
-          (distFromStationaryAnchorM >= 35.0 && accuracy <= 280)
-        ) && accuracy <= 280);
+          (isClientMoving && distFromStationaryAnchorM >= 14.0) ||
+          (distFromStationaryAnchorM >= 18.0 && (reportedSpeedKmh >= 1.5 || effectiveSpeedKmh >= 1.5)) ||
+          (distFromStationaryAnchorM >= 25.0 && accuracy <= 300)
+        ) && accuracy <= 320);
 
         if (hasBreakoutTravel && (!isTeleportation || isPointAToBHighwayTravel)) {
           // 🚗 DEPARTURE CONFIRMED: Transition from STATIONARY to MOVING!
@@ -854,10 +894,20 @@ exports.updateLocation = async (req, res) => {
             timestamp: timestamp.toISOString(),
             heading: coord.heading
           };
+
+          validCoords.push({
+            ...coord,
+            eventId,
+            lat,
+            lng,
+            timestamp: timestamp.toISOString()
+          });
         } else {
-          // Still at stationary spot: Softly converge centroid (EMA) to center the noise, strictly 0 KM added
-          centroidLat = 0.98 * centroidLat + 0.02 * lat;
-          centroidLng = 0.98 * centroidLng + 0.02 * lng;
+          // Still at stationary spot: Softly converge centroid (EMA) only for true indoor jitter (< 12m), strictly 0 KM added
+          if (distFromStationaryAnchorM < 12.0) {
+            centroidLat = 0.98 * centroidLat + 0.02 * lat;
+            centroidLng = 0.98 * centroidLng + 0.02 * lng;
+          }
           filterLat = snap.lat;
           filterLng = snap.lng;
           filterPLat = snap.pLat;
@@ -865,6 +915,17 @@ exports.updateLocation = async (req, res) => {
           prevTimestamp = tMs;
           lastValidTimestamp = Math.max(lastValidTimestamp, tMs);
           acceptedEventIds.push(eventId);
+
+          // Update current position in LiveLocation so admin map always shows fresh real-time spot
+          if (validCoords.length === 0 && i === nonDuplicateCoordinates.length - 1) {
+            validCoords.push({
+              ...coord,
+              eventId,
+              lat,
+              lng,
+              timestamp: timestamp.toISOString()
+            });
+          }
         }
       } else {
         // CURRENT STATE: MOVING ON ROAD
@@ -962,6 +1023,14 @@ exports.updateLocation = async (req, res) => {
             timestamp: timestamp.toISOString(),
             heading: coord.heading
           };
+
+          validCoords.push({
+            ...coord,
+            eventId,
+            lat,
+            lng,
+            timestamp: timestamp.toISOString()
+          });
         } else if (stepDistM > 2500) {
           // ── HIGHWAY / POCKET SLEEP GAP: POINT A TO POINT B ROAD RECOVERY ──
           const gapDistKm = dRawKm;
@@ -1017,6 +1086,14 @@ exports.updateLocation = async (req, res) => {
               timestamp: timestamp.toISOString(),
               heading: coord.heading
             };
+
+            validCoords.push({
+              ...coord,
+              eventId,
+              lat,
+              lng,
+              timestamp: timestamp.toISOString()
+            });
           }
         } else {
         // 2-Point Satellite/Network Consensus Relock (supports up to 240m accuracy):
@@ -1516,9 +1593,16 @@ exports.stopTracking = async (req, res) => {
     });
 
     const io = req.app.get('io');
-    io.to('admins').emit('employee_tracking_stopped', {
-      employeeId: req.user._id, name: req.user.name, sessionId, totalDistance: totalDist
-    });
+    if (io) {
+      io.to('admins').emit('employee_tracking_stopped', {
+        employeeId: req.user._id, name: req.user.name, sessionId, totalDistance: totalDist
+      });
+      if (userOrgId) {
+        io.to(`org_admins_${userOrgId}`).to(`org:${userOrgId}:admins`).to('superadmins').emit('employee_tracking_stopped', {
+          employeeId: req.user._id, name: req.user.name, sessionId, totalDistance: totalDist
+        });
+      }
+    }
 
     res.json({ success: true, totalDistance: totalDist, session });
   } catch (err) {
@@ -1731,12 +1815,19 @@ exports.getTodaySessions = async (req, res) => {
     const sanitizedSessions = await Promise.all((sessions || []).map(async (doc) => {
       const s = doc.toObject ? doc.toObject() : { ...doc };
 
-      // Self-Heal: If an external/legacy cron marked this session TRACKING_AUTO_STOPPED today, restore isActive=true immediately!
-      if (!s.isActive && !hasActiveSessionToday) {
-        const wasAutoStopped = s.autoClosed || await ActivityLog.exists({
+      // 🛑 User Manual Punch Out Guard: If session was manually stopped or has endTime, NEVER restore isActive=true!
+      const wasManuallyStopped = Boolean(s.manuallyStopped) || Boolean(s.endTime) || Boolean(await ActivityLog.exists({
+        employee: req.user._id,
+        action: 'TRACKING_STOP',
+        'metadata.sessionId': s.sessionId
+      }));
+
+      // Self-Heal: ONLY restore if it was purely auto-stopped AND never manually stopped by the user!
+      if (!s.isActive && !hasActiveSessionToday && !wasManuallyStopped) {
+        const wasAutoStopped = Boolean(s.autoClosed) || Boolean(await ActivityLog.exists({
           action: 'TRACKING_AUTO_STOPPED',
           'metadata.sessionId': s.sessionId
-        });
+        }));
         if (wasAutoStopped) {
           s.isActive = true;
           s.autoClosed = false;
@@ -2012,7 +2103,30 @@ exports.getLiveEmployees = async (req, res) => {
       }
     });
 
-    res.json({ success: true, employees, locations });
+    const flattenedLocations = activeLocationsList.map((loc) => {
+      const locObj = loc.toObject ? loc.toObject() : { ...loc };
+      const lastCoord = (loc.coordinates && loc.coordinates.length > 0) ? loc.coordinates[loc.coordinates.length - 1] : null;
+      const empIdStr = String(loc.employee?._id || loc.employee || '');
+
+      return {
+        ...locObj,
+        employeeId: empIdStr,
+        employeeIdCode: loc.employee?.employeeId || '',
+        name: loc.employee?.name || '',
+        avatar: loc.employee?.avatar || '',
+        department: loc.employee?.department || '',
+        isOnline: Boolean(loc.employee?.isOnline),
+        lastSeen: loc.employee?.lastSeen,
+        lat: lastCoord ? lastCoord.lat : (loc.lat || 0),
+        lng: lastCoord ? lastCoord.lng : (loc.lng || 0),
+        speed: lastCoord ? (Number(lastCoord.speed) || 0) : (loc.speed || 0),
+        accuracy: lastCoord ? (Number(lastCoord.accuracy) || 0) : 0,
+        address: (lastCoord && lastCoord.address) ? lastCoord.address : (loc.currentAddress || loc.startAddress || ''),
+        lastActivity: loc.lastActivity || (lastCoord ? lastCoord.timestamp : loc.updatedAt)
+      };
+    });
+
+    res.json({ success: true, employees, locations: flattenedLocations });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -2635,7 +2749,7 @@ exports.reconcileAllActiveSessions = async () => {
     // 1. Reverse any today sessions that were closed by a legacy TRACKING_AUTO_STOPPED process
     const inactiveToday = await LiveLocation.find(
       { date: today, isActive: false },
-      { _id: 1, sessionId: 1, employee: 1, autoClosed: 1, coordinates: { $slice: -1 } }
+      { _id: 1, sessionId: 1, employee: 1, autoClosed: 1, manuallyStopped: 1, endTime: 1, coordinates: { $slice: -1 } }
     ).lean();
 
     for (const s of inactiveToday) {
@@ -2643,15 +2757,19 @@ exports.reconcileAllActiveSessions = async () => {
         const alreadyHasActive = await LiveLocation.exists({ employee: s.employee, date: today, isActive: true });
         if (alreadyHasActive) continue;
       }
-      const wasAutoStopped = s.autoClosed || await ActivityLog.exists({
+      // 🛑 User Manual Punch Out Guard: If manually stopped, has endTime, or TRACKING_STOP log exists, NEVER touch!
+      const wasManuallyStopped = Boolean(s.manuallyStopped) || Boolean(s.endTime) || Boolean(await ActivityLog.exists({
+        action: 'TRACKING_STOP',
+        $or: [{ 'metadata.sessionId': s.sessionId }, { employee: s.employee }]
+      }));
+      if (wasManuallyStopped) {
+        continue;
+      }
+      const wasAutoStopped = Boolean(s.autoClosed) || Boolean(await ActivityLog.exists({
         action: 'TRACKING_AUTO_STOPPED',
         'metadata.sessionId': s.sessionId
-      });
-      const wasManuallyStopped = await ActivityLog.exists({
-        action: 'TRACKING_STOP',
-        'metadata.sessionId': s.sessionId
-      });
-      if (wasAutoStopped && !wasManuallyStopped) {
+      }));
+      if (wasAutoStopped) {
         const updateDoc = {
           $set: { isActive: true, autoClosed: false, lastActivity: now },
           $unset: { endTime: 1 }
