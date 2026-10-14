@@ -1269,7 +1269,7 @@ exports.updateLocation = async (req, res) => {
         { sessionId, employee: req.user._id },
         {
           $push: { 
-            coordinates: { $each: tagged, $slice: -2500 }, 
+            coordinates: { $each: tagged, $slice: -5000 }, 
             rejectionReasons: { $each: rejectionReasons, $slice: -100 } 
           },
           $inc: {
@@ -2205,34 +2205,6 @@ const recalculateSessionFromPoints = async (sessionId, sessionDate, sessionDocId
   }
 };
 exports.recalculateSessionFromPoints = recalculateSessionFromPoints;
-
-// @desc Continuous background worker to reconcile active sessions in MongoDB (NON-DESTRUCTIVE SYNC)
-exports.reconcileAllActiveSessions = async () => {
-  try {
-    const activeSessions = await LiveLocation.find({ isActive: true });
-
-    for (const session of activeSessions) {
-      // Non-destructive audit: calculate official distance strictly from DistanceLedger ACCEPTED sum
-      const ledgerAgg = await DistanceLedger.aggregate([
-        { $match: { sessionId: session.sessionId, classification: 'ACCEPTED' } },
-        { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
-      ]);
-
-      const officialKm = Math.round((ledgerAgg[0]?.totalKm || 0) * 100) / 100;
-      const targetKm = Math.round((officialKm + (Number(session.manualDistanceAdded) || 0)) * 100) / 100;
-
-      // Monotonic guard: only update if ledger has caught up and distance is strictly higher
-      if (targetKm > (session.totalDistance || 0) && (targetKm - (session.totalDistance || 0)) > 0.05) {
-        await LiveLocation.updateOne(
-          { sessionId: session.sessionId },
-          { $set: { totalDistance: targetKm, officialDistance: targetKm, acceptedDistance: officialKm } }
-        );
-      }
-    }
-  } catch (err) {
-    console.error('❌ [reconcileAllActiveSessions] Error:', err.message);
-  }
-};
 
 // @desc Get live locations (optimized with server-side caching, $slice: -1 projection & batched ledger aggregation)
 exports.getLiveLocations = async (req, res) => {
