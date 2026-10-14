@@ -850,8 +850,8 @@ exports.updateLocation = async (req, res) => {
             reason: isCoarseJump ? 'LOW_ACCURACY_COARSE_JUMP' : 'TELEPORTATION_OR_STEP_LIMIT_EXCEEDED',
             lat, lng, accuracy, speed: effectiveSpeedKmh
           });
-        } else if (stepDistM < 5.0 || (reportedSpeedKmh < 1.5 && effectiveSpeedKmh < 1.8)) {
-          // Vehicle has slowed down or briefly stopped (Traffic light / turn / speed breaker)
+        } else if (stepDistM < 5.0) {
+          // Micro-movement / Stopped at light / brief pause (< 5.0m):
           if (dt < 90) {
             // Traffic stop (< 90 seconds): Hold anchor and state intact so route NEVER breaks!
             acceptedEventIds.push(eventId);
@@ -1035,8 +1035,8 @@ exports.updateLocation = async (req, res) => {
     ]);
     let ledgerKm = Math.round((ledgerAgg[0]?.totalKm || 0) * 100) / 100;
 
-    // Strict Pure GPS Authority: Distance is derived solely from verified geodesic GPS segments
-    currentTotalDistance = ledgerKm;
+    // Strict Pure GPS Authority: Distance is derived solely from verified geodesic GPS segments (strictly non-decreasing)
+    currentTotalDistance = Math.max(currentTotalDistance, ledgerKm);
 
     // Bulk update TrackingPoint statuses
     if (acceptedEventIds.length > 0) {
