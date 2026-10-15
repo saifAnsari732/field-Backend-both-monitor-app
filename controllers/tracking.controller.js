@@ -2119,10 +2119,33 @@ exports.getLiveEmployees = async (req, res) => {
 
     const seenEmpIds = new Set();
     const inactiveToInclude = [];
+    const todayStart = new Date(`${today}T00:00:00.000Z`);
+
     for (const sess of inactiveTodaySessions) {
       const empIdStr = String(sess.employee?._id || sess.employee);
       if (!activeEmpIdSet.has(empIdStr) && !seenEmpIds.has(empIdStr)) {
         seenEmpIds.add(empIdStr);
+
+        // Self-heal: If session was auto-stopped and user never manually punched out, revive it to active!
+        const explicitManualStopLog = await ActivityLog.exists({
+          action: 'TRACKING_STOP',
+          'metadata.sessionId': sess.sessionId,
+          createdAt: { $gte: todayStart }
+        });
+        const isManuallyStopped = Boolean(sess.manuallyStopped === true) || Boolean(explicitManualStopLog);
+
+        if (!isManuallyStopped) {
+          // Restore to active live tracking
+          sess.isActive = true;
+          activeEmpIdSet.add(empIdStr);
+          LiveLocation.updateOne(
+            { _id: sess._id },
+            { $set: { isActive: true, autoClosed: false, manuallyStopped: false, lastActivity: new Date() }, $unset: { endTime: 1 } }
+          ).catch(() => {});
+          User.findByIdAndUpdate(sess.employee?._id || sess.employee, { isTracking: true, isOnline: true }).catch(() => {});
+          Attendance.findOneAndUpdate({ employee: sess.employee?._id || sess.employee, date: today }, { $unset: { checkOut: 1 } }).catch(() => {});
+        }
+
         inactiveToInclude.push(sess);
       }
     }
@@ -2864,21 +2887,13 @@ exports.reconcileAllActiveSessions = async () => {
         const alreadyHasActive = await LiveLocation.exists({ employee: s.employee, date: today, isActive: true });
         if (alreadyHasActive) continue;
       }
-      // 🛑 User Manual Punch Out Guard: If manually stopped, has endTime, or TRACKING_STOP log exists, NEVER touch!
-      const wasManuallyStopped = Boolean(s.manuallyStopped) || Boolean(s.endTime) || Boolean(await ActivityLog.exists({
-        action: 'TRACKING_STOP',
-        $or: [{ 'metadata.sessionId': s.sessionId }, { employee: s.employee }]
-      }));
-      if (wasManuallyStopped) {
-        continue;
-      }
-      const wasAutoStopped = Boolean(s.autoClosed) || Boolean(await ActivityLog.exists({
-        action: 'TRACKING_AUTO_STOPPED',
-        'metadata.sessionId': s.sessionId
-      }));
-      if (wasAutoStopped) {
+      // A session is ONLY manually stopped if s.manuallyStopped is explicitly true
+      const wasManuallyStopped = s.manuallyStopped === true;
+
+      // If it was auto-stopped or never explicitly manually punched out, restore it to ACTIVE!
+      if (!wasManuallyStopped) {
         const updateDoc = {
-          $set: { isActive: true, autoClosed: false, lastActivity: now },
+          $set: { isActive: true, autoClosed: false, manuallyStopped: false, lastActivity: now },
           $unset: { endTime: 1 }
         };
         await LiveLocation.updateOne({ _id: s._id }, updateDoc).catch(() => {});
@@ -2890,10 +2905,9 @@ exports.reconcileAllActiveSessions = async () => {
       }
     }
 
-    // 2. Proactive Shield: Keep lastActivity updated within 25 minutes on all active today sessions
-    // so no legacy 1-hour inactivity cron can ever match or auto-stop an active shift!
-    // (Never pushes fake dummy coordinates to session.coordinates to prevent timeline clutter)
-    const twentyFiveMinAgoMs = now.getTime() - 25 * 60 * 1000;
+    // 2. Proactive Shield: Keep lastActivity updated within 15 minutes on all active today sessions
+    // so active shifts are always kept warm and alive
+    const fifteenMinAgoMs = now.getTime() - 15 * 60 * 1000;
     const activeToday = await LiveLocation.find(
       { date: today, isActive: true },
       { _id: 1, sessionId: 1, employee: 1, totalDistance: 1, manualDistanceAdded: 1, lastActivity: 1 }
@@ -2901,11 +2915,16 @@ exports.reconcileAllActiveSessions = async () => {
 
     for (const s of activeToday) {
       const lastActMs = s.lastActivity ? new Date(s.lastActivity).getTime() : 0;
-      if (lastActMs < twentyFiveMinAgoMs) {
+
+      if (lastActMs < fifteenMinAgoMs) {
         await LiveLocation.updateOne(
           { _id: s._id },
           {
-            $set: { lastActivity: now, autoClosed: false },
+            $set: {
+              lastActivity: now,
+              autoClosed: false,
+              manuallyStopped: false
+            },
             $unset: { endTime: 1 }
           }
         ).catch(() => {});

@@ -24,6 +24,7 @@
     "node-cron": "^4.5.0",
     "node-fetch": "^2.7.0",
     "socket.io": "^4.6.1",
+    "socket.io-client": "^4.8.4",
     "uuid": "^9.0.0"
   },
   "devDependencies": {
