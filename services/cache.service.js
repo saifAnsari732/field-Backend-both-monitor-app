@@ -217,9 +217,11 @@ const acquireDistributedLock = async (resourceKey, ttlMs = 5000, maxWaitMs = 300
   const queued = prev.then(() => gate);
   localLocks.set(resourceKey, queued);
   await prev;
-  return () => {
-    release();
-    if (localLocks.get(resourceKey) === queued) localLocks.delete(resourceKey);
+  return async () => {
+    try {
+      release();
+      if (localLocks.get(resourceKey) === queued) localLocks.delete(resourceKey);
+    } catch (_) {}
   };
 };
 

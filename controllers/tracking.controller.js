@@ -233,6 +233,14 @@ async function reopenIfAutoClosed(sessionId, employeeId) {
 // @desc Update location (bulk coordinates) — AGTRIE-X v12 State-Space Pipeline
 exports.updateLocation = async (req, res) => {
   let releaseSessionLock;
+  const safeRelease = async () => {
+    if (typeof releaseSessionLock === 'function') {
+      try {
+        await releaseSessionLock();
+      } catch (_) {}
+    }
+  };
+
   try {
     let { sessionId, coordinates } = req.body;
     if (!Array.isArray(coordinates) || coordinates.length === 0) {
@@ -332,7 +340,7 @@ exports.updateLocation = async (req, res) => {
         const isDupKey = rawStoreErr.code === 11000 || rawStoreErr.name === 'MongoBulkWriteError' || String(rawStoreErr.message || '').includes('E11000');
         if (!isDupKey) {
           console.error('❌ [RAW_GPS_STORE_ERROR] Failed to persist raw GPS telemetry:', rawStoreErr.message);
-          if (releaseSessionLock) await releaseSessionLock().catch(() => {});
+          await safeRelease();
           return res.status(500).json({ 
             success: false, 
             message: 'Raw GPS persistence failed. Request will be retried by mobile offline queue.',
@@ -358,7 +366,7 @@ exports.updateLocation = async (req, res) => {
         await activeDoc.save();
         console.log(`🛡️ [DATE_ROLLOVER] Auto-closed yesterday session ${sessionId} from ${activeDoc.date} for employee ${req.user._id}`);
       }
-      if (releaseSessionLock) await releaseSessionLock().catch(() => {});
+      await safeRelease();
       return res.json({
         success: true,
         sessionClosed: true,
@@ -380,7 +388,7 @@ exports.updateLocation = async (req, res) => {
           $or: [{ manuallyStopped: true }, { endTime: { $exists: true, $ne: null } }]
         });
         if (hasManuallyStoppedToday) {
-          if (releaseSessionLock) await releaseSessionLock().catch(() => {});
+          await safeRelease();
           return res.json({
             success: true,
             sessionClosed: true,
@@ -424,7 +432,7 @@ exports.updateLocation = async (req, res) => {
             closedSessionLogThrottle.set(sessionId, Date.now());
             console.log(`🛑 [SESSION_CLOSED] Received trailing GPS telemetry for manually ended session ${sessionId}. Discarding.`);
           }
-          if (releaseSessionLock) await releaseSessionLock().catch(() => {});
+          await safeRelease();
           return res.json({ 
             success: true, 
             message: 'Session already ended by user.', 
@@ -507,7 +515,7 @@ exports.updateLocation = async (req, res) => {
     }
 
     if (nonDuplicateCoordinates.length === 0) {
-      if (typeof releaseSessionLock === 'function') await releaseSessionLock();
+      await safeRelease();
       return res.json({ success: true, totalDistance: sessionState.totalDistance || 0, duplicate: true });
     }
 
@@ -1318,7 +1326,7 @@ exports.updateLocation = async (req, res) => {
               { $set: { processingStatus: 'PENDING' } }
             );
           } catch (_) {}
-          if (typeof releaseSessionLock === 'function') await releaseSessionLock();
+          await safeRelease();
           return res.status(503).json({
             success: false,
             retryable: true,
@@ -1571,7 +1579,7 @@ exports.updateLocation = async (req, res) => {
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   } finally {
-    releaseSessionLock?.();
+    await safeRelease();
   }
 };
 
