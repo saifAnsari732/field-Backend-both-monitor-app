@@ -75,10 +75,22 @@ module.exports = (io) => {
         ...data,
       };
 
+      io.to('admins').emit('employee_location', payload);
       if (adminOrgRoom) {
         io.to(adminOrgRoom).to(`org:${orgId}:admins`).to('superadmins').emit('employee_location', payload);
-      } else {
-        io.to('admins').emit('employee_location', payload);
+      }
+      if (user._id) {
+        io.to(`user_${user._id}`).to(String(user._id)).emit('employee_location', payload);
+      }
+    });
+
+    socket.on('admin_broadcast_location', (data) => {
+      io.to('admins').emit('employee_location', data);
+      if (data.organizationId) {
+        io.to(`org_admins_${data.organizationId}`).to(`org:${data.organizationId}:admins`).to('superadmins').emit('employee_location', data);
+      }
+      if (data.employeeId) {
+        io.to(`user_${data.employeeId}`).to(String(data.employeeId)).emit('employee_location', data);
       }
     });
 

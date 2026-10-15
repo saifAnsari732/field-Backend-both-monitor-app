@@ -449,7 +449,12 @@ exports.updateLocation = async (req, res) => {
     if (!sessionState) {
       const lastCoordDb = (activeDoc.coordinates && activeDoc.coordinates[activeDoc.coordinates.length - 1]) || {};
       sessionState = {
-        totalDistance: activeDoc.totalDistance || 0,
+        totalDistance: (activeDoc.officialDistance !== undefined && activeDoc.officialDistance !== null)
+          ? Number(activeDoc.officialDistance)
+          : (Number(activeDoc.totalDistance) || 0),
+        officialDistance: (activeDoc.officialDistance !== undefined && activeDoc.officialDistance !== null)
+          ? Number(activeDoc.officialDistance)
+          : (Number(activeDoc.totalDistance) || 0),
         manualDistanceAdded: activeDoc.manualDistanceAdded || 0,
         date: activeDoc.date,
         lastLat: lastCoordDb.lat || 0,
@@ -523,11 +528,41 @@ exports.updateLocation = async (req, res) => {
     const dbManualAdded = Number(dbLiveDoc?.manualDistanceAdded) || 0;
     const cachedManualAdded = Number(sessionState.manualDistanceAdded) || 0;
 
-    let currentTotalDistance = Math.max(
-      Number(sessionState.totalDistance) || 0,
-      Number(activeDoc?.totalDistance) || 0,
-      Number(activeDoc?.officialDistance) || 0
-    );
+    // Strict Authority: Reconcile starting totalDistance.
+    // If activeDoc.officialDistance or Redis state has been reconciled, ensure it does NOT latch onto
+    // a stale higher sessionState.totalDistance or higher unverified number.
+    let currentTotalDistance = 0;
+    const hasOfficialDistance = activeDoc && activeDoc.officialDistance !== undefined && activeDoc.officialDistance !== null && !isNaN(Number(activeDoc.officialDistance));
+    const docOfficial = hasOfficialDistance ? Number(activeDoc.officialDistance) : null;
+    const hasRedisTotal = sessionState && sessionState.totalDistance !== undefined && sessionState.totalDistance !== null && !isNaN(Number(sessionState.totalDistance));
+    const redisTotal = hasRedisTotal ? Number(sessionState.totalDistance) : null;
+    const hasDocTotal = activeDoc && activeDoc.totalDistance !== undefined && activeDoc.totalDistance !== null && !isNaN(Number(activeDoc.totalDistance));
+    const docTotal = hasDocTotal ? Number(activeDoc.totalDistance) : null;
+
+    if (docOfficial !== null) {
+      currentTotalDistance = docOfficial;
+      // If Redis has advanced due to verified recent points within this session by a small delta (<= 0.5 km), honor it
+      if (redisTotal !== null && redisTotal > docOfficial && (redisTotal - docOfficial) <= 0.5) {
+        currentTotalDistance = redisTotal;
+      } else if (redisTotal !== null && Math.abs(redisTotal - docOfficial) > 0.001) {
+        // Stale or unverified Redis state detected: sync Redis state directly to authoritative officialDistance
+        sessionState.totalDistance = currentTotalDistance;
+        if (sessionState.officialDistance !== undefined) {
+          sessionState.officialDistance = currentTotalDistance;
+        }
+      }
+    } else if (redisTotal !== null && docTotal !== null) {
+      // If no officialDistance set, prevent latching to a massive unverified spike
+      if (Math.abs(redisTotal - docTotal) > 5.0) {
+        currentTotalDistance = Math.min(redisTotal, docTotal);
+      } else {
+        currentTotalDistance = Math.max(redisTotal, docTotal);
+      }
+    } else if (redisTotal !== null) {
+      currentTotalDistance = redisTotal;
+    } else if (docTotal !== null) {
+      currentTotalDistance = docTotal;
+    }
 
     // If an Admin credited or adjusted KM from the Web Monitoring portal during this active shift, apply the delta
     if (Math.abs(dbManualAdded - cachedManualAdded) > 0.001) {
@@ -801,6 +836,28 @@ exports.updateLocation = async (req, res) => {
         continue;
       }
 
+      // 🏓 PING-PONG / OSCILLATION SUPPRESSION:
+      // If employee alternates between two locations (e.g. dual sync streams or cell tower bounce):
+      // If current coordinate jumps far from prevValid (>= 1.5 km) but returns within 600m of prev2Valid within 10 minutes:
+      if (prev2Valid && prevValid && dRawKm >= 1.5) {
+        const prev2Lat = prev2Valid.latRaw ?? prev2Valid.lat;
+        const prev2Lng = prev2Valid.lngRaw ?? prev2Valid.lng;
+        if (Number.isFinite(prev2Lat) && Number.isFinite(prev2Lng)) {
+          const distFromPrev2Km = haversineDistance({ lat: prev2Lat, lng: prev2Lng }, { lat, lng });
+          const timeSincePrev2Secs = (tMs - new Date(prev2Valid.timestamp).getTime()) / 1000;
+          if (distFromPrev2Km <= 0.6 && timeSincePrev2Secs <= 600) {
+            rejectedPoints++;
+            rejectedEventIds.push(eventId);
+            rejectionReasons.push({
+              timestamp,
+              reason: 'PING_PONG_OSCILLATION_REJECTED',
+              lat, lng, accuracy, speed: effectiveSpeedKmh
+            });
+            continue;
+          }
+        }
+      }
+
       // 6. Dual-State Geodesic Movement Engine (AGTRIE-X v14.0 PRO)
       // State 1: STATIONARY (Sitting at desk / home / client meeting) -> Strict 45m Spot Geofence Lock + 0 Fake KM
       // State 2: MOVING (Travelling on road) -> Continuous Step Geodesics (>= 5.0m) + Traffic Light Hold (90s)
@@ -812,13 +869,17 @@ exports.updateLocation = async (req, res) => {
         const departureDistKm = distFromStationaryAnchorM / 1000;
 
         // 🚗 POINT A TO POINT B HIGHWAY / POCKET-SLEEP GAP RECOVERY (>= 1.5 KM):
-        // If employee was stationary at Point A (e.g. morning home) and travels to Point B (e.g. 47 KM away in Maharajganj):
-        // Background heartbeats may have arrived with dt=60s, falsely calculating speed as 2800 km/h (teleportation).
-        // Check session elapsed duration since start: if overall average speed <= 160 km/h, this is genuine road travel!
-        const sessionStartTime = activeDoc?.startTime ? new Date(activeDoc.startTime).getTime() : (tMs - 3600000);
-        const sessionElapsedHours = Math.max((tMs - sessionStartTime) / 3600000, 0.25);
-        const overallAvgSpeedKmh = departureDistKm / sessionElapsedHours;
-        const isPointAToBHighwayTravel = departureDistKm >= 1.5 && overallAvgSpeedKmh <= 160.0 && accuracy <= 350;
+        // If employee was stationary at Point A and travels to Point B across town/highway:
+        // Physical road velocity check: calculate speed using time elapsed since the last trusted fix (dt)
+        // Strict kinematics: To cover departureDistKm (>= 1.5 km), step speed MUST be between 2 km/h and 150 km/h
+        // AND dt must be at least 60 seconds (prevents supersonic sub-minute teleportation jumps!)
+        const stepDtHours = dt / 3600;
+        const stepSpeedKmh = stepDtHours > 0 ? (departureDistKm / stepDtHours) : 0;
+        const isPointAToBHighwayTravel = departureDistKm >= 1.5 &&
+          stepSpeedKmh >= 2.0 &&
+          stepSpeedKmh <= 150.0 &&
+          dt >= 60 &&
+          accuracy <= 350;
 
         // In STATIONARY state: Protect against indoor Wi-Fi/cell jitter (0.000 KM added)
         // Breakout requires:
@@ -851,28 +912,53 @@ exports.updateLocation = async (req, res) => {
             let stepRoadKm = departureDistKm;
             let stepReason = 'AGTRIE_X_V14_DEPARTURE_BREAKOUT_ACCEPTED';
             if (departureDistKm > 1.5) {
-              const roadRes = await getRoadDistance(centroidLat, centroidLng, lat, lng);
-              stepRoadKm = roadRes.distanceKm > 0 ? roadRes.distanceKm : Math.round(departureDistKm * 1.20 * 100) / 100;
-              stepReason = 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED';
+              const isDuplicateGapSegment = ledgerSegments.some(s => 
+                s.reason === 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED' &&
+                Math.abs(new Date(s.toTimestamp).getTime() - timestamp.getTime()) < 5 * 60 * 1000
+              );
+              let existingGapInDb = null;
+              if (!isDuplicateGapSegment) {
+                existingGapInDb = await DistanceLedger.findOne({
+                  sessionId,
+                  classification: 'ACCEPTED',
+                  reason: 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED',
+                  $or: [
+                    { fromEventId: safeFromEventId },
+                    { toTimestamp: { $gte: new Date(timestamp.getTime() - 5 * 60 * 1000), $lte: new Date(timestamp.getTime() + 5 * 60 * 1000) } }
+                  ]
+                }).lean();
+              }
+
+              if (isDuplicateGapSegment || existingGapInDb) {
+                console.log(`⚠️ [GAP_COLLISION_PREVENTED] Duplicate departure gap segment detected for session ${sessionId} at ${timestamp.toISOString()}. Ignored.`);
+                stepRoadKm = 0;
+                stepReason = 'DUPLICATE_GAP_COLLISION_IGNORED';
+              } else {
+                const roadRes = await getRoadDistance(centroidLat, centroidLng, lat, lng);
+                stepRoadKm = roadRes.distanceKm > 0 ? roadRes.distanceKm : Math.round(departureDistKm * 1.20 * 100) / 100;
+                stepReason = 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED';
+              }
             }
-            ledgerSegments.push({
-              organizationId: orgId,
-              employee: req.user._id,
-              sessionId,
-              fromEventId: safeFromEventId,
-              toEventId: eventId,
-              fromTimestamp: new Date(lastTrustedMs),
-              toTimestamp: timestamp,
-              fromLat: centroidLat,
-              fromLng: centroidLng,
-              toLat: lat,
-              toLng: lng,
-              distanceMeters: Math.round(stepRoadKm * 1000),
-              distanceKm: Math.round(stepRoadKm * 1000) / 1000,
-              classification: 'ACCEPTED',
-              reason: stepReason,
-              algorithmVersion: 'AGTRIE-X-v15.0-ROAD-PRO'
-            });
+            if (stepRoadKm > 0) {
+              ledgerSegments.push({
+                organizationId: orgId,
+                employee: req.user._id,
+                sessionId,
+                fromEventId: safeFromEventId,
+                toEventId: eventId,
+                fromTimestamp: new Date(lastTrustedMs),
+                toTimestamp: timestamp,
+                fromLat: centroidLat,
+                fromLng: centroidLng,
+                toLat: lat,
+                toLng: lng,
+                distanceMeters: Math.round(stepRoadKm * 1000),
+                distanceKm: Math.round(stepRoadKm * 1000) / 1000,
+                classification: 'ACCEPTED',
+                reason: stepReason,
+                algorithmVersion: 'AGTRIE-X-v15.0-ROAD-PRO'
+              });
+            }
           }
 
           centroidLat = lat;
@@ -1036,36 +1122,57 @@ exports.updateLocation = async (req, res) => {
           const gapDistKm = dRawKm;
           const dtHours = dt / 3600;
           const gapSpeedKmh = dtHours > 0 ? (gapDistKm / dtHours) : 0;
-          const isPlausibleHighwaySpeed = gapSpeedKmh <= 150.0 || dt >= 180;
+          const isPlausibleHighwaySpeed = gapSpeedKmh <= 150.0 && gapSpeedKmh >= 2.0 && dt >= 60;
 
           if (isPlausibleHighwaySpeed && accuracy <= 350) {
-            const roadRes = await getRoadDistance(anchorLat, anchorLng, lat, lng);
-            const roadKm = roadRes.distanceKm > 0 ? roadRes.distanceKm : Math.round(gapDistKm * 1.20 * 100) / 100;
+            const isDuplicateGapSegment = ledgerSegments.some(s => 
+              s.reason === 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED' &&
+              Math.abs(new Date(s.toTimestamp).getTime() - timestamp.getTime()) < 5 * 60 * 1000
+            );
+            let existingGapInDb = null;
+            if (!isDuplicateGapSegment) {
+              existingGapInDb = await DistanceLedger.findOne({
+                sessionId,
+                classification: 'ACCEPTED',
+                reason: 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED',
+                $or: [
+                  { fromEventId: safeFromEventId },
+                  { toTimestamp: { $gte: new Date(timestamp.getTime() - 5 * 60 * 1000), $lte: new Date(timestamp.getTime() + 5 * 60 * 1000) } }
+                ]
+              }).lean();
+            }
 
-            acceptedPoints++;
-            acceptedEventIds.push(eventId);
-            prevTimestamp = tMs;
-            relockCandidate = null;
+            if (isDuplicateGapSegment || existingGapInDb) {
+              console.log(`⚠️ [GAP_COLLISION_PREVENTED] Duplicate highway gap segment detected for session ${sessionId} at ${timestamp.toISOString()}. Ignored.`);
+            } else {
+              const roadRes = await getRoadDistance(anchorLat, anchorLng, lat, lng);
+              const roadKm = roadRes.distanceKm > 0 ? roadRes.distanceKm : Math.round(gapDistKm * 1.20 * 100) / 100;
 
-            const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
-            ledgerSegments.push({
-              organizationId: orgId,
-              employee: req.user._id,
-              sessionId,
-              fromEventId: safeFromEventId,
-              toEventId: eventId,
-              fromTimestamp: new Date(lastTrustedMs),
-              toTimestamp: timestamp,
-              fromLat: anchorLat,
-              fromLng: anchorLng,
-              toLat: lat,
-              toLng: lng,
-              distanceMeters: Math.round(roadKm * 1000),
-              distanceKm: roadKm,
-              classification: 'ACCEPTED',
-              reason: 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED',
-              algorithmVersion: 'AGTRIE-X-v15.0-ROAD-PRO'
-            });
+              acceptedPoints++;
+              acceptedEventIds.push(eventId);
+              prevTimestamp = tMs;
+              relockCandidate = null;
+
+              const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
+              ledgerSegments.push({
+                organizationId: orgId,
+                employee: req.user._id,
+                sessionId,
+                fromEventId: safeFromEventId,
+                toEventId: eventId,
+                fromTimestamp: new Date(lastTrustedMs),
+                toTimestamp: timestamp,
+                fromLat: anchorLat,
+                fromLng: anchorLng,
+                toLat: lat,
+                toLng: lng,
+                distanceMeters: Math.round(roadKm * 1000),
+                distanceKm: roadKm,
+                classification: 'ACCEPTED',
+                reason: 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED',
+                algorithmVersion: 'AGTRIE-X-v15.0-ROAD-PRO'
+              });
+            }
 
             centroidLat = lat;
             centroidLng = lng;
@@ -1228,13 +1335,11 @@ exports.updateLocation = async (req, res) => {
     ]);
     let ledgerKm = Math.round((ledgerAgg[0]?.totalKm || 0) * 100) / 100;
 
-    // Strict Pure GPS Authority: Distance is derived solely from verified geodesic GPS segments (strictly non-decreasing)
-    currentTotalDistance = Math.max(currentTotalDistance, ledgerKm);
-
-    // Dual-Screen Zero-Lag Bridge: If mobile device accumulated verified offline movement, reconcile to prevent any manager-employee lag
-    const maxClientScreenKm = nonDuplicateCoordinates.reduce((max, c) => Math.max(max, Number(c?.screenDistanceKm) || 0), 0);
-    if (maxClientScreenKm > currentTotalDistance && (maxClientScreenKm - currentTotalDistance) <= 150.0) {
-      currentTotalDistance = Math.round(maxClientScreenKm * 100) / 100;
+    // Strict Pure GPS Authority: Distance is derived solely from verified geodesic GPS segments
+    if (ledgerKm > 0) {
+      currentTotalDistance = Math.round((ledgerKm + dbManualAdded) * 100) / 100;
+    } else {
+      currentTotalDistance = Math.max(currentTotalDistance, ledgerKm);
     }
 
     // Bulk update TrackingPoint statuses
@@ -1403,7 +1508,7 @@ exports.updateLocation = async (req, res) => {
       { totalDistance: 1, officialDistance: 1 }
     ).lean().catch(() => []);
     const otherSessionsKm = (otherTodaySessions || []).reduce(
-      (sum, s) => sum + (Math.max(Number(s.totalDistance) || 0, Number(s.officialDistance) || 0)),
+      (sum, s) => sum + (s.officialDistance !== undefined && s.officialDistance !== null ? Number(s.officialDistance) : (Number(s.totalDistance) || 0)),
       0
     );
     const roundedDayKm = Math.round((currentTotalDistance + otherSessionsKm) * 100) / 100;
@@ -2071,8 +2176,10 @@ exports.getLiveEmployees = async (req, res) => {
         cleanKm = Math.round(todayCleanDistKm * 100) / 100;
       }
       
-      const existingKm = Number(loc.totalDistance) || Number(loc.officialDistance) || 0;
-      const currentSessionKm = Math.round(Math.max(existingKm, cleanKm) * 100) / 100;
+      const hasOfficial = loc.officialDistance !== undefined && loc.officialDistance !== null && !isNaN(Number(loc.officialDistance));
+      const currentSessionKm = hasOfficial
+        ? Math.round(Number(loc.officialDistance) * 100) / 100
+        : Math.round(Math.max(Number(loc.totalDistance) || 0, cleanKm) * 100) / 100;
 
       // Also sum any earlier sessions completed today by the same employee so multi-session days never drop KM
       const empId = loc.employee?._id || loc.employee;
@@ -2081,7 +2188,7 @@ exports.getLiveEmployees = async (req, res) => {
         { totalDistance: 1, officialDistance: 1 }
       ).lean().catch(() => []);
       const earlierKm = (earlierTodaySessions || []).reduce(
-        (sum, s) => sum + Math.max(Number(s.totalDistance) || 0, Number(s.officialDistance) || 0),
+        (sum, s) => sum + (s.officialDistance !== undefined && s.officialDistance !== null ? Number(s.officialDistance) : (Number(s.totalDistance) || 0)),
         0
       );
 
@@ -2815,7 +2922,7 @@ exports.reconcileAllActiveSessions = async () => {
       const ledgerKm = Math.round((ledgerAgg[0]?.totalKm || 0) * 100) / 100;
       const manualAdded = Number(s.manualDistanceAdded) || 0;
       const authoritativeKm = Math.round((ledgerKm + manualAdded) * 100) / 100;
-      if (authoritativeKm > (Number(s.totalDistance) || 0)) {
+      if (Math.abs(authoritativeKm - (Number(s.totalDistance) || 0)) > 0.05) {
         await LiveLocation.updateOne(
           { _id: s._id },
           {
