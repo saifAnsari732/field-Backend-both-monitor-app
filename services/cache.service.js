@@ -138,6 +138,25 @@ const deleteCache = async (key) => {
   }
 };
 
+const deleteCacheByPrefix = async (prefix) => {
+  try {
+    const keys = memCache.keys();
+    for (const k of keys) {
+      if (k.startsWith(prefix)) {
+        memCache.del(k);
+      }
+    }
+  } catch (_) {}
+  if (redisAvailable && redisClient) {
+    try {
+      const keys = await redisClient.keys(`${prefix}*`);
+      if (Array.isArray(keys) && keys.length > 0) {
+        await redisClient.del(...keys);
+      }
+    } catch (_) {}
+  }
+};
+
 // ─── Distance Tracking Helpers (Redis-native atomic increment) ────────────────
 /**
  * Get current distance for a session from Redis / mem-cache.
@@ -268,6 +287,7 @@ module.exports = {
   getCache,
   setCache,
   deleteCache,
+  deleteCacheByPrefix,
   getSessionState,
   saveSessionState,
   incrementSessionDistance,

@@ -4,6 +4,7 @@ const { v4: uuidv4 } = require('uuid');
 const {
   liveCache,
   deleteCache,
+  deleteCacheByPrefix,
   saveSessionState,
   getSessionState,
   incrementSessionDistance,
@@ -88,6 +89,12 @@ exports.startTracking = async (req, res) => {
           { employee: req.user._id, date: today },
           { $unset: { checkOut: 1 } }
         ).catch(() => {});
+        await Promise.all([
+          deleteCacheByPrefix('live_locations_'),
+          deleteCacheByPrefix('admin_employees_'),
+          deleteCacheByPrefix('admin_dashboard_stats_'),
+          deleteCache(`emp_dashboard_stats_${req.user._id}`),
+        ]).catch(() => {});
         return res.status(200).json({
           success: true,
           message: 'Active shift resumed.',
@@ -121,11 +128,13 @@ exports.startTracking = async (req, res) => {
       lastTs: new Date().toISOString(),
     });
 
-    // Invalidate live location caches
-    const userOrgId = req.user.organizationId?._id || req.user.organizationId;
-    if (userOrgId) await deleteCache(`live_locations_${userOrgId}`);
-    await deleteCache(`live_locations_${req.user._id}`);
-    await deleteCache('live_locations_all');
+    // Invalidate live location & admin caches
+    await Promise.all([
+      deleteCacheByPrefix('live_locations_'),
+      deleteCacheByPrefix('admin_employees_'),
+      deleteCacheByPrefix('admin_dashboard_stats_'),
+      deleteCache(`emp_dashboard_stats_${req.user._id}`),
+    ]).catch(() => {});
 
     // If geocode finishes later, update the session
     addressPromise.then(async (realAddr) => {
@@ -706,16 +715,16 @@ exports.updateLocation = async (req, res) => {
         //    uploaded coordinate is 25m-500m from the stationary anchor, so dividing by 4.5 hours (dt=16200s)
         //    previously gave gapSpeedKmh = 0.01 km/h (< 1.5 km/h) and rejected the movement!
         // 2. Long Gap Travel Recovery (> 0.15km): Phone slept while employee traveled across town.
-        const isStationaryDeparture = dGapKm >= 0.020 && dGapKm <= 3.5 && accuracy <= 300;
-        const isGapTravelRecovery = dGapKm >= 0.050 && gapSpeedKmh <= 160.0 && accuracy <= 300;
+        const isStationaryDeparture = dGapKm >= 0.035 && dGapKm <= 3.5 && accuracy <= 250;
+        const isGapTravelRecovery = dGapKm >= 0.050 && gapSpeedKmh <= 160.0 && accuracy <= 250;
 
         if (isStationaryDeparture || isGapTravelRecovery) {
           acceptedPoints++;
           acceptedEventIds.push(eventId);
           prevTimestamp = tMs;
 
-          // Apply 1.12x road curvature compensation for long sleep/offline gaps (>= 300m) so straight-line chords never lose curve KM
-          const effectiveGapKm = dGapKm >= 0.300 ? Math.round(dGapKm * 1.12 * 1000) / 1000 : dGapKm;
+          // Pure Haversine GPS distance without artificial inflation multipliers
+          const effectiveGapKm = Math.round(dGapKm * 1000) / 1000;
 
           const effectiveResumeSpeed = Math.max(reportedSpeedKmh, gapSpeedKmh, 5.0);
           if (effectiveResumeSpeed > batchMaxSpeed && effectiveResumeSpeed <= 160) {
@@ -815,11 +824,11 @@ exports.updateLocation = async (req, res) => {
       const toKmh = (s) => (Number(s) > 0 ? (Number(s) <= 60 ? Number(s) * 3.6 : Number(s)) : 0);
       const reportedSpeedKmh = toKmh(coord.speed);
       const isClientStationary = coord.motionState === 'STATIONARY' || coord.screenMoving === false;
-      // Do NOT calculate artificial speed from dividing small sub-25m indoor noise by small seconds!
-      const rawCalcSpeedKmh = (dt > 0 && (distM >= 25.0 || reportedSpeedKmh >= 2.0)) ? (dRawKm / dt) * 3600 : 0;
+      // Do NOT calculate artificial speed from dividing small sub-30m indoor noise by small seconds!
+      const rawCalcSpeedKmh = (dt > 0 && (distM >= 30.0 || reportedSpeedKmh >= 2.5)) ? (dRawKm / dt) * 3600 : 0;
       const prevWasMoving = (Number(prevValid?.speedKmh) || 0) >= 3.0;
       const stepWindowSecs = Math.min(dt, Math.max(stepDt, 4.0), 20.0);
-      const stepCalcSpeedKmh = (!prevWasMoving && distM >= 12.0 && stepWindowSecs > 0)
+      const stepCalcSpeedKmh = (!prevWasMoving && distM >= 30.0 && stepWindowSecs > 0)
         ? Math.min((dRawKm / stepWindowSecs) * 3600, 65.0)
         : 0;
       const effectiveSpeedKmh = Math.max(reportedSpeedKmh, rawCalcSpeedKmh, stepCalcSpeedKmh);
@@ -829,16 +838,16 @@ exports.updateLocation = async (req, res) => {
       }
 
       // 🛑 STRICT IDENTICAL COORDINATE / ZERO-DISPLACEMENT GUARD:
-      // Agar client se identical ya near-identical coordinate mil rahe hain (< 1.2m delta ya dRawKm == 0):
+      // Agar client se identical ya near-identical coordinate mil rahe hain (< 3.0m delta ya dRawKm == 0):
       // 1. Distance bilkul 0 KM add hogi (no fake jitter or duplicate coordinate accumulation)
       // 2. Centroid update nahi hoga
       // 3. Keepalive timestamp update hoga taki session disconnected na ho
-      const isIdenticalToAnchor = distM < 1.2 || (
-        Math.abs(lat - anchorLat) < 0.000010 &&
-        Math.abs(lng - anchorLng) < 0.000010
+      const isIdenticalToAnchor = distM < 3.0 || (
+        Math.abs(lat - anchorLat) < 0.000020 &&
+        Math.abs(lng - anchorLng) < 0.000020
       );
 
-      if (isIdenticalToAnchor && effectiveSpeedKmh < 1.8) {
+      if (isIdenticalToAnchor && reportedSpeedKmh < 2.5) {
         // Coordinate is the same: Employee is stopped at the spot. Zero KM added.
         lastValidTimestamp = Math.max(lastValidTimestamp, tMs);
         continue;
@@ -867,44 +876,30 @@ exports.updateLocation = async (req, res) => {
       }
 
       // 6. Dual-State Geodesic Movement Engine (AGTRIE-X v14.0 PRO)
-      // State 1: STATIONARY (Sitting at desk / home / client meeting) -> Strict 45m Spot Geofence Lock + 0 Fake KM
-      // State 2: MOVING (Travelling on road) -> Continuous Step Geodesics (>= 5.0m) + Traffic Light Hold (90s)
+      // State 1: STATIONARY (Sitting at desk / home / client meeting) -> Strict 35m Spot Geofence Lock + 0 Fake KM
+      // State 2: MOVING (Travelling on road) -> Pure Haversine Step Geodesics (>= 8.0m) + Traffic Light Hold (45s)
       const distFromStationaryAnchorM = haversineDistance({ lat: centroidLat, lng: centroidLng }, { lat, lng }) * 1000;
-      const isCoarseJump = accuracy > (coord.screenMoving === true ? 300 : 240);
+      const isCoarseJump = accuracy > (coord.screenMoving === true ? 250 : 200);
       const isTeleportation = effectiveSpeedKmh > 180.0 || isCoarseJump;
 
       if (currentMotionState === 'STATIONARY') {
         const departureDistKm = distFromStationaryAnchorM / 1000;
 
         // 🚗 POINT A TO POINT B HIGHWAY / POCKET-SLEEP GAP RECOVERY (>= 1.5 KM):
-        // If employee was stationary at Point A and travels to Point B across town/highway:
-        // Physical road velocity check: calculate speed using time elapsed since the last trusted fix (dt)
-        // Strict kinematics: To cover departureDistKm (>= 1.5 km), step speed MUST be between 2 km/h and 150 km/h
-        // AND dt must be at least 60 seconds (prevents supersonic sub-minute teleportation jumps!)
         const stepDtHours = dt / 3600;
         const stepSpeedKmh = stepDtHours > 0 ? (departureDistKm / stepDtHours) : 0;
         const isPointAToBHighwayTravel = departureDistKm >= 1.5 &&
           stepSpeedKmh >= 2.0 &&
           stepSpeedKmh <= 150.0 &&
           dt >= 60 &&
-          accuracy <= 350;
+          accuracy <= 250;
 
-        // In STATIONARY state: Protect against indoor Wi-Fi/cell jitter (0.000 KM added)
-        // Breakout requires:
-        // 1. Point A to Point B highway gap (>= 1.5 KM with plausible shift duration), OR
-        // 2. Mobile screen confirmed moving with displacement >= 18m, OR
-        // 3. Genuine displacement >= 25m with speed >= 2.0 km/h, OR
-        // 4. Clear departure step >= 35m with acceptable accuracy
-        const isClientMoving = coord.screenMoving === true ||
-          coord.motionState === 'MOVING' || coord.motionState === 'WALKING' ||
-          coord.motionState === 'BIKE' || coord.motionState === 'VEHICLE' ||
-          effectiveSpeedKmh >= 1.5;
-
+        // In STATIONARY state: Strictly block all indoor/stationary GPS jitter (< 35m unless hardware Doppler speed >= 3.0 km/h with >= 22m move)
         const hasBreakoutTravel = isPointAToBHighwayTravel || ((
-          (isClientMoving && distFromStationaryAnchorM >= 14.0) ||
-          (distFromStationaryAnchorM >= 18.0 && (reportedSpeedKmh >= 1.5 || effectiveSpeedKmh >= 1.5)) ||
-          (distFromStationaryAnchorM >= 25.0 && accuracy <= 300)
-        ) && accuracy <= 320);
+          (distFromStationaryAnchorM >= 22.0 && reportedSpeedKmh >= 3.0 && accuracy <= 100) ||
+          (distFromStationaryAnchorM >= 35.0 && (reportedSpeedKmh >= 2.0 || effectiveSpeedKmh >= 3.0) && accuracy <= 200) ||
+          (distFromStationaryAnchorM >= 50.0 && accuracy <= 220)
+        ) && !isClientStationary);
 
         if (hasBreakoutTravel && (!isTeleportation || isPointAToBHighwayTravel)) {
           // 🚗 DEPARTURE CONFIRMED: Transition from STATIONARY to MOVING!
@@ -916,9 +911,12 @@ exports.updateLocation = async (req, res) => {
 
           const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
 
-          if (departureDistKm >= 0.020) {
-            let stepRoadKm = departureDistKm;
-            let stepReason = 'AGTRIE_X_V14_DEPARTURE_BREAKOUT_ACCEPTED';
+          if (departureDistKm >= 0.022) {
+            let stepRoadKm = Math.round(departureDistKm * 1000) / 1000;
+            let stepReason = departureDistKm > 1.5
+              ? 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED'
+              : 'AGTRIE_X_V14_DEPARTURE_BREAKOUT_ACCEPTED';
+
             if (departureDistKm > 1.5) {
               const isDuplicateGapSegment = ledgerSegments.some(s => 
                 s.reason === 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED' &&
@@ -941,12 +939,9 @@ exports.updateLocation = async (req, res) => {
                 console.log(`⚠️ [GAP_COLLISION_PREVENTED] Duplicate departure gap segment detected for session ${sessionId} at ${timestamp.toISOString()}. Ignored.`);
                 stepRoadKm = 0;
                 stepReason = 'DUPLICATE_GAP_COLLISION_IGNORED';
-              } else {
-                const roadRes = await getRoadDistance(centroidLat, centroidLng, lat, lng);
-                stepRoadKm = roadRes.distanceKm > 0 ? roadRes.distanceKm : Math.round(departureDistKm * 1.20 * 100) / 100;
-                stepReason = 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED';
               }
             }
+
             if (stepRoadKm > 0) {
               ledgerSegments.push({
                 organizationId: orgId,
@@ -961,10 +956,10 @@ exports.updateLocation = async (req, res) => {
                 toLat: lat,
                 toLng: lng,
                 distanceMeters: Math.round(stepRoadKm * 1000),
-                distanceKm: Math.round(stepRoadKm * 1000) / 1000,
+                distanceKm: stepRoadKm,
                 classification: 'ACCEPTED',
                 reason: stepReason,
-                algorithmVersion: 'AGTRIE-X-v15.0-ROAD-PRO'
+                algorithmVersion: 'AGTRIE-X-v15.0-PURE-GPS'
               });
             }
           }
@@ -1023,9 +1018,12 @@ exports.updateLocation = async (req, res) => {
         }
       } else {
         // CURRENT STATE: MOVING ON ROAD
-        // While moving, consecutive road points are typically 10m-60m apart.
-        // Measure continuous geodesic step from last valid committed coordinate!
+        // Measure continuous pure Haversine geodesic step from last valid committed coordinate!
         const stepDistM = distM;
+        // In MOVING state: If reported speed < 2.5 km/h AND calculated speed < 2.8 km/h,
+        // any displacement < 35m is STOPPED JITTER (traffic light, parking, customer visit, sitting at desk).
+        const isLowSpeedStop = (reportedSpeedKmh < 2.5 && effectiveSpeedKmh < 2.8);
+        const isStoppedJitter = (stepDistM < 8.0) || (isLowSpeedStop && stepDistM < 35.0) || (isClientStationary && stepDistM < 35.0);
 
         if (isTeleportation) {
           // Outlier jump > 180 km/h: discard
@@ -1040,44 +1038,29 @@ exports.updateLocation = async (req, res) => {
             reason: isCoarseJump ? 'LOW_ACCURACY_COARSE_JUMP' : 'TELEPORTATION_OR_STEP_LIMIT_EXCEEDED',
             lat, lng, accuracy, speed: effectiveSpeedKmh
           });
-        } else if (stepDistM < 5.0) {
-          // Micro-movement / Stopped at light / brief pause (< 5.0m):
-          if (dt < 90) {
-            // Traffic stop (< 90 seconds): Hold anchor and state intact so route NEVER breaks!
+          continue;
+        } else if (isStoppedJitter) {
+          // Micro-movement / Stopped at light / brief pause:
+          if (dt < 45 && !isClientStationary) {
+            // Brief traffic stop (< 45 seconds): Hold anchor and state intact so route NEVER breaks, 0 KM added
             acceptedEventIds.push(eventId);
           } else {
-            // Stopped for >= 90 seconds: Arrived at destination or prolonged stop!
+            // Stopped for >= 45 seconds or client stationary: Arrived at destination or prolonged stop!
             currentMotionState = 'STATIONARY';
             centroidLat = lat;
             centroidLng = lng;
             acceptedEventIds.push(eventId);
           }
-        } else if (stepDistM >= 5.0 && stepDistM <= 2500) {
-          // Valid continuous road step!
+          continue;
+        } else if (stepDistM >= 8.0 && stepDistM <= 2500) {
+          // Valid continuous road step — Pure Haversine GPS distance (no artificial curve multipliers!)
           acceptedPoints++;
           acceptedEventIds.push(eventId);
           prevTimestamp = tMs;
           relockCandidate = null;
 
           const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
-
-          // Road Curvature & Arc Length Compensation:
-          // Straight-line chords cut through corners and curves, causing a 10%-15% distance shortfall on 18km trips.
-          // Apply heading-aware curve compensation ONLY during active vehicle travel (speed >= 8 km/h and step >= 20m):
-          let effectiveStepDistKm = dRawKm;
-          if (effectiveSpeedKmh >= 8.0 && stepDistM >= 20.0) {
-            const h1 = Number(prevValid?.heading);
-            const h2 = Number(coord?.heading);
-            let curveFactor = 1.04;
-            if (Number.isFinite(h1) && Number.isFinite(h2) && h1 >= 0 && h2 >= 0) {
-              const diff = Math.abs(h2 - h1);
-              const headingDelta = Math.min(diff, 360 - diff);
-              if (headingDelta >= 25 && headingDelta <= 135) {
-                curveFactor = Math.min(1.10, 1.0 + (headingDelta / 90) * 0.08);
-              }
-            }
-            effectiveStepDistKm = Math.round(dRawKm * curveFactor * 1000) / 1000;
-          }
+          const effectiveStepDistKm = Math.round(dRawKm * 1000) / 1000;
 
           ledgerSegments.push({
             organizationId: orgId,
@@ -1095,7 +1078,7 @@ exports.updateLocation = async (req, res) => {
             distanceKm: effectiveStepDistKm,
             classification: 'ACCEPTED',
             reason: 'AGTRIE_X_V14_ROAD_STEP_ACCEPTED',
-            algorithmVersion: 'AGTRIE-X-v14.0-PRO'
+            algorithmVersion: 'AGTRIE-X-v15.0-PURE-GPS'
           });
 
           centroidLat = lat;
@@ -1126,13 +1109,13 @@ exports.updateLocation = async (req, res) => {
             timestamp: timestamp.toISOString()
           });
         } else if (stepDistM > 2500) {
-          // ── HIGHWAY / POCKET SLEEP GAP: POINT A TO POINT B ROAD RECOVERY ──
+          // ── HIGHWAY / POCKET SLEEP GAP: PURE GPS DISTANCE ──
           const gapDistKm = dRawKm;
           const dtHours = dt / 3600;
           const gapSpeedKmh = dtHours > 0 ? (gapDistKm / dtHours) : 0;
           const isPlausibleHighwaySpeed = gapSpeedKmh <= 150.0 && gapSpeedKmh >= 2.0 && dt >= 60;
 
-          if (isPlausibleHighwaySpeed && accuracy <= 350) {
+          if (isPlausibleHighwaySpeed && accuracy <= 250) {
             const isDuplicateGapSegment = ledgerSegments.some(s => 
               s.reason === 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED' &&
               Math.abs(new Date(s.toTimestamp).getTime() - timestamp.getTime()) < 5 * 60 * 1000
@@ -1153,8 +1136,7 @@ exports.updateLocation = async (req, res) => {
             if (isDuplicateGapSegment || existingGapInDb) {
               console.log(`⚠️ [GAP_COLLISION_PREVENTED] Duplicate highway gap segment detected for session ${sessionId} at ${timestamp.toISOString()}. Ignored.`);
             } else {
-              const roadRes = await getRoadDistance(anchorLat, anchorLng, lat, lng);
-              const roadKm = roadRes.distanceKm > 0 ? roadRes.distanceKm : Math.round(gapDistKm * 1.20 * 100) / 100;
+              const roadKm = Math.round(gapDistKm * 1000) / 1000;
 
               acceptedPoints++;
               acceptedEventIds.push(eventId);
@@ -1178,7 +1160,7 @@ exports.updateLocation = async (req, res) => {
                 distanceKm: roadKm,
                 classification: 'ACCEPTED',
                 reason: 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED',
-                algorithmVersion: 'AGTRIE-X-v15.0-ROAD-PRO'
+                algorithmVersion: 'AGTRIE-X-v15.0-PURE-GPS'
               });
             }
 
@@ -1292,6 +1274,7 @@ exports.updateLocation = async (req, res) => {
           reason: isCoarseJump ? 'LOW_ACCURACY_COARSE_JUMP' : 'TELEPORTATION_OR_STEP_LIMIT_EXCEEDED',
           lat, lng, accuracy, speed: effectiveSpeedKmh
         });
+        continue;
       }
     }
 
@@ -1343,12 +1326,9 @@ exports.updateLocation = async (req, res) => {
     ]);
     let ledgerKm = Math.round((ledgerAgg[0]?.totalKm || 0) * 100) / 100;
 
-    // Strict Pure GPS Authority: Distance is derived solely from verified geodesic GPS segments
-    if (ledgerKm > 0) {
-      currentTotalDistance = Math.round((ledgerKm + dbManualAdded) * 100) / 100;
-    } else {
-      currentTotalDistance = Math.max(currentTotalDistance, ledgerKm);
-    }
+    // Strict Pure GPS Authority: Distance is derived solely from verified geodesic GPS segments in DistanceLedger (+ any manual admin adjustment)
+    const authoritativeSessionKm = Math.round((ledgerKm + dbManualAdded) * 100) / 100;
+    currentTotalDistance = ledgerKm > 0 ? authoritativeSessionKm : Math.max(currentTotalDistance, authoritativeSessionKm);
 
     // Bulk update TrackingPoint statuses
     if (acceptedEventIds.length > 0) {
@@ -1449,7 +1429,7 @@ exports.updateLocation = async (req, res) => {
         lastActivity: new Date(),
         motionState: currentMotionState,
         averageAccuracy: runningAvgAccuracy,
-        algorithmVersion: 'AGTRIE-X-v10.0-PRO',
+        algorithmVersion: 'AGTRIE-X-v15.0-PURE-GPS',
       };
       if (validClientAddress) {
         setPayload.currentAddress = validClientAddress;
@@ -1540,9 +1520,13 @@ exports.updateLocation = async (req, res) => {
       speed: Math.round(finalSpeedKmh),
       address: validClientAddress || dbLiveDoc?.currentAddress || '',
       totalDistance: roundedDayKm,
+      totalDistanceToday: roundedDayKm,
+      todayKm: roundedDayKm,
       sessionDistance: currentTotalDistance,
       sessionId,
-      motionState: currentMotionState
+      motionState: currentMotionState,
+      isActive: true,
+      isTracking: true
     };
     if (io) {
       io.to('admins').emit('employee_location', locationPayload);
@@ -1553,20 +1537,20 @@ exports.updateLocation = async (req, res) => {
       io.to('user_' + req.user._id).to(String(req.user._id)).emit('employee_location', locationPayload);
     }
 
-    // Invalidate live location & dashboard caches so admin/manager UI updates instantly
-    if (orgId) {
-      await deleteCache(`live_locations_${orgId}`).catch(() => {});
-      await deleteCache(`admin_dashboard_${orgId}`).catch(() => {});
-    }
-    await deleteCache(`live_locations_${req.user._id}`).catch(() => {});
-    await deleteCache(`emp_dashboard_stats_${req.user._id}`).catch(() => {});
-    await deleteCache('live_locations_all').catch(() => {});
+    // Invalidate all live location, employee directory & dashboard caches so admin/manager UI updates instantly
+    await Promise.all([
+      deleteCacheByPrefix('live_locations_'),
+      deleteCacheByPrefix('admin_employees_'),
+      deleteCacheByPrefix('admin_dashboard_stats_'),
+      deleteCache(`emp_dashboard_stats_${req.user._id}`),
+    ]).catch(() => {});
 
     res.json({ 
       success: true, 
       sessionId,
       totalDistance: currentTotalDistance, 
       totalDistanceToday: roundedDayKm,
+      todayKm: roundedDayKm,
       motionState: currentMotionState, 
       audit: {
         rawGpsDistance: currentTotalDistance,
@@ -1617,33 +1601,25 @@ exports.stopTracking = async (req, res) => {
     session.isActive = false;
     session.endTime = new Date();
 
-    // Authoritative distance: take the maximum of session.totalDistance, redisTotalDist, and DistanceLedger accepted sum
-    const ledgerSegments = await DistanceLedger.find({ sessionId: effectiveSessionId, classification: 'ACCEPTED' }).lean();
+    // Authoritative distance: take the verified DistanceLedger sum (+ any manual adjustment) without OSRM trajectory inflation
+    const ledgerSegments = await DistanceLedger.find({
+      sessionId: effectiveSessionId,
+      classification: { $in: ['ACCEPTED', 'RECOVERED'] },
+      reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' }
+    }).lean();
     let ledgerSumKm = 0;
     ledgerSegments.forEach(seg => {
       ledgerSumKm += Number(seg.distanceKm) || ((Number(seg.distanceMeters) || 0) / 1000);
     });
-    ledgerSumKm = Math.round(ledgerSumKm * 100) / 100;
+    const manualAdded = Number(session.manualDistanceAdded) || 0;
+    ledgerSumKm = Math.round((ledgerSumKm + manualAdded) * 100) / 100;
 
-    // Point A to Point B trajectory road network verification:
-    // Ensures highway gaps or pocket sleep are completely bridged upon punch out
-    let trajectoryRoadKm = 0;
-    if (session.coordinates && session.coordinates.length >= 2) {
-      try {
-        const routeRoadRes = await computeRouteRoadDistance(session.coordinates);
-        trajectoryRoadKm = routeRoadRes.totalRoadKm || 0;
-      } catch (_) {}
-    }
-
-    const baseGpsKm = Math.max(
-      Number(session.totalDistance) || 0,
-      Number(redisTotalDist) || 0,
-      ledgerSumKm,
-      trajectoryRoadKm
-    );
+    const baseGpsKm = ledgerSumKm > 0
+      ? ledgerSumKm
+      : Math.max(Number(session.totalDistance) || 0, Number(redisTotalDist) || 0);
     const gpsKm = Math.round(baseGpsKm * 100) / 100;
 
-    // Pure GPS distance — no tolerance/inflation added (AGTRIE-X v7 strict mode)
+    // Pure GPS distance — no tolerance/inflation added
     session.acceptedDistance = gpsKm;
     session.rawGpsDistance = gpsKm;
     session.totalDistance = gpsKm;
@@ -1666,17 +1642,19 @@ exports.stopTracking = async (req, res) => {
       { $set: { isActive: false, autoClosed: false, manuallyStopped: true, endTime: new Date() } }
     );
 
-    // Invalidate live location caches so dashboard immediately removes the stopped employee
+    // Invalidate live location & admin caches so dashboard immediately reflects final KM and status
     const userOrgId = req.user.organizationId?._id || req.user.organizationId;
-    if (userOrgId) await deleteCache(`live_locations_${userOrgId}`);
-    await deleteCache(`live_locations_${req.user._id}`);
-    await deleteCache(`emp_dashboard_stats_${req.user._id}`).catch(() => {});
-    await deleteCache('live_locations_all');
+    await Promise.all([
+      deleteCacheByPrefix('live_locations_'),
+      deleteCacheByPrefix('admin_employees_'),
+      deleteCacheByPrefix('admin_dashboard_stats_'),
+      deleteCache(`emp_dashboard_stats_${req.user._id}`),
+    ]).catch(() => {});
 
     // Use session.date so shifts spanning midnight attribute distance to correct attendance day
     const targetDate = session.date || getBusinessDate(new Date(), 'Asia/Kolkata');
     const allSessions = await LiveLocation.find({ employee: req.user._id, date: targetDate });
-    const totalDist = allSessions.reduce((acc, s) => acc + (s.totalDistance || 0), 0);
+    const totalDist = Math.round(allSessions.reduce((acc, s) => acc + (s.totalDistance || 0), 0) * 100) / 100;
 
     const attRecord = await Attendance.findOne({ employee: req.user._id, date: targetDate });
     if (attRecord) {
@@ -1684,7 +1662,7 @@ exports.stopTracking = async (req, res) => {
       const workHours = Math.max(0, (Date.now() - checkInTime) / (1000 * 60 * 60));
       attRecord.checkOut = new Date();
       attRecord.totalWorkHours = Math.round(workHours * 100) / 100;
-      attRecord.totalDistanceTraveled = Math.round(totalDist * 100) / 100;
+      attRecord.totalDistanceTraveled = totalDist;
       await attRecord.save();
     } else {
       await Attendance.create({
@@ -1694,7 +1672,7 @@ exports.stopTracking = async (req, res) => {
         checkIn: session.startTime || new Date(),
         checkOut: new Date(),
         totalWorkHours: Math.round(Math.max(0, (Date.now() - (session.startTime ? new Date(session.startTime).getTime() : Date.now())) / (1000 * 60 * 60)) * 100) / 100,
-        totalDistanceTraveled: Math.round(totalDist * 100) / 100,
+        totalDistanceTraveled: totalDist,
         status: 'present'
       });
     }
@@ -1708,16 +1686,19 @@ exports.stopTracking = async (req, res) => {
     const io = req.app.get('io');
     if (io) {
       io.to('admins').emit('employee_tracking_stopped', {
-        employeeId: req.user._id, name: req.user.name, sessionId, totalDistance: totalDist
+        employeeId: req.user._id, name: req.user.name, sessionId, totalDistance: totalDist, todayKm: totalDist
       });
       if (userOrgId) {
         io.to(`org_admins_${userOrgId}`).to(`org:${userOrgId}:admins`).to('superadmins').emit('employee_tracking_stopped', {
-          employeeId: req.user._id, name: req.user.name, sessionId, totalDistance: totalDist
+          employeeId: req.user._id, name: req.user.name, sessionId, totalDistance: totalDist, todayKm: totalDist
         });
       }
+      io.to('user_' + req.user._id).to(String(req.user._id)).emit('employee_tracking_stopped', {
+        employeeId: req.user._id, name: req.user.name, sessionId, totalDistance: totalDist, todayKm: totalDist
+      });
     }
 
-    res.json({ success: true, totalDistance: totalDist, session });
+    res.json({ success: true, totalDistance: totalDist, totalDistanceToday: totalDist, session });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -1891,23 +1872,33 @@ exports.heartbeat = async (req, res) => {
     if (emitLat && emitLng) {
       const io = req.app.get('io');
       if (io) {
-        io.to('admins').emit('employee_location', {
+        const hbPayload = {
           employeeId: req.user._id,
           name: req.user.name,
           avatar: req.user.avatar,
           department: req.user.department,
+          organizationId: orgId,
           lat: emitLat,
           lng: emitLng,
           address: hbAddress || lastCoordDb.address || '',
           totalDistance,
+          totalDistanceToday: totalDistance,
+          todayKm: totalDistance,
           sessionDistance: totalDistance,
           sessionId,
-          motionState: 'STATIONARY'
-        });
+          motionState: 'STATIONARY',
+          isActive: true,
+          isTracking: true
+        };
+        io.to('admins').emit('employee_location', hbPayload);
+        if (orgId) {
+          io.to(`org_admins_${orgId}`).to(`org:${orgId}:admins`).to('superadmins').emit('employee_location', hbPayload);
+        }
+        io.to('user_' + req.user._id).to(String(req.user._id)).emit('employee_location', hbPayload);
       }
     }
 
-    res.json({ success: true, sessionId, totalDistance });
+    res.json({ success: true, sessionId, totalDistance, totalDistanceToday: totalDistance, todayKm: totalDistance });
   } catch (err) {
     console.error('[tracking] heartbeat error:', err.message);
     res.status(500).json({ success: false, message: err.message });
@@ -2509,7 +2500,7 @@ exports.getLiveLocations = async (req, res) => {
     const today = getBusinessDate(new Date(), 'Asia/Kolkata');
     const todayStartMs = new Date(`${today}T00:00:00.000Z`).getTime();
 
-    const [sessionLedgerAggs, empTodayLedgerAggs] = await Promise.all([
+    const [sessionLedgerAggs, empTodayLedgerAggs, todayAllSessions] = await Promise.all([
       DistanceLedger.aggregate([
         { $match: { sessionId: { $in: sessionIds }, classification: { $in: ['ACCEPTED', 'RECOVERED'] }, reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' } } },
         { $group: { _id: '$sessionId', totalKm: { $sum: '$distanceKm' } } }
@@ -2524,11 +2515,23 @@ exports.getLiveLocations = async (req, res) => {
           }
         },
         { $group: { _id: '$employee', totalKm: { $sum: '$distanceKm' } } }
-      ])
+      ]),
+      LiveLocation.find(
+        { employee: { $in: activeEmpIds }, date: today },
+        { employee: 1, sessionId: 1, totalDistance: 1, officialDistance: 1, isActive: 1 }
+      ).lean()
     ]);
 
     const sessionKmMap = new Map(sessionLedgerAggs.map(a => [String(a._id), Math.round((a.totalKm || 0) * 100) / 100]));
     const empTodayKmMap = new Map(empTodayLedgerAggs.map(a => [String(a._id), Math.round((a.totalKm || 0) * 100) / 100]));
+    const empCompletedTodayMap = new Map();
+    for (const s of (todayAllSessions || [])) {
+      if (!s.isActive) {
+        const empKey = String(s.employee);
+        const sDist = Number(s.totalDistance || s.officialDistance || 0);
+        empCompletedTodayMap.set(empKey, (empCompletedTodayMap.get(empKey) || 0) + sDist);
+      }
+    }
 
     const rawLocations = await Promise.all(activeSessions.map(async (session) => {
       if (!session.employee) return null;
@@ -2539,8 +2542,10 @@ exports.getLiveLocations = async (req, res) => {
       const sessionDist = Number(sessionState?.totalDistance ?? session.totalDistance ?? 0);
       let displayDistance = Math.max(ledgerKm, Math.round(sessionDist * 100) / 100);
 
-      const empTodayKm = empTodayKmMap.get(String(session.employee._id)) || 0;
-      const todayTotalKm = empTodayKm > 0 ? Math.max(empTodayKm, displayDistance) : displayDistance;
+      const empKey = String(session.employee._id);
+      const empTodayKm = empTodayKmMap.get(empKey) || 0;
+      const completedTodayKm = empCompletedTodayMap.get(empKey) || 0;
+      const todayTotalKm = Math.round(Math.max(empTodayKm, completedTodayKm + displayDistance, displayDistance) * 100) / 100;
 
       return {
         employeeId: session.employee._id,
@@ -2553,6 +2558,8 @@ exports.getLiveLocations = async (req, res) => {
         speed: (session.motionState === 'STATIONARY') ? 0 : (latestCoord.speed || 0),
         address: latestCoord.address || session.currentAddress,
         totalDistance: todayTotalKm,
+        totalDistanceToday: todayTotalKm,
+        todayKm: todayTotalKm,
         sessionTotalDistance: displayDistance,
         sessionId: session.sessionId,
         motionState: session.motionState || 'STATIONARY',

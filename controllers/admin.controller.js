@@ -1,7 +1,13 @@
 // ─── Meeting Controller ───────────────────────────────────────────────────────
-const { Meeting, Expense, Attendance, ActivityLog, Notification, LiveLocation, Lead, Leave, Task } = require('../models/index');
+const { Meeting, Expense, Attendance, ActivityLog, Notification, LiveLocation, Lead, Leave, Task, DistanceLedger } = require('../models/index');
 const User = require('../models/User.model');
-const { liveCache } = require('../services/cache.service');
+const { liveCache, getSessionState } = require('../services/cache.service');
+
+function getBusinessDate(date = new Date(), timeZone = 'Asia/Kolkata') {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).format(date);
+}
 
 // Meeting CRUD
 exports.createMeeting = async (req, res) => {
@@ -103,7 +109,8 @@ exports.getDashboardStats = async (req, res) => {
       return res.json({ success: true, stats: cachedStats, fromCache: true });
     }
 
-    const today = new Date().toISOString().slice(0, 10);
+    const today = getBusinessDate(new Date(), 'Asia/Kolkata');
+    const todayStart = new Date(`${today}T00:00:00.000+05:30`);
     const userFilter = isSuperAdmin ? {} : { organizationId: orgId };
 
     if (userRole === 'MANAGER') {
@@ -118,13 +125,13 @@ exports.getDashboardStats = async (req, res) => {
       totalEmployees, activeEmployees, trackingNow,
       totalMeetings, todayMeetings, pendingExpenses,
       totalExpenses, presentCount, lateCount, halfDayCount,
-      totalKmData, totalLeads, totalLeaves, totalTasks
+      totalKmData, ledgerKmData, totalLeads, totalLeaves, totalTasks
     ] = await Promise.all([
       User.countDocuments({ role: { $nin: ['SUPER_ADMIN', 'SUPERADMIN'] }, isApproved: true, ...userFilter }),
       User.countDocuments({ role: { $nin: ['SUPER_ADMIN', 'SUPERADMIN'] }, isOnline: true, ...userFilter }),
       User.countDocuments({ role: { $nin: ['SUPER_ADMIN', 'SUPERADMIN'] }, isTracking: true, ...userFilter }),
       Meeting.countDocuments(isSuperAdmin ? {} : { employee: { $in: empIds } }),
-      Meeting.countDocuments(isSuperAdmin ? { date: { $gte: new Date(today) } } : { employee: { $in: empIds }, date: { $gte: new Date(today) } }),
+      Meeting.countDocuments(isSuperAdmin ? { date: { $gte: todayStart } } : { employee: { $in: empIds }, date: { $gte: todayStart } }),
       Expense.countDocuments(isSuperAdmin ? { status: 'pending' } : { employee: { $in: empIds }, status: 'pending' }),
       Expense.aggregate([
         ...(isSuperAdmin ? [] : [{ $match: { employee: { $in: empIds } } }]),
@@ -134,8 +141,19 @@ exports.getDashboardStats = async (req, res) => {
       Attendance.countDocuments(isSuperAdmin ? { date: today, status: 'late' } : { employee: { $in: empIds }, date: today, status: 'late' }),
       Attendance.countDocuments(isSuperAdmin ? { date: today, status: 'half-day' } : { employee: { $in: empIds }, date: today, status: 'half-day' }),
       LiveLocation.aggregate([
-        { $match: { date: today, ...(isSuperAdmin ? {} : { employee: { $in: empIds } }) } },
+        { $match: { $or: [{ date: today }, { isActive: true }], ...(isSuperAdmin ? {} : { employee: { $in: empIds } }) } },
         { $group: { _id: null, total: { $sum: '$totalDistance' } } }
+      ]),
+      DistanceLedger.aggregate([
+        {
+          $match: {
+            ...(isSuperAdmin ? {} : { employee: { $in: empIds } }),
+            classification: { $in: ['ACCEPTED', 'RECOVERED'] },
+            reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' },
+            toTimestamp: { $gte: todayStart }
+          }
+        },
+        { $group: { _id: null, total: { $sum: '$distanceKm' } } }
       ]),
       Lead.countDocuments(isSuperAdmin ? {} : { employee: { $in: empIds } }),
       Leave.countDocuments(isSuperAdmin ? {} : { employee: { $in: empIds } }),
@@ -156,6 +174,8 @@ exports.getDashboardStats = async (req, res) => {
       { $group: { _id: '$category', total: { $sum: '$amount' } } }
     ]);
 
+    const totalKm = Math.round(Math.max(totalKmData[0]?.total || 0, ledgerKmData[0]?.total || 0) * 100) / 100;
+
     const stats = {
       totalEmployees,
       activeEmployees,
@@ -170,7 +190,8 @@ exports.getDashboardStats = async (req, res) => {
       todayMeetings,
       pendingExpenses,
       totalExpenses: totalExpenses[0]?.total || 0,
-      totalKm: totalKmData[0]?.total || 0,
+      totalKm,
+      totalKmToday: totalKm,
       totalLeads: totalLeads || 0,
       totalLeaves: totalLeaves || 0,
       totalTasks: totalTasks || 0,
@@ -178,7 +199,7 @@ exports.getDashboardStats = async (req, res) => {
       expenseByCategory,
     };
 
-    await liveCache.set(cacheKey, stats, 30);
+    await liveCache.set(cacheKey, stats, 8);
 
     res.json({
       success: true,
@@ -250,13 +271,12 @@ exports.getAllEmployees = async (req, res) => {
       User.countDocuments(filter)
     ]);
 
-    // Enrich employees with today's real attendance distance and live location metrics (WITHOUT coordinates array!)
+    // Enrich employees with today's real attendance distance and live location metrics
     const empIds = employees.map(e => e._id);
-    const today = new Date().toISOString().slice(0, 10);
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
+    const today = getBusinessDate(new Date(), 'Asia/Kolkata');
+    const startOfToday = new Date(`${today}T00:00:00.000+05:30`);
 
-    const [todayAttendances, todayLiveLocations] = await Promise.all([
+    const [todayAttendances, todayLiveLocations, todayLedgerAggs] = await Promise.all([
       Attendance.find({ 
         employee: { $in: empIds }, 
         $or: [{ date: today }, { createdAt: { $gte: startOfToday } }] 
@@ -266,8 +286,19 @@ exports.getAllEmployees = async (req, res) => {
           employee: { $in: empIds }, 
           $or: [{ date: today }, { createdAt: { $gte: startOfToday } }, { isActive: true }] 
         },
-        { coordinates: 0, rejectionReasons: 0 }
-      ).lean()
+        { coordinates: { $slice: -1 }, rejectionReasons: 0 }
+      ).lean(),
+      DistanceLedger.aggregate([
+        {
+          $match: {
+            employee: { $in: empIds },
+            classification: { $in: ['ACCEPTED', 'RECOVERED'] },
+            reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' },
+            toTimestamp: { $gte: startOfToday }
+          }
+        },
+        { $group: { _id: '$employee', totalKm: { $sum: '$distanceKm' } } }
+      ])
     ]);
 
     const attMap = new Map();
@@ -279,30 +310,41 @@ exports.getAllEmployees = async (req, res) => {
       }
     });
 
+    const ledgerMap = new Map(todayLedgerAggs.map(a => [String(a._id), Number(a.totalKm || 0)]));
     const empSessionsDistMap = new Map();
     const liveMap = new Map();
 
-    todayLiveLocations.forEach(l => {
+    for (const l of todayLiveLocations) {
       const empKey = String(l.employee);
-      const sessionDist = Number(l.totalDistance) || Number(l.officialDistance) || Number(l.acceptedDistance) || 0;
+      let sessionDist = Number(l.totalDistance) || Number(l.officialDistance) || Number(l.acceptedDistance) || 0;
+      if (l.isActive && l.sessionId) {
+        try {
+          const sState = await getSessionState(l.sessionId);
+          if (sState && Number(sState.totalDistance) > sessionDist) {
+            sessionDist = Number(sState.totalDistance);
+          }
+        } catch (_) {}
+      }
       empSessionsDistMap.set(empKey, (empSessionsDistMap.get(empKey) || 0) + sessionDist);
 
       const existing = liveMap.get(empKey);
-      if (!existing || (l.isActive && !existing.isActive) || (new Date(l.updatedAt || 0) > new Date(existing.updatedAt || 0))) {
-        liveMap.set(empKey, l);
+      if (!existing || (l.isActive && !existing.isActive) || (l.isActive === Boolean(existing.isActive) && new Date(l.updatedAt || 0) > new Date(existing.updatedAt || 0))) {
+        liveMap.set(empKey, { ...l, totalDistance: sessionDist });
       }
-    });
+    }
 
     const enrichedEmployees = employees.map(e => {
       const empObj = e.toObject ? e.toObject() : { ...e };
       const empIdStr = String(empObj._id);
       const att = attMap.get(empIdStr);
       const live = liveMap.get(empIdStr);
+      const latestCoord = (live?.coordinates && live.coordinates[live.coordinates.length - 1]) || {};
 
-      const isLive = live?.isActive === true || empObj.isTracking === true;
+      const isLive = live?.isActive === true || empObj.isTracking === true || (Boolean(att?.checkIn) && !att?.checkOut);
       const todayKm = Math.round(Math.max(
         Number(att?.totalDistanceTraveled) || 0,
         empSessionsDistMap.get(empIdStr) || 0,
+        ledgerMap.get(empIdStr) || 0,
         Number(live?.totalDistance) || 0,
         Number(live?.officialDistance) || 0
       ) * 100) / 100;
@@ -313,18 +355,23 @@ exports.getAllEmployees = async (req, res) => {
         ...empObj,
         isTracking: isLive,
         isLive,
+        todayKm,
         totalDistance: todayKm,
         totalDistanceToday: todayKm,
+        lat: latestCoord.lat,
+        lng: latestCoord.lng,
+        speed: (live?.motionState === 'STATIONARY') ? 0 : (latestCoord.speed || 0),
+        motionState: live?.motionState || 'STATIONARY',
         lastPing: lastPingTime,
         lastCheckIn: att?.checkIn || empObj.lastCheckIn,
         attendanceStatus: att?.status || (isLive ? 'present' : 'absent'),
-        currentAddress: live?.currentAddress || live?.endAddress || live?.startAddress || empObj.address
+        currentAddress: latestCoord.address || live?.currentAddress || live?.endAddress || live?.startAddress || empObj.address
       };
     });
 
     const payload = { success: true, employees: enrichedEmployees, total, pages: Math.ceil(total / limit) };
     if (canCache) {
-      await liveCache.set(cacheKey, payload, 12);
+      await liveCache.set(cacheKey, payload, 6);
     }
 
     res.json(payload);

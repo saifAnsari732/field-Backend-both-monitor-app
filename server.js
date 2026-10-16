@@ -129,8 +129,8 @@ app.use('/api/leaves', require('./routes/leave.routes'));
 app.use('/api/tasks', require('./routes/task.routes'));
 app.use('/api/trips', require('./routes/trip.routes'));
 const { protect } = require('./middleware/auth.middleware');
-const { LiveLocation, Meeting } = require('./models');
-const { liveCache } = require('./services/cache.service');
+const { LiveLocation, Meeting, DistanceLedger } = require('./models');
+const { liveCache, getSessionState } = require('./services/cache.service');
 
 function getBusinessDate(date = new Date(), timeZone = 'Asia/Kolkata') {
   return new Intl.DateTimeFormat('en-CA', {
@@ -148,11 +148,10 @@ app.get('/api/dashboard/stats', protect, async (req, res) => {
     }
 
     const today = getBusinessDate(new Date(), 'Asia/Kolkata');
-    const todayDateObj = new Date();
-    todayDateObj.setHours(0, 0, 0, 0);
+    const todayDateObj = new Date(`${today}T00:00:00.000+05:30`);
 
     // Project ONLY needed fields and run in parallel
-    const [allSessions, meetingCount] = await Promise.all([
+    const [allSessions, meetingCount, ledgerTodayAgg] = await Promise.all([
       LiveLocation.find(
         { employee: req.user._id },
         { totalDistance: 1, officialDistance: 1, date: 1, isActive: 1, sessionId: 1 }
@@ -160,29 +159,43 @@ app.get('/api/dashboard/stats', protect, async (req, res) => {
       Meeting.countDocuments({ 
         employee: req.user._id, 
         date: { $gte: todayDateObj } 
-      })
+      }),
+      DistanceLedger.aggregate([
+        {
+          $match: {
+            employee: req.user._id,
+            classification: { $in: ['ACCEPTED', 'RECOVERED'] },
+            reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' },
+            toTimestamp: { $gte: todayDateObj }
+          }
+        },
+        { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
+      ])
     ]);
 
-    const totalDistanceAllDates = allSessions.reduce(
-      (acc, s) => acc + (Number(s.totalDistance || s.officialDistance) || 0),
-      0
-    );
-    
     // Match today's business date OR any session currently active
     const todaySessions = allSessions.filter(s => s.date === today || s.isActive === true);
-    let distanceToday = 0;
+    let sessionSumToday = 0;
     for (const s of todaySessions) {
       let sDist = Number(s.totalDistance || s.officialDistance) || 0;
       if (s.isActive && s.sessionId) {
         try {
-          const redisState = await liveCache.get(`tracking_session_${s.sessionId}`);
+          const redisState = await getSessionState(s.sessionId);
           if (redisState && Number(redisState.totalDistance) > sDist) {
             sDist = Number(redisState.totalDistance);
           }
         } catch (_) {}
       }
-      distanceToday += sDist;
+      sessionSumToday += sDist;
     }
+
+    const ledgerTodayKm = Number(ledgerTodayAgg?.[0]?.totalKm || 0);
+    const distanceToday = Math.max(sessionSumToday, ledgerTodayKm);
+
+    const pastSessionsDist = allSessions
+      .filter(s => s.date !== today && !s.isActive)
+      .reduce((acc, s) => acc + (Number(s.totalDistance || s.officialDistance) || 0), 0);
+    const totalDistanceAllDates = pastSessionsDist + distanceToday;
 
     const statsPayload = {
       distanceToday: distanceToday.toFixed(2),
@@ -194,7 +207,7 @@ app.get('/api/dashboard/stats', protect, async (req, res) => {
       totalExpenses: 0
     };
 
-    await liveCache.set(cacheKey, statsPayload, 5);
+    await liveCache.set(cacheKey, statsPayload, 3);
 
     res.json({
       success: true,
