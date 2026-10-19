@@ -9,6 +9,20 @@ function getBusinessDate(date = new Date(), timeZone = 'Asia/Kolkata') {
   }).format(date);
 }
 
+// Helper to build manager $or conditions including assignedEmployees array
+function buildManagerOrFilter(user) {
+  const orList = [{ managerId: user._id }, { manager: user._id }, { _id: user._id }];
+  if (Array.isArray(user.assignedEmployees) && user.assignedEmployees.length > 0) {
+    const assignedIds = user.assignedEmployees
+      .map(e => (e && e._id ? e._id : e))
+      .filter(Boolean);
+    if (assignedIds.length > 0) {
+      orList.push({ _id: { $in: assignedIds } });
+    }
+  }
+  return orList;
+}
+
 // Meeting CRUD
 exports.createMeeting = async (req, res) => {
   try {
@@ -114,7 +128,7 @@ exports.getDashboardStats = async (req, res) => {
     const userFilter = isSuperAdmin ? {} : { organizationId: orgId };
 
     if (userRole === 'MANAGER') {
-      userFilter.$or = [{ managerId: req.user._id }, { manager: req.user._id }, { _id: req.user._id }];
+      userFilter.$or = buildManagerOrFilter(req.user);
     }
 
     // Get list of matching employee IDs for scoped sub-queries
@@ -231,7 +245,7 @@ exports.getAllEmployees = async (req, res) => {
     }
 
     if (userRole === 'MANAGER') {
-      filter.$or = [{ managerId: req.user._id }, { manager: req.user._id }, { _id: req.user._id }];
+      filter.$or = buildManagerOrFilter(req.user);
     }
 
     if (role && role !== 'all') {
@@ -459,7 +473,7 @@ const getScopedEmployeeIds = async (user) => {
   }
 
   if (userRole === 'MANAGER') {
-    userScope.$or = [{ managerId: user._id }, { manager: user._id }, { _id: user._id }];
+    userScope.$or = buildManagerOrFilter(user);
   } else if (userRole === 'EMPLOYEE') {
     userScope._id = user._id;
   } else if (!orgId) {
@@ -527,7 +541,7 @@ exports.getAllExpenses = async (req, res) => {
     if (!isSuperAdmin) {
       if (userRole === 'MANAGER') {
         const scopedUsers = await User.find({
-          $or: [{ managerId: req.user._id }, { manager: req.user._id }, { _id: req.user._id }]
+          $or: buildManagerOrFilter(req.user)
         }).select('_id');
         const scopedIds = scopedUsers.map(u => u._id);
         if (employeeId) {
