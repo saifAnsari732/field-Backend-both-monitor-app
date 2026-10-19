@@ -2,6 +2,9 @@ const jwt = require('jsonwebtoken');
 const User = require('../models/User.model');
 const { liveCache } = require('../services/cache.service');
 
+const JWT_SECRET = process.env.JWT_SECRET || 'your_super_secret_jwt_key_here_change_in_production';
+const JWT_EXPIRE = process.env.JWT_EXPIRE || '30d';
+
 const protect = async (req, res, next) => {
   let token;
   if (req.headers.authorization?.startsWith('Bearer ')) {
@@ -11,7 +14,7 @@ const protect = async (req, res, next) => {
 
   let decoded;
   try {
-    decoded = jwt.verify(token, process.env.JWT_SECRET);
+    decoded = jwt.verify(token, JWT_SECRET);
   } catch (err) {
     return res.status(401).json({ success: false, message: 'Token invalid or expired' });
   }
@@ -67,6 +70,6 @@ const authorize = (...roles) => (req, res, next) => {
 };
 
 const generateToken = (id) =>
-  jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRE || '7d' });
+  jwt.sign({ id }, JWT_SECRET, { expiresIn: JWT_EXPIRE });
 
 module.exports = { protect, authorize, generateToken };

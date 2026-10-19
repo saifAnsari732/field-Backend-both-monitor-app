@@ -97,7 +97,8 @@ exports.refreshToken = async (req, res) => {
     let userId = req.user?._id;
     if (!userId) {
       try {
-        const decoded = jwt.verify(rawToken, process.env.JWT_SECRET, { ignoreExpiration: true });
+        const secret = process.env.JWT_SECRET || 'your_super_secret_jwt_key_here_change_in_production';
+        const decoded = jwt.verify(rawToken, secret, { ignoreExpiration: true });
         userId = decoded.id;
       } catch (e) {
         return res.status(401).json({ success: false, message: 'Invalid token' });
