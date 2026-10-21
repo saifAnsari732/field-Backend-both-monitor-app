@@ -717,7 +717,7 @@ exports.updateLocation = async (req, res) => {
         const reportedSpeedKmh = toKmh(coord.speed);
 
         // Require either >= 45m with Doppler speed >= 2.8 km/h, or >= 80m genuine displacement so a 35m stationary drift after 30m adds 0 KM
-        const isStationaryDeparture = dGapKm >= 0.045 && dGapKm <= 3.5 && (reportedSpeedKmh >= 2.8 || dGapKm >= 0.080) && accuracy <= 200;
+        const isStationaryDeparture = dGapKm >= 0.045 && dGapKm <= 15.0 && (reportedSpeedKmh >= 2.5 || dGapKm >= 0.080) && accuracy <= 250;
         // Travel recovery for genuine travel gaps (including highway transit & inter-district field travel):
         // Employees often travel between cities/districts (e.g. 50-250 km) by bus, train, or bike where phone
         // goes into battery Doze mode or network drops on state highways.
@@ -728,7 +728,8 @@ exports.updateLocation = async (req, res) => {
         // (Excludes stationary office drift where speed is < 4.5 km/h, and teleport glitches where speed > 130 km/h)
         // For multi-kilometer journeys (>= 3.0 km) like highway transit, allow first wakeup accuracy up to 550m (< 2% error)
         const maxAllowedAcc = dGapKm >= 3.0 ? 550 : 250;
-        const isGapTravelRecovery = dGapKm >= 0.080 && gapSpeedKmh >= 4.5 && gapSpeedKmh <= 130.0 && accuracy <= maxAllowedAcc;
+        const minGapSpeedKmh = dGapKm >= 0.250 ? 0.3 : 2.5;
+        const isGapTravelRecovery = dGapKm >= 0.080 && gapSpeedKmh >= minGapSpeedKmh && gapSpeedKmh <= 135.0 && accuracy <= maxAllowedAcc;
 
         if (isStationaryDeparture || isGapTravelRecovery) {
           acceptedPoints++;
