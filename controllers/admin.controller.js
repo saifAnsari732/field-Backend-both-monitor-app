@@ -354,7 +354,7 @@ exports.getAllEmployees = async (req, res) => {
       const live = liveMap.get(empIdStr);
       const latestCoord = (live?.coordinates && live.coordinates[live.coordinates.length - 1]) || {};
 
-      const isLive = live?.isActive === true || empObj.isTracking === true || (Boolean(att?.checkIn) && !att?.checkOut);
+      const isLive = Boolean(live && live.manuallyStopped !== true) || empObj.isTracking === true || (Boolean(att?.checkIn) && !att?.checkOut);
       const todayKm = Math.round(Math.max(
         Number(att?.totalDistanceTraveled) || 0,
         empSessionsDistMap.get(empIdStr) || 0,

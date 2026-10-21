@@ -1,6 +1,6 @@
 {
   "name": "crm-tracker-backend",
-  "version": "1.0.34",
+  "version": "1.0.38",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

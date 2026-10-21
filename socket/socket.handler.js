@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User.model');
+const { LiveLocation } = require('../models/index');
 
 module.exports = (io) => {
   // Auth middleware for socket
@@ -148,16 +149,23 @@ module.exports = (io) => {
       console.log(`🔌 ${user.name} disconnected`);
 
       try {
+        // Check if employee still has an active GPS tracking session today (e.g. phone screen locked while stationary)
+        const hasActiveTracking = Boolean(await LiveLocation.exists({ employee: user._id, isActive: true }));
+
         await User.findByIdAndUpdate(user._id, {
-          isOnline: false,
+          isOnline: hasActiveTracking ? true : false,
+          ...(hasActiveTracking ? { isTracking: true } : {}),
           lastSeen: new Date(),
           socketId: null,
         });
 
-        io.to('admins').emit('employee_offline', {
-          employeeId: user._id,
-          name: user.name,
-        });
+        if (!hasActiveTracking) {
+          io.to('admins').emit('employee_offline', {
+            employeeId: user._id,
+            name: user.name,
+            isTracking: false,
+          });
+        }
       } catch (discErr) {
         console.error(`Socket disconnect error for ${user.name}:`, discErr.message);
       }
