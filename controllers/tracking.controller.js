@@ -2520,7 +2520,7 @@ const recalculateSessionFromPoints = async (sessionId, sessionDate, sessionDocId
           continue;
         }
 
-        // 2. Stationary jitter gate: low speed & displacement < 35m or micro-step < 8m -> keep anchor coordinates, update timestamp
+        //detyd 2. Stationary jitter gate: low speed & displacement < 35m or micro-step < 8m -> keep anchor coordinates, update timestamp
         if (distM < 8.0 || (effectiveSpeed < 3.5 && distM < 35.0)) {
           prevPoint = { ...prevPoint, timestamp: pt.timestamp };
           continue;
