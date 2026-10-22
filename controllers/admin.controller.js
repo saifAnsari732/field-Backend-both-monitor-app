@@ -143,7 +143,7 @@ exports.getDashboardStats = async (req, res) => {
     ] = await Promise.all([
       User.countDocuments({ role: { $nin: ['SUPER_ADMIN', 'SUPERADMIN'] }, isApproved: true, ...userFilter }),
       User.countDocuments({ role: { $nin: ['SUPER_ADMIN', 'SUPERADMIN'] }, isOnline: true, ...userFilter }),
-      User.countDocuments({ role: { $nin: ['SUPER_ADMIN', 'SUPERADMIN'] }, isTracking: true, ...userFilter }),
+      LiveLocation.distinct('employee', { date: today, isActive: true, manuallyStopped: { $ne: true }, autoClosed: { $ne: true }, ...(isSuperAdmin ? {} : { employee: { $in: empIds } }) }).then(res => res.length),
       Meeting.countDocuments(isSuperAdmin ? {} : { employee: { $in: empIds } }),
       Meeting.countDocuments(isSuperAdmin ? { date: { $gte: todayStart } } : { employee: { $in: empIds }, date: { $gte: todayStart } }),
       Expense.countDocuments(isSuperAdmin ? { status: 'pending' } : { employee: { $in: empIds }, status: 'pending' }),
@@ -354,7 +354,16 @@ exports.getAllEmployees = async (req, res) => {
       const live = liveMap.get(empIdStr);
       const latestCoord = (live?.coordinates && live.coordinates[live.coordinates.length - 1]) || {};
 
-      const isLive = Boolean(live && live.manuallyStopped !== true) || empObj.isTracking === true || (Boolean(att?.checkIn) && !att?.checkOut);
+      const lastPingTime = live?.lastActivity || latestCoord.timestamp || live?.updatedAt || empObj.lastSeen;
+      const pingAgeMs = lastPingTime ? (Date.now() - new Date(lastPingTime).getTime()) : Infinity;
+      const isRecentlyActive = pingAgeMs < 45 * 60 * 1000;
+      const isLive = Boolean(
+        live &&
+        live.isActive === true &&
+        live.manuallyStopped !== true &&
+        live.autoClosed !== true &&
+        isRecentlyActive
+      );
       const todayKm = Math.round(Math.max(
         Number(att?.totalDistanceTraveled) || 0,
         empSessionsDistMap.get(empIdStr) || 0,
@@ -363,7 +372,7 @@ exports.getAllEmployees = async (req, res) => {
         Number(live?.officialDistance) || 0
       ) * 100) / 100;
 
-      const lastPingTime = live?.lastActivity || live?.updatedAt || att?.checkIn || empObj.lastSeen || empObj.updatedAt;
+
 
       return {
         ...empObj,
@@ -378,7 +387,7 @@ exports.getAllEmployees = async (req, res) => {
         motionState: live?.motionState || 'STATIONARY',
         lastPing: lastPingTime,
         lastCheckIn: att?.checkIn || empObj.lastCheckIn,
-        attendanceStatus: att?.status || (isLive ? 'present' : 'absent'),
+        attendanceStatus: att?.status || (att?.checkIn ? 'present' : 'absent'),
         currentAddress: latestCoord.address || live?.currentAddress || live?.endAddress || live?.startAddress || empObj.address
       };
     });

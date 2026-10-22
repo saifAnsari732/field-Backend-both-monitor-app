@@ -2078,17 +2078,7 @@ exports.getTodaySessions = async (req, res) => {
         'metadata.sessionId': s.sessionId
       }));
 
-      // Self-Heal: ONLY restore if it was auto-stopped / not manually stopped by the user!
-      if (!s.isActive && !hasActiveSessionToday && !wasManuallyStopped) {
-        s.isActive = true;
-        s.autoClosed = false;
-        delete s.endTime;
-        await LiveLocation.updateOne(
-          { _id: s._id },
-          { $set: { isActive: true, autoClosed: false, manuallyStopped: false, lastActivity: new Date() }, $unset: { endTime: 1 } }
-        ).catch(() => {});
-        await User.findByIdAndUpdate(req.user._id, { isTracking: true, isOnline: true }).catch(() => {});
-      }
+      // Completed/inactive sessions remain inactive. No forced revival.
 
       const ledgerAgg = await DistanceLedger.aggregate([
         { $match: { sessionId: s.sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] }, reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' } } },
@@ -2289,17 +2279,9 @@ exports.getLiveEmployees = async (req, res) => {
         });
         const isManuallyStopped = Boolean(sess.manuallyStopped === true) || Boolean(explicitManualStopLog);
 
-        if (!isManuallyStopped) {
-          // Restore to active live tracking
-          sess.isActive = true;
-          activeEmpIdSet.add(empIdStr);
-          LiveLocation.updateOne(
-            { _id: sess._id },
-            { $set: { isActive: true, autoClosed: false, manuallyStopped: false, lastActivity: new Date() }, $unset: { endTime: 1 } }
-          ).catch(() => {});
-          User.findByIdAndUpdate(sess.employee?._id || sess.employee, { isTracking: true, isOnline: true }).catch(() => {});
-          Attendance.findOneAndUpdate({ employee: sess.employee?._id || sess.employee, date: today }, { $unset: { checkOut: 1 } }).catch(() => {});
-        }
+        // Inactive sessions remain inactive (not revived). Used strictly to calculate completed KM for today.
+        sess.isActive = false;
+        sess.isTracking = false;
 
         inactiveToInclude.push(sess);
       }
@@ -2632,16 +2614,20 @@ exports.getLiveLocations = async (req, res) => {
     const orgEmployees = await User.find(userScope).select('_id').lean();
     const empIds = orgEmployees.map(e => e._id);
 
-    // Get active tracking sessions within last 14h cutoff OR any non-manually-stopped session today — ONLY fetch the last 1 coordinate ($slice: -1)
+    // Get active tracking sessions within last 45m active window today — ONLY fetch the last 1 coordinate ($slice: -1)
     const today = getBusinessDate(new Date(), 'Asia/Kolkata');
-    const cutoff = new Date(Date.now() - 14 * 60 * 60 * 1000);
+    const cutoff = new Date(Date.now() - 45 * 60 * 1000);
     const activeSessions = await LiveLocation.find(
       {
         employee: { $in: empIds },
+        date: today,
+        isActive: true,
+        manuallyStopped: { $ne: true },
+        autoClosed: { $ne: true },
         $or: [
-          { isActive: true, lastActivity: { $gte: cutoff } },
-          { isActive: true, lastActivity: null, updatedAt: { $gte: cutoff } },
-          { date: today, manuallyStopped: { $ne: true } }
+          { lastActivity: { $gte: cutoff } },
+          { 'coordinates.timestamp': { $gte: cutoff } },
+          { updatedAt: { $gte: cutoff } }
         ]
       },
       { coordinates: { $slice: -1 }, rejectionReasons: 0 }
@@ -3054,58 +3040,41 @@ exports.reconcileAllActiveSessions = async () => {
     const today = getBusinessDate(new Date(), 'Asia/Kolkata');
     const now = new Date();
 
-    // 1. Reverse any today sessions that were closed by a legacy TRACKING_AUTO_STOPPED process
-    const inactiveToday = await LiveLocation.find(
-      { date: today, isActive: false },
-      { _id: 1, sessionId: 1, employee: 1, autoClosed: 1, manuallyStopped: 1, endTime: 1, coordinates: { $slice: -1 } }
-    ).lean();
-
-    for (const s of inactiveToday) {
-      if (s.employee) {
-        const alreadyHasActive = await LiveLocation.exists({ employee: s.employee, date: today, isActive: true });
-        if (alreadyHasActive) continue;
-      }
-      // A session is ONLY manually stopped if s.manuallyStopped is explicitly true
-      const wasManuallyStopped = s.manuallyStopped === true;
-
-      // If it was auto-stopped or never explicitly manually punched out, restore it to ACTIVE!
-      if (!wasManuallyStopped) {
-        const updateDoc = {
-          $set: { isActive: true, autoClosed: false, manuallyStopped: false, lastActivity: now },
-          $unset: { endTime: 1 }
-        };
-        await LiveLocation.updateOne({ _id: s._id }, updateDoc).catch(() => {});
-        if (s.employee) {
-          await User.findByIdAndUpdate(s.employee, { isTracking: true, isOnline: true, lastSeen: now }).catch(() => {});
-          await Attendance.findOneAndUpdate({ employee: s.employee, date: today }, { $unset: { checkOut: 1 } }).catch(() => {});
-        }
-        console.log(`🛡️ [SENTINEL_GUARDIAN] Restored auto-stopped session ${s.sessionId} back to ACTIVE with keepalive`);
-      }
-    }
-
-    // 2. Proactive Shield: Keep lastActivity updated within 15 minutes on all active today sessions
-    // so active shifts are always kept warm and alive
-    const fifteenMinAgoMs = now.getTime() - 15 * 60 * 1000;
+    // 1. Staleness Guardian: Gracefully auto-close active sessions that have had NO GPS points or heartbeat for > 2 hours.
+    // Preserves distance 100% in DistanceLedger & session, prevents phantom "Tracking ON" after employees leave work.
+    const twoHoursAgoMs = now.getTime() - 2 * 60 * 60 * 1000;
     const activeToday = await LiveLocation.find(
       { date: today, isActive: true },
-      { _id: 1, sessionId: 1, employee: 1, totalDistance: 1, manualDistanceAdded: 1, lastActivity: 1 }
+      { _id: 1, sessionId: 1, employee: 1, totalDistance: 1, manualDistanceAdded: 1, lastActivity: 1, coordinates: { $slice: -1 } }
     ).lean();
 
     for (const s of activeToday) {
+      const lastCoord = (s.coordinates && s.coordinates.length > 0) ? s.coordinates[0] : null;
+      const lastCoordMs = lastCoord?.timestamp ? new Date(lastCoord.timestamp).getTime() : 0;
       const lastActMs = s.lastActivity ? new Date(s.lastActivity).getTime() : 0;
+      const mostRecentActivityMs = Math.max(lastCoordMs, lastActMs);
 
-      if (lastActMs < fifteenMinAgoMs) {
+      if (mostRecentActivityMs > 0 && mostRecentActivityMs < twoHoursAgoMs) {
+        const endTime = new Date(mostRecentActivityMs);
         await LiveLocation.updateOne(
           { _id: s._id },
           {
             $set: {
-              lastActivity: now,
-              autoClosed: false,
-              manuallyStopped: false
-            },
-            $unset: { endTime: 1 }
+              isActive: false,
+              autoClosed: true,
+              endTime: endTime
+            }
           }
         ).catch(() => {});
+
+        if (s.employee) {
+          await User.findByIdAndUpdate(s.employee, { isTracking: false, isOnline: false }).catch(() => {});
+          await Attendance.findOneAndUpdate(
+            { employee: s.employee, date: today, checkOut: null },
+            { $set: { checkOut: endTime } }
+          ).catch(() => {});
+        }
+        console.log(`⏱️ [SENTINEL] Inactive session ${s.sessionId} gracefully auto-closed after 2+ hours silence.`);
       }
     }
 
