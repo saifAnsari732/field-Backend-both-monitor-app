@@ -1757,11 +1757,19 @@ exports.stopTracking = async (req, res) => {
 
     const gpsKm = Math.round(Math.max(ledgerSumKm, candidateKm) * 100) / 100;
 
-    // Pure GPS distance — verified and strictly preserved (can NEVER decrease upon punch out)
-    session.acceptedDistance = gpsKm;
+    // Automatic 10% punch-out road curvature & network compensation
+    const TOLERANCE_PCT = Number(process.env.PUNCH_OUT_TOLERANCE_PCT ?? 10);
+    const toleranceKm = (gpsKm > 0 && TOLERANCE_PCT > 0) ? Math.round(gpsKm * (TOLERANCE_PCT / 100) * 100) / 100 : 0;
+    const finalOfficialKm = Math.round((gpsKm + toleranceKm) * 100) / 100;
+
+    session.acceptedDistance = gpsKm;       // pure raw GPS km
     session.rawGpsDistance = gpsKm;
-    session.totalDistance = gpsKm;
-    session.officialDistance = gpsKm;
+    session.totalDistance = finalOfficialKm;
+    session.officialDistance = finalOfficialKm;
+    if (toleranceKm > 0) {
+      session.manualDistanceAdded = Math.round(((Number(session.manualDistanceAdded) || 0) + toleranceKm) * 100) / 100;
+      session.manualAdjustmentReason = `${TOLERANCE_PCT}% Punch Out road compensation: GPS ${gpsKm} km + ${toleranceKm} km = ${finalOfficialKm} km`;
+    }
 
     // Get end address from last coordinate
     if (session.coordinates && session.coordinates.length > 0) {
