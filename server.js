@@ -97,6 +97,14 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
+// Graceful JSON parse error handler (prevents log noise on malformed request bodies)
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({ success: false, message: 'Invalid JSON payload format' });
+  }
+  next(err);
+});
+
 // Health check endpoint (placed BEFORE rate limiter so uptime monitors and CI/CD never get blocked)
 app.get('/api/health', (req, res) => res.json({ status: '1 OK AWS Working CI-CD Live Test', timestamp: new Date() }));
 
