@@ -39,8 +39,11 @@ jobs:
             git fetch origin main
             git reset --hard origin/main
             npm install --omit=dev
-            # Clean up duplicate PM2 processes to prevent port 5000 EADDRINUSE conflicts
-            pm2 delete kisanconnect-backend 2>/dev/null || pm2 delete 1 2>/dev/null || true
+            # Clean up duplicate PM2 processes to prevent port 5000 conflicts and rogue auto-stop crons
+            pm2 delete trackpro-api 2>/dev/null || true
+            pm2 delete kisanconnect-backend 2>/dev/null || true
+            pm2 delete 1 2>/dev/null || true
+            pm2 delete 2 2>/dev/null || true
             pm2 restart field-App-backend || pm2 restart 0 || pm2 start server.js --name "field-App-backend"
             pm2 save
             echo "✅ Deployment Successful!"

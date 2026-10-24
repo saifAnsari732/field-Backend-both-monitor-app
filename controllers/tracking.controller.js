@@ -47,6 +47,84 @@ function curvatureCompensation(segmentDistKm, avgAccuracy) {
 // In-memory throttle for closed session drop logs (max 1 log per 60s per session)
 const closedSessionLogThrottle = new Map();
 
+/**
+ * AGTRIE-X v16 Temporal & Spatial Interval Non-Overlap Invariant Engine
+ * Completely prevents duplicate gap replays (e.g. 150 km counted twice).
+ * An accepted segment MUST NOT overlap with an existing accepted segment in the same session:
+ * 1. Time overlap: intersection([fromT, toT], [existing.fromT, existing.toT]) > 30% of interval
+ * 2. Spatial vector corridor: fromPoint and toPoint both within 2.5 km of an existing large gap
+ */
+async function isDuplicateGapOverlapping(sessionId, fromTime, toTime, fromLat, fromLng, toLat, toLng, gapDistKm, inMemorySegments = []) {
+  if (gapDistKm < 1.0) return false;
+
+  const fromMs = new Date(fromTime).getTime();
+  const toMs = new Date(toTime).getTime();
+  const durationMs = toMs - fromMs;
+  if (durationMs <= 0) return true;
+
+  // 1. Check in-memory batch segments
+  for (const s of inMemorySegments) {
+    if (s.classification !== 'ACCEPTED' && s.classification !== 'RECOVERED') continue;
+    if (s.distanceKm < 1.0) continue;
+
+    const sFromMs = new Date(s.fromTimestamp).getTime();
+    const sToMs = new Date(s.toTimestamp).getTime();
+    const overlapStart = Math.max(fromMs, sFromMs);
+    const overlapEnd = Math.min(toMs, sToMs);
+    const overlapDuration = overlapEnd - overlapStart;
+
+    if (overlapDuration > 0 && (overlapDuration / Math.min(durationMs, (sToMs - sFromMs))) > 0.3) {
+      return true;
+    }
+
+    if (s.fromLat && s.toLat && fromLat && toLat) {
+      const dFrom = haversineMeters(fromLat, fromLng, s.fromLat, s.fromLng);
+      const dTo = haversineMeters(toLat, toLng, s.toLat, s.toLng);
+      if (dFrom < 2500 && dTo < 2500 && Math.abs(s.distanceKm - gapDistKm) < 10) {
+        return true;
+      }
+    }
+  }
+
+  // 2. Check MongoDB DistanceLedger for this session
+  try {
+    const overlappingLedgers = await DistanceLedger.find({
+      sessionId,
+      classification: { $in: ['ACCEPTED', 'RECOVERED'] },
+      distanceKm: { $gt: 1.0 },
+      fromTimestamp: { $lte: new Date(toMs) },
+      toTimestamp: { $gte: new Date(fromMs) }
+    }).select('fromTimestamp toTimestamp distanceKm fromLat fromLng toLat toLng').lean();
+
+    for (const l of overlappingLedgers) {
+      const lFromMs = new Date(l.fromTimestamp).getTime();
+      const lToMs = new Date(l.toTimestamp).getTime();
+      const overlapStart = Math.max(fromMs, lFromMs);
+      const overlapEnd = Math.min(toMs, lToMs);
+      const overlapDuration = overlapEnd - overlapStart;
+      const minDuration = Math.min(durationMs, (lToMs - lFromMs));
+
+      if (overlapDuration > 0 && minDuration > 0 && (overlapDuration / minDuration) > 0.3) {
+        console.log(`⚠️ [GAP_COLLISION_BLOCKED] Time overlap detected (${(overlapDuration/60000).toFixed(1)}m) for session ${sessionId} (${gapDistKm.toFixed(1)} km). Ignored.`);
+        return true;
+      }
+
+      if (l.fromLat && l.toLat && fromLat && toLat) {
+        const dFrom = haversineMeters(fromLat, fromLng, l.fromLat, l.fromLng);
+        const dTo = haversineMeters(toLat, toLng, l.toLat, l.toLng);
+        if (dFrom < 2500 && dTo < 2500) {
+          console.log(`⚠️ [GAP_COLLISION_BLOCKED] Spatial corridor duplicate (${dFrom.toFixed(0)}m / ${dTo.toFixed(0)}m) for session ${sessionId} (${gapDistKm.toFixed(1)} km). Ignored.`);
+          return true;
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Error in isDuplicateGapOverlapping:', err.message);
+  }
+
+  return false;
+}
+
 // @desc Start tracking session
 exports.startTracking = async (req, res) => {
   try {
@@ -732,6 +810,23 @@ exports.updateLocation = async (req, res) => {
         const isGapTravelRecovery = dGapKm >= 0.080 && gapSpeedKmh >= minGapSpeedKmh && gapSpeedKmh <= 135.0 && accuracy <= maxAllowedAcc;
 
         if (isStationaryDeparture || isGapTravelRecovery) {
+          const fromAnchorLat = prevValid?.latRaw ?? lastValidLat;
+          const fromAnchorLng = prevValid?.lngRaw ?? lastValidLng;
+          const isGapDup = await isDuplicateGapOverlapping(
+            sessionId,
+            new Date(lastTrustedMs),
+            timestamp,
+            fromAnchorLat,
+            fromAnchorLng,
+            lat,
+            lng,
+            dGapKm,
+            ledgerSegments
+          );
+
+          if (isGapDup) {
+            console.log(`⚠️ [GAP_REPLAY_REJECTED] Discarded duplicate gap replay of ${dGapKm.toFixed(2)} km for session ${sessionId}`);
+          } else {
           acceptedPoints++;
           acceptedEventIds.push(eventId);
           prevTimestamp = tMs;
@@ -772,6 +867,7 @@ exports.updateLocation = async (req, res) => {
           }).catch(() => {});
 
           console.log(`📍 [STATIONARY_WAKEUP] Accepted +${effectiveGapKm.toFixed(4)} km after ${(dt / 60).toFixed(0)} min stationary gap (speed: ${effectiveResumeSpeed.toFixed(1)} km/h)`);
+          }
         } else if (dGapKm >= 0.080) {
           // Long gap or overnight jump (>2.5h or >65km or unrealistic speed): Re-anchor to new position WITHOUT adding unverified distance
           const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
@@ -2622,21 +2718,14 @@ exports.getLiveLocations = async (req, res) => {
     const orgEmployees = await User.find(userScope).select('_id').lean();
     const empIds = orgEmployees.map(e => e._id);
 
-    // Get active tracking sessions within last 45m active window today — ONLY fetch the last 1 coordinate ($slice: -1)
+    // All today's active sessions remain visible on Live Map all day (Immortal Shift Policy)
     const today = getBusinessDate(new Date(), 'Asia/Kolkata');
-    const cutoff = new Date(Date.now() - 45 * 60 * 1000);
     const activeSessions = await LiveLocation.find(
       {
         employee: { $in: empIds },
         date: today,
         isActive: true,
         manuallyStopped: { $ne: true },
-        autoClosed: { $ne: true },
-        $or: [
-          { lastActivity: { $gte: cutoff } },
-          { 'coordinates.timestamp': { $gte: cutoff } },
-          { updatedAt: { $gte: cutoff } }
-        ]
       },
       { coordinates: { $slice: -1 }, rejectionReasons: 0 }
     )
@@ -3048,47 +3137,91 @@ exports.reconcileAllActiveSessions = async () => {
     const today = getBusinessDate(new Date(), 'Asia/Kolkata');
     const now = new Date();
 
-    // 1. Staleness Guardian: Gracefully auto-close active sessions that have had NO GPS points or heartbeat for > 2 hours.
-    // Preserves distance 100% in DistanceLedger & session, prevents phantom "Tracking ON" after employees leave work.
-    const twoHoursAgoMs = now.getTime() - 2 * 60 * 60 * 1000;
+    // 1. Permanent Shift Guardian (Zero Data Loss Policy):
+    // Sessions remain 100% active for the entire workday until employee explicitly taps Punch Out.
+    // Auto-heals any session closed by false timeout or rogue process today.
+    const autoClosedToday = await LiveLocation.find(
+      { date: today, isActive: false, manuallyStopped: { $ne: true } },
+      { _id: 1, sessionId: 1, employee: 1, totalDistance: 1, manualDistanceAdded: 1, lastActivity: 1 }
+    ).lean();
+
+    for (const s of autoClosedToday) {
+      const explicitManualStop = await ActivityLog.exists({
+        action: 'TRACKING_STOP',
+        'metadata.sessionId': s.sessionId
+      });
+
+      if (!explicitManualStop) {
+        await LiveLocation.updateOne(
+          { _id: s._id },
+          {
+            $set: {
+              isActive: true,
+              autoClosed: false,
+              manuallyStopped: false,
+              lastActivity: new Date()
+            },
+            $unset: { endTime: 1, autoStoppedAt: 1 }
+          }
+        ).catch(() => {});
+
+        if (s.employee) {
+          await User.findByIdAndUpdate(s.employee, { isTracking: true, isOnline: true }).catch(() => {});
+          await Attendance.findOneAndUpdate(
+            { employee: s.employee, date: today },
+            { $unset: { checkOut: 1, punchOutTime: 1 } }
+          ).catch(() => {});
+        }
+        console.log(`🛡️ [SENTINEL_GUARDIAN] Auto-restored session ${s.sessionId} for employee ${s.employee} (Immortal Shift Policy)`);
+      }
+    }
+
     const activeToday = await LiveLocation.find(
       { date: today, isActive: true },
       { _id: 1, sessionId: 1, employee: 1, totalDistance: 1, manualDistanceAdded: 1, lastActivity: 1, coordinates: { $slice: -1 } }
     ).lean();
 
-    for (const s of activeToday) {
-      const lastCoord = (s.coordinates && s.coordinates.length > 0) ? s.coordinates[0] : null;
-      const lastCoordMs = lastCoord?.timestamp ? new Date(lastCoord.timestamp).getTime() : 0;
-      const lastActMs = s.lastActivity ? new Date(s.lastActivity).getTime() : 0;
-      const mostRecentActivityMs = Math.max(lastCoordMs, lastActMs);
-
-      if (mostRecentActivityMs > 0 && mostRecentActivityMs < twoHoursAgoMs) {
-        const endTime = new Date(mostRecentActivityMs);
-        await LiveLocation.updateOne(
-          { _id: s._id },
-          {
-            $set: {
-              isActive: false,
-              autoClosed: true,
-              endTime: endTime
-            }
-          }
-        ).catch(() => {});
-
-        if (s.employee) {
-          await User.findByIdAndUpdate(s.employee, { isTracking: false, isOnline: false }).catch(() => {});
-          await Attendance.findOneAndUpdate(
-            { employee: s.employee, date: today, checkOut: null },
-            { $set: { checkOut: endTime } }
-          ).catch(() => {});
-        }
-        console.log(`⏱️ [SENTINEL] Inactive session ${s.sessionId} gracefully auto-closed after 2+ hours silence.`);
-      }
-    }
-
     // 3. Reconcile DistanceLedger KM for all active sessions today
 
     for (const s of activeToday) {
+      // 2. Autonomous Interval & Spatial Corridor De-duplicator:
+      // Instantly detects and rejects any duplicate overlapping gap segments (> 2 km)
+      const largeLedgers = await DistanceLedger.find({
+        sessionId: s.sessionId,
+        classification: 'ACCEPTED',
+        distanceKm: { $gt: 2.0 }
+      }).sort({ toTimestamp: 1 }).lean();
+
+      if (largeLedgers.length >= 2) {
+        for (let i = 0; i < largeLedgers.length; i++) {
+          for (let j = i + 1; j < largeLedgers.length; j++) {
+            const l1 = largeLedgers[i];
+            const l2 = largeLedgers[j];
+            const t1Start = new Date(l1.fromTimestamp).getTime();
+            const t1End = new Date(l1.toTimestamp).getTime();
+            const t2Start = new Date(l2.fromTimestamp).getTime();
+            const t2End = new Date(l2.toTimestamp).getTime();
+            const overlapStart = Math.max(t1Start, t2Start);
+            const overlapEnd = Math.min(t1End, t2End);
+            const overlapMs = overlapEnd - overlapStart;
+            const minDur = Math.min(t1End - t1Start, t2End - t2Start);
+
+            const isTimeDup = overlapMs > 0 && minDur > 0 && (overlapMs / minDur) > 0.4;
+            const isSpatialDup = l1.fromLat && l2.fromLat &&
+              haversineMeters(l1.fromLat, l1.fromLng, l2.fromLat, l2.fromLng) < 2500 &&
+              haversineMeters(l1.toLat, l1.toLng, l2.toLat, l2.toLng) < 2500;
+
+            if (isTimeDup || isSpatialDup) {
+              console.log(`🛡️ [SENTINEL_DEDUP] Overlapping gap duplicate rejected in session ${s.sessionId}: ${l2._id}`);
+              await DistanceLedger.updateOne(
+                { _id: l2._id },
+                { $set: { classification: 'REJECTED', reason: 'AGTRIE_X_AUTONOMOUS_OVERLAP_REPLAY_REJECTED' } }
+              ).catch(() => {});
+            }
+          }
+        }
+      }
+
       const ledgerAgg = await DistanceLedger.aggregate([
         { $match: { sessionId: s.sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
         { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
