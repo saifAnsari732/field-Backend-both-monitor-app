@@ -363,10 +363,17 @@ exports.updateLocation = async (req, res) => {
     // If mobile app lost currentTrackingSessionId in AsyncStorage (or sent AUTO_RECOVER_SESSION),
     // ONLY resolve an existing active LiveLocation session for today — NEVER create a new shift without Punch In!
     if (!sessionId || sessionId === 'AUTO_RECOVER_SESSION') {
-      const recoveredDoc = await LiveLocation.findOne(
+      let recoveredDoc = await LiveLocation.findOne(
         { employee: req.user._id, date: today, isActive: true },
         { sessionId: 1, isActive: 1, manuallyStopped: 1, autoClosed: 1, endTime: 1 }
       ).sort({ createdAt: -1 });
+
+      if (!recoveredDoc) {
+        recoveredDoc = await LiveLocation.findOne(
+          { employee: req.user._id, date: today, manuallyStopped: { $ne: true } },
+          { sessionId: 1, isActive: 1, manuallyStopped: 1, autoClosed: 1, endTime: 1 }
+        ).sort({ createdAt: -1 });
+      }
 
       if (!recoveredDoc) {
         return res.json({
@@ -483,6 +490,15 @@ exports.updateLocation = async (req, res) => {
         { employee: req.user._id, isActive: true, date: today },
         { sessionId: 1, isActive: 1, autoClosed: 1, manuallyStopped: 1, date: 1, endTime: 1, lastActivity: 1, totalDistance: 1, manualDistanceAdded: 1, coordinates: { $slice: -1 } }
       ).sort({ createdAt: -1 });
+
+      // Fallback: Recover any session today that was NOT explicitly manually stopped!
+      if (!activeDoc) {
+        activeDoc = await LiveLocation.findOne(
+          { employee: req.user._id, date: today, manuallyStopped: { $ne: true } },
+          { sessionId: 1, isActive: 1, autoClosed: 1, manuallyStopped: 1, date: 1, endTime: 1, lastActivity: 1, totalDistance: 1, manualDistanceAdded: 1, coordinates: { $slice: -1 } }
+        ).sort({ createdAt: -1 });
+      }
+
       if (!activeDoc) {
         await safeRelease();
         return res.json({
@@ -1079,24 +1095,19 @@ exports.updateLocation = async (req, res) => {
               : 'AGTRIE_X_V14_DEPARTURE_BREAKOUT_ACCEPTED';
 
             if (departureDistKm > 1.5) {
-              const isDuplicateGapSegment = ledgerSegments.some(s => 
-                s.reason === 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED' &&
-                Math.abs(new Date(s.toTimestamp).getTime() - timestamp.getTime()) < 5 * 60 * 1000
+              const isDuplicateGap = await isDuplicateGapOverlapping(
+                sessionId,
+                new Date(lastTrustedMs),
+                timestamp,
+                centroidLat,
+                centroidLng,
+                lat,
+                lng,
+                departureDistKm,
+                ledgerSegments
               );
-              let existingGapInDb = null;
-              if (!isDuplicateGapSegment) {
-                existingGapInDb = await DistanceLedger.findOne({
-                  sessionId,
-                  classification: 'ACCEPTED',
-                  reason: 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED',
-                  $or: [
-                    { fromEventId: safeFromEventId },
-                    { toTimestamp: { $gte: new Date(timestamp.getTime() - 5 * 60 * 1000), $lte: new Date(timestamp.getTime() + 5 * 60 * 1000) } }
-                  ]
-                }).lean();
-              }
 
-              if (isDuplicateGapSegment || existingGapInDb) {
+              if (isDuplicateGap) {
                 console.log(`⚠️ [GAP_COLLISION_PREVENTED] Duplicate departure gap segment detected for session ${sessionId} at ${timestamp.toISOString()}. Ignored.`);
                 stepRoadKm = 0;
                 stepReason = 'DUPLICATE_GAP_COLLISION_IGNORED';
@@ -1280,24 +1291,19 @@ exports.updateLocation = async (req, res) => {
 
           if (isPlausibleHighwaySpeed && accuracy <= 250) {
             const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
-            const isDuplicateGapSegment = ledgerSegments.some(s => 
-              s.reason === 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED' &&
-              Math.abs(new Date(s.toTimestamp).getTime() - timestamp.getTime()) < 5 * 60 * 1000
+            const isDuplicateGap = await isDuplicateGapOverlapping(
+              sessionId,
+              new Date(lastTrustedMs),
+              timestamp,
+              anchorLat,
+              anchorLng,
+              lat,
+              lng,
+              gapDistKm,
+              ledgerSegments
             );
-            let existingGapInDb = null;
-            if (!isDuplicateGapSegment) {
-              existingGapInDb = await DistanceLedger.findOne({
-                sessionId,
-                classification: 'ACCEPTED',
-                reason: 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED',
-                $or: [
-                  { fromEventId: safeFromEventId },
-                  { toTimestamp: { $gte: new Date(timestamp.getTime() - 5 * 60 * 1000), $lte: new Date(timestamp.getTime() + 5 * 60 * 1000) } }
-                ]
-              }).lean();
-            }
 
-            if (isDuplicateGapSegment || existingGapInDb) {
+            if (isDuplicateGap) {
               console.log(`⚠️ [GAP_COLLISION_PREVENTED] Duplicate highway gap segment detected for session ${sessionId} at ${timestamp.toISOString()}. Ignored.`);
             } else {
               const roadKm = curvatureCompensation(gapDistKm, accuracy);
