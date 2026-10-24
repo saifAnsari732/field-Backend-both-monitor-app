@@ -1802,20 +1802,22 @@ exports.stopTracking = async (req, res) => {
       classification: { $in: ['ACCEPTED', 'RECOVERED'] },
       reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' }
     }).lean();
-    let ledgerSumKm = 0;
+    let pureLedgerKm = 0;
     ledgerSegments.forEach(seg => {
-      ledgerSumKm += Number(seg.distanceKm) || ((Number(seg.distanceMeters) || 0) / 1000);
+      pureLedgerKm += Number(seg.distanceKm) || ((Number(seg.distanceMeters) || 0) / 1000);
     });
-    const manualAdded = Number(session.manualDistanceAdded) || 0;
-    ledgerSumKm = Math.round((ledgerSumKm + manualAdded) * 100) / 100;
+    pureLedgerKm = Math.round(pureLedgerKm * 100) / 100;
 
-    const existingSessionKm = Math.max(
-      Number(session.totalDistance) || 0,
-      Number(session.officialDistance) || 0,
-      Number(redisTotalDist) || 0
+    // Distinguish admin manual adjustment from auto 10% punch-out tolerance:
+    // If previous manual adjustment was just the auto punch-out tolerance, separate it out to prevent compounding!
+    const isAutoTolerance = session.manualAdjustmentReason && session.manualAdjustmentReason.includes('Punch Out road compensation');
+    const adminManualAdded = isAutoTolerance ? 0 : (Number(session.manualDistanceAdded) || 0);
+
+    const baseRawGps = Math.max(
+      pureLedgerKm,
+      Number(session.rawGpsDistance) || 0,
+      clientReportedKm
     );
-
-    let candidateKm = Math.max(ledgerSumKm, clientReportedKm, existingSessionKm);
 
     // Sanity check: verify physical displacement and session duration
     let dispKm = 0;
@@ -1828,50 +1830,26 @@ exports.stopTracking = async (req, res) => {
     }
     const sessionStartMs = session.startTime ? new Date(session.startTime).getTime() : (session.createdAt ? new Date(session.createdAt).getTime() : Date.now());
     const sessionDurationHours = Math.max((Date.now() - sessionStartMs) / (1000 * 3600), 0.05);
-    const avgSpeed = candidateKm / sessionDurationHours;
+    const avgSpeed = baseRawGps / sessionDurationHours;
 
-    // If client distance is higher than ledgerSumKm and physically plausible (speed <= 140 km/h and covers at least 70% of straight line displacement):
-    if (candidateKm > ledgerSumKm && avgSpeed <= 140 && (dispKm <= 0.5 || candidateKm >= dispKm * 0.7)) {
-      const missingLedgerKm = Math.round((candidateKm - ledgerSumKm) * 100) / 100;
-      if (missingLedgerKm >= 0.05) {
-        const userOrgId = req.user.organizationId?._id || req.user.organizationId;
-        await DistanceLedger.create({
-          organizationId: userOrgId,
-          employee: req.user._id,
-          sessionId: effectiveSessionId,
-          fromEventId: `${effectiveSessionId}:punchout_recon:from`,
-          toEventId: `${effectiveSessionId}:punchout_recon:to`,
-          fromTimestamp: session.startTime || new Date(),
-          toTimestamp: new Date(),
-          fromLat: session.coordinates?.[0]?.lat || 0,
-          fromLng: session.coordinates?.[0]?.lng || 0,
-          toLat: session.coordinates?.[session.coordinates.length - 1]?.lat || 0,
-          toLng: session.coordinates?.[session.coordinates.length - 1]?.lng || 0,
-          distanceMeters: Math.round(missingLedgerKm * 1000),
-          distanceKm: missingLedgerKm,
-          classification: 'ACCEPTED',
-          reason: 'CLIENT_OFFLINE_ACCUMULATED_ROAD_DISTANCE_HONORED',
-          algorithmVersion: 'AGTRIE-X-v15.0-PURE-GPS'
-        }).catch(() => {});
-        ledgerSumKm += missingLedgerKm;
-      }
-    }
-
-    const gpsKm = Math.round(Math.max(ledgerSumKm, candidateKm) * 100) / 100;
+    let finalPureGpsKm = Math.max(pureLedgerKm, (avgSpeed <= 140 && (dispKm <= 0.5 || baseRawGps >= dispKm * 0.7)) ? baseRawGps : pureLedgerKm);
+    finalPureGpsKm = Math.round(finalPureGpsKm * 100) / 100;
 
     // Automatic 10% punch-out road curvature & network compensation
+    // Strictly computed on pure GPS distance without compounding on multiple punch-outs or retries
     const TOLERANCE_PCT = Number(process.env.PUNCH_OUT_TOLERANCE_PCT ?? 10);
-    const toleranceKm = (gpsKm > 0 && TOLERANCE_PCT > 0) ? Math.round(gpsKm * (TOLERANCE_PCT / 100) * 100) / 100 : 0;
-    const finalOfficialKm = Math.round((gpsKm + toleranceKm) * 100) / 100;
+    const toleranceKm = (finalPureGpsKm > 0 && TOLERANCE_PCT > 0) ? Math.round(finalPureGpsKm * (TOLERANCE_PCT / 100) * 100) / 100 : 0;
+    const totalAddedKm = Math.round((adminManualAdded + toleranceKm) * 100) / 100;
+    const finalOfficialKm = Math.round((finalPureGpsKm + totalAddedKm) * 100) / 100;
 
-    session.acceptedDistance = gpsKm;       // pure raw GPS km
-    session.rawGpsDistance = gpsKm;
+    session.acceptedDistance = finalPureGpsKm;       // pure raw GPS km
+    session.rawGpsDistance = finalPureGpsKm;
     session.totalDistance = finalOfficialKm;
     session.officialDistance = finalOfficialKm;
-    if (toleranceKm > 0) {
-      session.manualDistanceAdded = Math.round(((Number(session.manualDistanceAdded) || 0) + toleranceKm) * 100) / 100;
-      session.manualAdjustmentReason = `${TOLERANCE_PCT}% Punch Out road compensation: GPS ${gpsKm} km + ${toleranceKm} km = ${finalOfficialKm} km`;
-    }
+    session.manualDistanceAdded = totalAddedKm;
+    session.manualAdjustmentReason = toleranceKm > 0
+      ? `${TOLERANCE_PCT}% Punch Out road compensation: GPS ${finalPureGpsKm} km + ${toleranceKm} km = ${finalOfficialKm} km`
+      : (session.manualAdjustmentReason || 'Pure GPS distance');
 
     // Get end address from last coordinate
     if (session.coordinates && session.coordinates.length > 0) {
@@ -1924,6 +1902,9 @@ exports.stopTracking = async (req, res) => {
         status: 'present'
       });
     }
+
+    // Sync User.totalDistanceToday with final authoritative distance (including 10% road compensation)
+    await User.findByIdAndUpdate(req.user._id, { totalDistanceToday: totalDist, isTracking: false });
 
     await ActivityLog.create({
       employee: req.user._id, action: 'TRACKING_STOP',
