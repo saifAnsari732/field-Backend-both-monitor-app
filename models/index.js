@@ -185,6 +185,13 @@ const activityLogSchema = new mongoose.Schema({
   ip: String,
 }, { timestamps: true });
 
+activityLogSchema.pre('save', function (next) {
+  if (this.action === 'TRACKING_AUTO_STOPPED') {
+    return next(new Error('Zero Data Loss Policy: TRACKING_AUTO_STOPPED is prohibited'));
+  }
+  next();
+});
+
 activityLogSchema.index({ organizationId: 1, employee: 1, createdAt: -1 });
 
 // ─── Notification ─────────────────────────────────────────────────────────────
@@ -198,6 +205,16 @@ const notificationSchema = new mongoose.Schema({
   isRead: { type: Boolean, default: false },
   data: mongoose.Schema.Types.Mixed,
 }, { timestamps: true });
+
+notificationSchema.pre('save', function (next) {
+  if (
+    this.title === 'Tracking stopped automatically' ||
+    (this.message && this.message.includes('without accepted GPS movement'))
+  ) {
+    return next(new Error('Zero Data Loss Policy: Auto-stop notifications are prohibited'));
+  }
+  next();
+});
 
 notificationSchema.index({ organizationId: 1, recipient: 1, createdAt: -1 });
 notificationSchema.index({ isRead: 1 });

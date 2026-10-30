@@ -548,6 +548,7 @@ exports.updateLocation = async (req, res) => {
           { $set: { isActive: true, autoClosed: false, lastActivity: new Date() }, $unset: { endTime: 1 } }
         ).catch(() => {});
         await User.findByIdAndUpdate(req.user._id, { isTracking: true }).catch(() => {});
+        await Attendance.findOneAndUpdate({ employee: req.user._id, date: today }, { $unset: { checkOut: 1, punchOutTime: 1 } }).catch(() => {});
         console.log(`🛡️ [AUTO_RESUME] Auto-reactivated today's session ${sessionId} and captured coordinates for ${req.user.name || req.user._id}`);
       }
     }
@@ -3162,6 +3163,12 @@ exports.reconcileAllActiveSessions = async () => {
         console.log(`🛡️ [SENTINEL_GUARDIAN] Auto-restored session ${s.sessionId} for employee ${s.employee} (Immortal Shift Policy)`);
       }
     }
+
+    // Proactive Keepalive: Keep lastActivity fresh on all active shifts today
+    await LiveLocation.updateMany(
+      { date: today, isActive: true },
+      { $set: { lastActivity: now } }
+    ).catch(() => {});
 
     const activeToday = await LiveLocation.find(
       { date: today, isActive: true },
