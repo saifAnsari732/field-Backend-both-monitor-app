@@ -354,6 +354,7 @@ exports.startTracking = async (req, res) => {
       success: true, 
       sessionId: session.sessionId,
       session, 
+      totalDistance: Math.round(totalDistanceToday * 100) / 100,
       totalDistanceToday: Math.round(totalDistanceToday * 100) / 100 
     });
   } catch (err) {
@@ -1797,8 +1798,9 @@ exports.updateLocation = async (req, res) => {
     res.json({ 
       success: true, 
       sessionId,
-      totalDistance: currentTotalDistance, 
+      totalDistance: roundedDayKm, 
       totalDistanceToday: roundedDayKm,
+      sessionDistance: currentTotalDistance,
       exactTotalDistance: exactAuthoritativeSessionKm,
       exactTotalDistanceToday: exactDayKm,
       todayKm: roundedDayKm,

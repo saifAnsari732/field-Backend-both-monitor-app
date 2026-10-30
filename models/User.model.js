@@ -60,6 +60,8 @@ const userSchema = new mongoose.Schema(
     isTracking: { type: Boolean, default: false },
     isOnline: { type: Boolean, default: false },
     lastSeen: { type: Date },
+    totalDistanceToday: { type: Number, default: 0 },
+    distanceTodayDate: { type: String, default: "" },
     socketId: { type: String },
     fcmToken: { type: String },
     mustChangePassword: { type: Boolean, default: false },
