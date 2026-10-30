@@ -1,7 +1,7 @@
 const cron = require('node-cron');
 const { Notification, LiveLocation, User } = require('../models');
 const { reconcileAllActiveSessions } = require('../controllers/tracking.controller');
-const { deleteCacheByPrefix } = require('../utils/cache');
+const { deleteCacheByPrefix } = require('./cache.service');
 
 function getBusinessDate(date = new Date(), timeZone = 'Asia/Kolkata') {
   return new Intl.DateTimeFormat('en-CA', {
