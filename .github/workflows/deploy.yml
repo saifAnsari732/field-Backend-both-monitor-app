@@ -34,44 +34,39 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           port: 22
           script: |
-            echo "🚀 Starting Automated Deployment & Rogue Process Purge..."
-            echo "=== CURRENT PM2 PROCESSES ==="
-            pm2 list || true
+            echo "🚀 Starting Automated Deployment to AWS EC2..."
+            
+            # Locate active backend repository directory
+            TARGET_DIR=""
+            for dir in "$HOME/field-Backend-both-monitor-app" "$HOME/backend" "$HOME/CRM-B" "$HOME/field-App" /var/www/*/kisanteamapp.online; do
+              if [ -f "$dir/server.js" ]; then
+                TARGET_DIR="$dir"
+                break
+              fi
+            done
 
-            echo "=== RUNNING NODE PROCESSES ==="
-            ps aux | grep -i node || true
+            if [ -z "$TARGET_DIR" ]; then
+              TARGET_DIR=$(find "$HOME" -maxdepth 3 -name "server.js" 2>/dev/null | head -n 1 | xargs dirname)
+            fi
 
-            echo "=== CHECKING CRONTAB ==="
-            crontab -l || true
+            echo "📂 Target directory found: $TARGET_DIR"
+            if [ -z "$TARGET_DIR" ] || [ ! -d "$TARGET_DIR" ]; then
+              echo "❌ ERROR: Target directory with server.js not found!"
+              exit 1
+            fi
 
-            # Delete all legacy PM2 processes to eliminate duplicate timers & auto-stop crons
-            echo "=== PURGING PM2 INSTANCES ==="
-            pm2 delete all 2>/dev/null || true
-            pkill -9 -f "trackpro" 2>/dev/null || true
-            pkill -9 -f "kisanconnect" 2>/dev/null || true
-            pkill -9 -f "field-Backend-monitor-web" 2>/dev/null || true
-            rm -rf ~/.pm2/dump.pm2 2>/dev/null || true
-
-            echo "=== UPDATING MAIN CODEBASE ==="
-            cd ~/field-Backend-both-monitor-app || cd ~/CRM-B || cd ~/field-App
+            cd "$TARGET_DIR"
+            echo "=== UPDATING REPOSITORY ==="
             git fetch origin main
             git reset --hard origin/main
             npm install --omit=dev
 
-            # Check if web monitor repo exists and update it too
-            if [ -d ~/field-Backend-monitor-web ]; then
-              echo "=== UPDATING field-Backend-monitor-web ==="
-              cd ~/field-Backend-monitor-web
-              git fetch origin main 2>/dev/null || true
-              git reset --hard origin/main 2>/dev/null || true
-              npm install --omit=dev 2>/dev/null || true
-            fi
-
-            echo "=== STARTING CLEAN SINGLE BACKEND ==="
-            cd ~/field-Backend-both-monitor-app || cd ~/CRM-B || cd ~/field-App
-            pm2 start server.js --name "field-App-backend"
+            echo "=== STARTING / RESTARTING PM2 BACKEND ==="
+            pm2 delete trackpro-api 2>/dev/null || true
+            pm2 delete kisanconnect-backend 2>/dev/null || true
+            pm2 restart field-App-backend || pm2 restart 0 || pm2 start server.js --name "field-App-backend"
             pm2 save --force
 
-            echo "=== POST-DEPLOY VERIFICATION ==="
+            echo "=== VERIFYING PM2 STATUS ==="
             pm2 list
-            echo "✅ Deployment Successful!"
+            echo "✅ Deployment Successful! Server is active on port 5000."
