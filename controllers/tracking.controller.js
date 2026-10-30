@@ -45,6 +45,20 @@ function curvatureCompensation(segmentDistKm, avgAccuracy) {
 }
 
 // In-memory throttle for closed session drop logs (max 1 log per 60s per session)
+// High-precision Haversine distance calculation in meters (WGS84)
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000; // Earth radius in meters
+  const dLat = ((Number(lat2) - Number(lat1)) * Math.PI) / 180;
+  const dLon = ((Number(lon2) - Number(lon1)) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((Number(lat1) * Math.PI) / 180) *
+      Math.cos((Number(lat2) * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
 const closedSessionLogThrottle = new Map();
 
 /**
