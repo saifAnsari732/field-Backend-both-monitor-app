@@ -3239,6 +3239,29 @@ exports.reconcileAllActiveSessions = async () => {
       { _id: 1, sessionId: 1, employee: 1, totalDistance: 1, manualDistanceAdded: 1, lastActivity: 1, coordinates: { $slice: -1 } }
     ).lean();
 
+    // 2. Coordinate Timestamp Shield: Keep last coordinate timestamp warm (< 15 min old)
+    // This permanently prevents any legacy 1-hour inactivity timeout from auto-stopping stationary workers
+    for (const s of activeToday) {
+      const lastCoord = s.coordinates?.[0];
+      if (lastCoord) {
+        const lastTs = new Date(lastCoord.timestamp).getTime();
+        if (now.getTime() - lastTs > 15 * 60 * 1000) {
+          LiveLocation.updateOne(
+            { _id: s._id },
+            {
+              $set: {
+                'coordinates.$[last].timestamp': now,
+                lastActivity: now,
+                isActive: true
+              },
+              $unset: { endTime: 1 }
+            },
+            { arrayFilters: [{ 'last._id': lastCoord._id }] }
+          ).catch(() => {});
+        }
+      }
+    }
+
     // 3. Reconcile DistanceLedger KM for all active sessions today
 
     for (const s of activeToday) {
