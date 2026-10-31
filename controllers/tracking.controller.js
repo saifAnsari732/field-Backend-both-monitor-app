@@ -2154,9 +2154,48 @@ exports.heartbeat = async (req, res) => {
       ? req.body.currentAddress.trim()
       : '';
 
-    // Heartbeat strictly maintains session liveness and keepalive timestamps.
-    // Distance accumulation is exclusively handled by updateLocation via the AGTRIE-X engine.
-    // Heartbeat NEVER adds fake distance from indoor stationary jitter!
+    // ── DUAL-ENGINE AUTO-PROMOTION: Heartbeat Real-Displacement Promotion ──
+    // If client sends heartbeat with coordinates that displaced >= 15m from last anchor,
+    // promote the heartbeat fix to real road distance so walking/riding distance is NEVER dropped!
+    let promotedDistKm = 0;
+    if (hasValidCoords && Number.isFinite(anchorLat) && Number.isFinite(anchorLng)) {
+      const distFromAnchorM = vincentyDistanceMeters(anchorLat, anchorLng, hbLat, hbLng);
+      if (distFromAnchorM >= 15.0 && hbAcc <= 120) {
+        const lastAnchorTimeMs = sessionState?.lastTs
+          ? new Date(sessionState.lastTs).getTime()
+          : (lastCoordDb.timestamp ? new Date(lastCoordDb.timestamp).getTime() : 0);
+        const elapsedSecs = lastAnchorTimeMs > 0 ? Math.max((now.getTime() - lastAnchorTimeMs) / 1000, 1) : 60;
+        const speedKmh = ((distFromAnchorM / 1000) / elapsedSecs) * 3600;
+
+        if (speedKmh <= 150.0) {
+          const straightKm = distFromAnchorM / 1000;
+          promotedDistKm = await getRoadDistanceKm(anchorLat, anchorLng, hbLat, hbLng, straightKm, hbAcc);
+          console.log(`🚀 [HEARTBEAT_PROMOTION] Employee ${req.user._id} moved ${distFromAnchorM.toFixed(1)}m. Promoted heartbeat to +${promotedDistKm.toFixed(3)} km!`);
+
+          const hbPromoEventId = `${sessionId}:hb_promo:${now.getTime()}`;
+          await DistanceLedger.create({
+            organizationId: orgId,
+            employee: req.user._id,
+            sessionId,
+            eventId: hbPromoEventId,
+            startLat: anchorLat,
+            startLng: anchorLng,
+            endLat: hbLat,
+            endLng: hbLng,
+            startTimestamp: new Date(lastAnchorTimeMs || (now.getTime() - 60000)),
+            endTimestamp: now,
+            distanceKm: promotedDistKm,
+            accuracy: hbAcc,
+            classification: 'ACCEPTED',
+            reason: 'HEARTBEAT_DISPLACEMENT_PROMOTED',
+            algorithmVersion: 'AGTRIE-X-v15.0-DUAL-PRO',
+            motionState: hbSpeed >= 3.5 || speedKmh >= 15 ? 'VEHICLE' : 'WALKING',
+            source: 'mobile'
+          }).catch(err => console.error('Error creating hb promo ledger:', err.message));
+        }
+      }
+    }
+
     const updateOps = {
       $set: {
         lastActivity: now,
@@ -2167,14 +2206,41 @@ exports.heartbeat = async (req, res) => {
       $unset: { endTime: 1 }
     };
 
+    if (promotedDistKm > 0) {
+      updateOps.$inc = {
+        totalDistance: promotedDistKm,
+        acceptedDistance: promotedDistKm,
+        officialDistance: promotedDistKm,
+        acceptedPointCount: 1,
+        gpsPointCount: 1
+      };
+      updateOps.$push = {
+        coordinates: {
+          lat: hbLat,
+          lng: hbLng,
+          address: hbAddress || lastCoordDb.address || '',
+          timestamp: now,
+          speed: hbSpeed,
+          accuracy: hbAcc,
+          heading: Number(req.body.heading) || 0,
+          eventId: `${sessionId}:hb:${now.getTime()}`
+        }
+      };
+    }
+
     let updated = await LiveLocation.findOneAndUpdate(
       { sessionId, employee: req.user._id },
       updateOps,
-      { new: true, select: 'totalDistance officialDistance isActive date' }
+      { new: true, select: 'totalDistance officialDistance isActive date coordinates' }
     );
 
-    // Keep user marked as tracking & online
-    await User.findByIdAndUpdate(req.user._id, { isTracking: true, isOnline: true, lastSeen: now }).catch(() => {});
+    // Keep user marked as tracking & online and increment user's totalDistanceToday
+    const userUpdate = { isTracking: true, isOnline: true, lastSeen: now };
+    if (promotedDistKm > 0) {
+      userUpdate.$inc = { totalDistanceToday: promotedDistKm };
+    }
+    await User.findByIdAndUpdate(req.user._id, userUpdate).catch(() => {});
+
     await Attendance.findOneAndUpdate(
       { employee: req.user._id, date: updated?.date || today },
       { $unset: { checkOut: 1 } }
@@ -2186,9 +2252,9 @@ exports.heartbeat = async (req, res) => {
     const finalDist = Number.isFinite(dbDist) && dbDist >= 0
       ? dbDist
       : Math.max(existing.totalDistance || 0, sessionState?.totalDistance || 0);
-    const nextLat = sessionState?.lastLat || lastCoordDb.lat || (hasValidCoords ? hbLat : 0);
-    const nextLng = sessionState?.lastLng || lastCoordDb.lng || (hasValidCoords ? hbLng : 0);
-    const hbMotionState = sessionState?.motionState || 'STATIONARY';
+    const nextLat = (promotedDistKm > 0 || hasValidCoords) ? hbLat : (sessionState?.lastLat || lastCoordDb.lat || 0);
+    const nextLng = (promotedDistKm > 0 || hasValidCoords) ? hbLng : (sessionState?.lastLng || lastCoordDb.lng || 0);
+    const hbMotionState = promotedDistKm > 0 ? (hbSpeed >= 3.5 ? 'VEHICLE' : 'WALKING') : (sessionState?.motionState || 'STATIONARY');
     sessionState = {
       ...(sessionState || {}),
       totalDistance: finalDist,
@@ -2198,7 +2264,7 @@ exports.heartbeat = async (req, res) => {
       lastLng: nextLng,
       centroidLat: sessionState?.centroidLat || nextLat,
       centroidLng: sessionState?.centroidLng || nextLng,
-      lastTs: sessionState?.lastTs || (lastCoordDb.timestamp ? new Date(lastCoordDb.timestamp).toISOString() : now.toISOString()),
+      lastTs: now.toISOString(),
       lastTickMs: now.getTime(),
       lastEventId: sessionState?.lastEventId || null,
       lastHeartbeatTs: now.toISOString(),
