@@ -68,6 +68,29 @@ function curvatureCompensation(segmentDistKm, avgAccuracy) {
 // High-precision Haversine distance calculation in meters (WGS84)
 
 // High-precision WGS-84 Ellipsoidal Vincenty Inverse Geodesic Formula (millimeter accuracy)
+async function getRoadDistanceKm(fromLat, fromLng, toLat, toLng, straightKm, accuracy = 15) {
+  if (!fromLat || !fromLng || !toLat || !toLng || straightKm < 0.35) {
+    return curvatureCompensation(straightKm, accuracy);
+  }
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1200);
+    const url = `http://router.project-osrm.org/route/v1/driving/${Number(fromLng).toFixed(6)},${Number(fromLat).toFixed(6)};${Number(toLng).toFixed(6)},${Number(toLat).toFixed(6)}?overview=false`;
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.code === 'Ok' && data.routes && data.routes[0]?.distance > 0) {
+        const roadKm = data.routes[0].distance / 1000;
+        if (roadKm >= straightKm * 0.95 && roadKm <= straightKm * 2.5) {
+          return Number(roadKm.toFixed(6));
+        }
+      }
+    }
+  } catch (_) {}
+  return curvatureCompensation(straightKm, accuracy);
+}
+
 function vincentyDistanceMeters(lat1, lon1, lat2, lon2) {
   const a = 6378137.0; // WGS-84 semi-major axis
   const b = 6356752.314245; // WGS-84 semi-minor axis
@@ -932,7 +955,7 @@ exports.updateLocation = async (req, res) => {
           prevTimestamp = tMs;
 
           // Apply road curvature compensation for sparse gap / departure segments
-          const effectiveGapKm = curvatureCompensation(dGapKm, accuracy);
+          const effectiveGapKm = await getRoadDistanceKm(fromAnchorLat, fromAnchorLng, lat, lng, dGapKm, accuracy);
 
           const effectiveResumeSpeed = Math.max(reportedSpeedKmh, gapSpeedKmh, 5.0);
           if (effectiveResumeSpeed > batchMaxSpeed && effectiveResumeSpeed <= 160) {
@@ -1173,7 +1196,7 @@ exports.updateLocation = async (req, res) => {
           const rawDepartureKm = Math.max(departureDistKm, dRawKm);
 
           if (rawDepartureKm >= 0.012) {
-            let stepRoadKm = curvatureCompensation(rawDepartureKm, accuracy);
+            let stepRoadKm = await getRoadDistanceKm(centroidLat, centroidLng, lat, lng, rawDepartureKm, accuracy);
             let stepReason = departureDistKm > 1.5
               ? 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED'
               : 'AGTRIE_X_V14_DEPARTURE_BREAKOUT_ACCEPTED';
@@ -1390,7 +1413,7 @@ exports.updateLocation = async (req, res) => {
             if (isDuplicateGap) {
               console.log(`⚠️ [GAP_COLLISION_PREVENTED] Duplicate highway gap segment detected for session ${sessionId} at ${timestamp.toISOString()}. Ignored.`);
             } else {
-              const roadKm = curvatureCompensation(gapDistKm, accuracy);
+              const roadKm = await getRoadDistanceKm(anchorCoord.lat, anchorCoord.lng, lat, lng, gapDistKm, accuracy);
 
               acceptedPoints++;
               acceptedEventIds.push(eventId);
