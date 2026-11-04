@@ -700,7 +700,18 @@ exports.updateLocation = async (req, res) => {
     }
 
     // Step 1: Chronological Sorting & Durable Idempotency Gate
-    const orderedCoordinates = [...coordinates].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    // Extracts true GNSS capture timestamp from eventId if client/network coalesced request timestamps
+    const extractCaptureTime = (c) => {
+      if (c?.eventId && typeof c.eventId === 'string') {
+        const parts = c.eventId.split(':');
+        if (parts.length >= 2 && !isNaN(Number(parts[1])) && Number(parts[1]) > 1700000000000) {
+          return Number(parts[1]);
+        }
+      }
+      return c?.timestamp ? new Date(c.timestamp).getTime() : Date.now();
+    };
+
+    const orderedCoordinates = [...coordinates].sort((a, b) => extractCaptureTime(a) - extractCaptureTime(b));
     
     // Durable Idempotency Gate (drops duplicate retries if already processed by Screen or Background engine)
     const incomingEventIds = [];
@@ -826,8 +837,8 @@ exports.updateLocation = async (req, res) => {
       const coord = nonDuplicateCoordinates[i];
       const lat = Number(coord?.lat);
       const lng = Number(coord?.lng);
-      let timestamp = new Date(coord?.timestamp);
-      let tMs = timestamp.getTime();
+      let tMs = extractCaptureTime(coord);
+      let timestamp = new Date(tMs);
       const eventId = coord?.eventId || `${sessionId}:${tMs}:${lat.toFixed(6)}:${lng.toFixed(6)}`;
 
       // 1. Strict Geographic Boundary Gate (India: Lat 6 to 38, Lng 68 to 98)
@@ -1598,23 +1609,52 @@ exports.updateLocation = async (req, res) => {
 
     // Derive authoritative session total directly from immutable DistanceLedger (ACCEPTED + RECOVERED segments)
     const ledgerAgg = await DistanceLedger.aggregate([
-      { $match: { sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] }, reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' } } },
+      { $match: { sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
       { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
     ]);
     const exactLedgerKm = Number((ledgerAgg[0]?.totalKm || 0).toFixed(5));
     const exactAuthoritativeSessionKm = Number((exactLedgerKm + dbManualAdded).toFixed(5));
     let ledgerKm = Math.round(exactLedgerKm * 100) / 100;
 
-    // Strict Pure GPS Authority: Distance is derived solely from verified geodesic GPS segments in DistanceLedger (+ any manual admin adjustment)
+    // Strict Monotonic Distance Anchor: Distance can NEVER decrease
     const authoritativeSessionKm = Math.round(exactAuthoritativeSessionKm * 100) / 100;
-    currentTotalDistance = exactLedgerKm > 0 ? authoritativeSessionKm : Math.max(currentTotalDistance, authoritativeSessionKm);
+    currentTotalDistance = Math.max(
+      Number(currentTotalDistance) || 0,
+      authoritativeSessionKm,
+      Number(dbLiveDoc?.totalDistance) || 0,
+      Number(dbLiveDoc?.officialDistance) || 0
+    );
 
     const clientScreenKm = Math.max(
       Number(req.body.totalDistance) || 0,
       Number(req.body.clientDistance) || 0,
       ...nonDuplicateCoordinates.map(c => Number(c.screenDistanceKm) || 0)
     );
-    if (clientScreenKm > exactLedgerKm && clientScreenKm <= 350 && clientScreenKm > currentTotalDistance) {
+    if (clientScreenKm > currentTotalDistance && clientScreenKm <= 500) {
+      const clientDeltaKm = Number((clientScreenKm - currentTotalDistance).toFixed(4));
+      if (clientDeltaKm >= 0.02) {
+        const syncSegment = {
+          sessionId,
+          employee: req.user._id,
+          organizationId: orgId,
+          fromEventId: `client_sync:${sessionId}:${Date.now() - 1000}`,
+          toEventId: `client_sync:${sessionId}:${Date.now()}`,
+          fromLat: lastValidLat,
+          fromLng: lastValidLng,
+          toLat: lastValidLat,
+          toLng: lastValidLng,
+          distanceMeters: Math.round(clientDeltaKm * 1000),
+          distanceKm: clientDeltaKm,
+          classification: 'ACCEPTED',
+          reason: 'AGTRIE_X_V15_CLIENT_ACCUMULATED_SYNC',
+          fromTimestamp: new Date(Date.now() - 1000),
+          toTimestamp: new Date(),
+          durationSeconds: 1,
+          speedKmh: 0,
+          accuracy: 5,
+        };
+        await DistanceLedger.create(syncSegment).catch(() => {});
+      }
       currentTotalDistance = clientScreenKm;
     }
 
@@ -1711,10 +1751,6 @@ exports.updateLocation = async (req, res) => {
       const setPayload = {
         isActive: true,
         autoClosed: false,
-        totalDistance: currentTotalDistance,
-        officialDistance: currentTotalDistance,
-        acceptedDistance: currentTotalDistance,
-        rawGpsDistance: currentTotalDistance,
         manualDistanceAdded: dbManualAdded,
         lastActivity: new Date(),
         motionState: currentMotionState,
@@ -1738,6 +1774,10 @@ exports.updateLocation = async (req, res) => {
             rejectedPointCount: rejectedPoints,
           },
           $max: {
+            totalDistance: currentTotalDistance,
+            officialDistance: currentTotalDistance,
+            acceptedDistance: currentTotalDistance,
+            rawGpsDistance: currentTotalDistance,
             worstAccuracy: batchWorstAccuracy,
             maxSpeed: batchMaxSpeed,
           },
@@ -1761,8 +1801,6 @@ exports.updateLocation = async (req, res) => {
       const fallbackSet = {
         isActive: true,
         autoClosed: false,
-        totalDistance: currentTotalDistance,
-        officialDistance: currentTotalDistance,
         manualDistanceAdded: dbManualAdded,
         lastActivity: new Date(),
       };
@@ -1773,6 +1811,12 @@ exports.updateLocation = async (req, res) => {
         { sessionId, employee: req.user._id },
         {
           $set: fallbackSet,
+          $max: {
+            totalDistance: currentTotalDistance,
+            officialDistance: currentTotalDistance,
+            acceptedDistance: currentTotalDistance,
+            rawGpsDistance: currentTotalDistance,
+          },
           $unset: { endTime: 1 }
         },
         { runValidators: true }
@@ -1789,15 +1833,20 @@ exports.updateLocation = async (req, res) => {
       (sum, s) => sum + (s.officialDistance !== undefined && s.officialDistance !== null ? Number(s.officialDistance) : (Number(s.totalDistance) || 0)),
       0
     );
-    const exactDayKm = Number(((exactLedgerKm > 0 ? exactAuthoritativeSessionKm : currentTotalDistance) + otherSessionsKm).toFixed(5));
+    const exactDayKm = Number((currentTotalDistance + otherSessionsKm).toFixed(5));
     const roundedDayKm = Math.round(exactDayKm * 100) / 100;
 
     await Attendance.findOneAndUpdate(
       { employee: req.user._id, date: targetDate },
-      { $unset: { checkOut: 1 }, $set: { totalDistanceTraveled: roundedDayKm } }
+      { $unset: { checkOut: 1 }, $max: { totalDistanceTraveled: roundedDayKm } }
     ).catch(() => {});
 
-    await User.findByIdAndUpdate(req.user._id, { isTracking: true, isOnline: true, lastSeen: new Date() }).catch(() => {});
+    await User.findByIdAndUpdate(req.user._id, {
+      isTracking: true,
+      isOnline: true,
+      lastSeen: new Date(),
+      $max: { totalDistanceToday: roundedDayKm }
+    }).catch(() => {});
 
     const io = req.app.get('io');
     const locationPayload = {
@@ -1907,8 +1956,7 @@ exports.stopTracking = async (req, res) => {
 
     const ledgerSegments = await DistanceLedger.find({
       sessionId: effectiveSessionId,
-      classification: { $in: ['ACCEPTED', 'RECOVERED'] },
-      reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' }
+      classification: { $in: ['ACCEPTED', 'RECOVERED'] }
     }).lean();
     let pureLedgerKm = 0;
     ledgerSegments.forEach(seg => {
@@ -1924,6 +1972,9 @@ exports.stopTracking = async (req, res) => {
     const baseRawGps = Math.max(
       pureLedgerKm,
       Number(session.rawGpsDistance) || 0,
+      Number(session.acceptedDistance) || 0,
+      Number(session.totalDistance) || 0,
+      Number(redisTotalDist) || 0,
       clientReportedKm
     );
 
@@ -1940,7 +1991,7 @@ exports.stopTracking = async (req, res) => {
     const sessionDurationHours = Math.max((Date.now() - sessionStartMs) / (1000 * 3600), 0.05);
     const avgSpeed = baseRawGps / sessionDurationHours;
 
-    let finalPureGpsKm = Math.max(pureLedgerKm, (avgSpeed <= 140 && (dispKm <= 0.5 || baseRawGps >= dispKm * 0.7)) ? baseRawGps : pureLedgerKm);
+    let finalPureGpsKm = Math.max(pureLedgerKm, (avgSpeed <= 140 && baseRawGps <= 600) ? baseRawGps : pureLedgerKm);
     finalPureGpsKm = Math.round(finalPureGpsKm * 100) / 100;
 
     // Automatic 10% punch-out road curvature & network compensation
@@ -1950,10 +2001,10 @@ exports.stopTracking = async (req, res) => {
     const totalAddedKm = Math.round((adminManualAdded + toleranceKm) * 100) / 100;
     const finalOfficialKm = Math.round((finalPureGpsKm + totalAddedKm) * 100) / 100;
 
-    session.acceptedDistance = finalPureGpsKm;       // pure raw GPS km
-    session.rawGpsDistance = finalPureGpsKm;
-    session.totalDistance = finalOfficialKm;
-    session.officialDistance = finalOfficialKm;
+    session.acceptedDistance = Math.max(Number(session.acceptedDistance) || 0, finalPureGpsKm);
+    session.rawGpsDistance = Math.max(Number(session.rawGpsDistance) || 0, finalPureGpsKm);
+    session.totalDistance = Math.max(Number(session.totalDistance) || 0, finalOfficialKm);
+    session.officialDistance = Math.max(Number(session.officialDistance) || 0, finalOfficialKm);
     session.manualDistanceAdded = totalAddedKm;
     session.manualAdjustmentReason = toleranceKm > 0
       ? `${TOLERANCE_PCT}% Punch Out road compensation: GPS ${finalPureGpsKm} km + ${toleranceKm} km = ${finalOfficialKm} km`
@@ -1996,7 +2047,7 @@ exports.stopTracking = async (req, res) => {
       const workHours = Math.max(0, (Date.now() - checkInTime) / (1000 * 60 * 60));
       attRecord.checkOut = new Date();
       attRecord.totalWorkHours = Math.round(workHours * 100) / 100;
-      attRecord.totalDistanceTraveled = totalDist;
+      attRecord.totalDistanceTraveled = Math.max(Number(attRecord.totalDistanceTraveled) || 0, totalDist);
       await attRecord.save();
     } else {
       await Attendance.create({
@@ -2012,7 +2063,7 @@ exports.stopTracking = async (req, res) => {
     }
 
     // Sync User.totalDistanceToday with final authoritative distance (including 10% road compensation)
-    await User.findByIdAndUpdate(req.user._id, { totalDistanceToday: totalDist, isTracking: false });
+    await User.findByIdAndUpdate(req.user._id, { $max: { totalDistanceToday: totalDist }, isTracking: false });
 
     await ActivityLog.create({
       employee: req.user._id, action: 'TRACKING_STOP',
@@ -2313,6 +2364,17 @@ exports.heartbeat = async (req, res) => {
         }
         io.to('user_' + req.user._id).to(String(req.user._id)).emit('employee_location', hbPayload);
       }
+    }
+
+    if (totalDistance > 0) {
+      Attendance.updateOne(
+        { employee: req.user._id, date: existing.date || today },
+        { $max: { totalDistanceTraveled: totalDistance } }
+      ).catch(() => {});
+      User.updateOne(
+        { _id: req.user._id },
+        { $max: { totalDistanceToday: totalDistance } }
+      ).catch(() => {});
     }
 
     res.json({ success: true, sessionId, totalDistance: finalDist, totalDistanceToday: totalDistance, todayKm: totalDistance, motionState: hbMotionState });
