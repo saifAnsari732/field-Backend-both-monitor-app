@@ -260,10 +260,18 @@ exports.getTeamTrackingHistory = async (req, res) => {
         { $match: { sessionId: s.sessionId, classification: 'ACCEPTED' } },
         { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
       ]);
-      if (ledgerAgg && ledgerAgg.length > 0 && typeof ledgerAgg[0].totalKm === 'number' && ledgerAgg[0].totalKm > 0) {
-        const verifiedKm = Math.round(ledgerAgg[0].totalKm * 100) / 100;
-        s.totalDistance = verifiedKm;
-        s.officialDistance = verifiedKm;
+      const ledgerKm = (ledgerAgg && ledgerAgg.length > 0 && typeof ledgerAgg[0].totalKm === 'number') ? ledgerAgg[0].totalKm : 0;
+      const manualAdded = Number(s.manualDistanceAdded) || 0;
+      const ledgerOfficialKm = Math.round((ledgerKm + manualAdded) * 100) / 100;
+      const authoritativeKm = Math.max(Number(s.totalDistance) || 0, Number(s.officialDistance) || 0, ledgerOfficialKm);
+
+      if (authoritativeKm > 0) {
+        s.totalDistance = authoritativeKm;
+        s.officialDistance = authoritativeKm;
+
+
+
+
       }
       return s;
     }));
