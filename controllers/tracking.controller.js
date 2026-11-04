@@ -281,18 +281,23 @@ exports.startTracking = async (req, res) => {
         );
         const existingState = await getSessionState(existingActiveSession.sessionId);
         const lastC = (resumedSession?.coordinates && resumedSession.coordinates[resumedSession.coordinates.length - 1]) || null;
+        const authoritativeKm = Math.max(
+          Number(resumedSession?.officialDistance) || 0,
+          Number(resumedSession?.totalDistance) || 0,
+          Number(existingState?.totalDistance) || 0
+        );
         await saveSessionState(existingActiveSession.sessionId, {
           ...(existingState || {}),
-          totalDistance: Math.max(Number(resumedSession?.totalDistance) || 0, Number(existingState?.totalDistance) || 0),
+          totalDistance: authoritativeKm,
           date: today,
           lastLat: existingState?.lastLat || (lastC ? Number(lastC.lat) : (hasCoords ? lat : null)),
           lastLng: existingState?.lastLng || (lastC ? Number(lastC.lng) : (hasCoords ? lng : null)),
           lastTs: existingState?.lastTs || (lastC?.timestamp ? new Date(lastC.timestamp).toISOString() : new Date().toISOString()),
         }).catch(() => {});
-        await User.findByIdAndUpdate(req.user._id, { isTracking: true, isOnline: true, lastSeen: new Date() });
+        await User.findByIdAndUpdate(req.user._id, { isTracking: true, isOnline: true, lastSeen: new Date(), $max: { totalDistanceToday: authoritativeKm } });
         await Attendance.findOneAndUpdate(
           { employee: req.user._id, date: today },
-          { $unset: { checkOut: 1 } }
+          { $unset: { checkOut: 1 }, $max: { totalDistanceTraveled: authoritativeKm } }
         ).catch(() => {});
         await Promise.all([
           deleteCacheByPrefix('live_locations_'),
@@ -304,8 +309,8 @@ exports.startTracking = async (req, res) => {
           success: true,
           message: 'Active shift resumed.',
           sessionId: existingActiveSession.sessionId,
-          totalDistance: resumedSession?.totalDistance || 0,
-          totalDistanceToday: resumedSession?.totalDistance || 0,
+          totalDistance: authoritativeKm,
+          totalDistanceToday: authoritativeKm,
           startTime: resumedSession?.startTime || existingActiveSession.startTime,
           session: resumedSession || existingActiveSession,
         });
@@ -2224,17 +2229,20 @@ exports.heartbeat = async (req, res) => {
           console.log(`🚀 [HEARTBEAT_PROMOTION] Employee ${req.user._id} moved ${distFromAnchorM.toFixed(1)}m. Promoted heartbeat to +${promotedDistKm.toFixed(3)} km!`);
 
           const hbPromoEventId = `${sessionId}:hb_promo:${now.getTime()}`;
+          const fromEvtId = sessionState?.lastEventId || `${sessionId}:hb_anchor:${lastAnchorTimeMs || (now.getTime() - 60000)}`;
           await DistanceLedger.create({
             organizationId: orgId,
             employee: req.user._id,
             sessionId,
-            eventId: hbPromoEventId,
-            startLat: anchorLat,
-            startLng: anchorLng,
-            endLat: hbLat,
-            endLng: hbLng,
-            startTimestamp: new Date(lastAnchorTimeMs || (now.getTime() - 60000)),
-            endTimestamp: now,
+            fromEventId: fromEvtId,
+            toEventId: hbPromoEventId,
+            fromLat: anchorLat,
+            fromLng: anchorLng,
+            toLat: hbLat,
+            toLng: hbLng,
+            fromTimestamp: new Date(lastAnchorTimeMs || (now.getTime() - 60000)),
+            toTimestamp: now,
+            distanceMeters: Math.round(promotedDistKm * 1000),
             distanceKm: promotedDistKm,
             accuracy: hbAcc,
             classification: 'ACCEPTED',
