@@ -1974,13 +1974,18 @@ exports.stopTracking = async (req, res) => {
     const isAutoTolerance = session.manualAdjustmentReason && session.manualAdjustmentReason.includes('Punch Out road compensation');
     const adminManualAdded = isAutoTolerance ? 0 : (Number(session.manualDistanceAdded) || 0);
 
+    // Official-inclusive values (totalDistance, Redis total, client screen KM) already contain the
+    // previous manual/auto compensation. Strip it before using them as PURE GPS, otherwise every
+    // resume + punch-out cycle compounds another 10% on top of the last 10% (KM inflation bug).
+    const prevManualKm = Number(session.manualDistanceAdded) || 0;
+    const stripManual = (v) => Math.max((Number(v) || 0) - prevManualKm, 0);
+
     const baseRawGps = Math.max(
       pureLedgerKm,
-      Number(session.rawGpsDistance) || 0,
       Number(session.acceptedDistance) || 0,
-      Number(session.totalDistance) || 0,
-      Number(redisTotalDist) || 0,
-      clientReportedKm
+      stripManual(session.totalDistance),
+      stripManual(redisTotalDist),
+      stripManual(clientReportedKm)
     );
 
     // Sanity check: verify physical displacement and session duration
@@ -2873,19 +2878,25 @@ const recalculateSessionFromPoints = async (sessionId, sessionDate, sessionDocId
     }
 
     // Monotonic invariant: Never wipe out an already higher official or ledger distance
-    const currentHigherKm = Math.max(
-      Number(session.totalDistance) || 0,
-      Number(session.officialDistance) || 0,
-      Number(session.rawGpsDistance) || 0
+    const manualAdded = Number(session.manualDistanceAdded) || 0;
+    const rawCalculatedKm = Math.round(totalDistKm * 100) / 100;
+    const pureGpsKm = Math.max(
+      rawCalculatedKm,
+      Number(session.rawGpsDistance) || 0,
+      Number(session.acceptedDistance) || 0
     );
-    totalDistKm = Math.max(Math.round(totalDistKm * 100) / 100, currentHigherKm);
+    const finalOfficialKm = Math.max(
+      Math.round((pureGpsKm + manualAdded) * 100) / 100,
+      Number(session.totalDistance) || 0,
+      Number(session.officialDistance) || 0
+    );
 
     // If existing ledgers already exceed points calculation (e.g. road gap or commute ledgers), protect them!
     const existingLedgers = await DistanceLedger.find({ sessionId: actualSessionId, classification: 'ACCEPTED' }).lean();
     let existingLedgerTotal = 0;
     existingLedgers.forEach(l => existingLedgerTotal += Number(l.distanceKm) || 0);
 
-    if (ledgerSegments.length > 0 && totalDistKm >= existingLedgerTotal) {
+    if (ledgerSegments.length > 0 && pureGpsKm >= existingLedgerTotal) {
       await DistanceLedger.deleteMany({ sessionId: actualSessionId });
       try {
         await DistanceLedger.insertMany(ledgerSegments, { ordered: false });
@@ -2898,10 +2909,10 @@ const recalculateSessionFromPoints = async (sessionId, sessionDate, sessionDocId
       { _id: session._id },
       { 
         $max: { 
-          totalDistance: totalDistKm, 
-          officialDistance: totalDistKm,
-          acceptedDistance: totalDistKm,
-          rawGpsDistance: totalDistKm
+          totalDistance: finalOfficialKm, 
+          officialDistance: finalOfficialKm,
+          acceptedDistance: pureGpsKm,
+          rawGpsDistance: pureGpsKm
         } 
       }
     );
@@ -2910,7 +2921,7 @@ const recalculateSessionFromPoints = async (sessionId, sessionDate, sessionDocId
     const allEmpSessions = await LiveLocation.find({ employee: session.employee, date: targetDate });
     const empDayTotal = allEmpSessions.reduce((sum, s) => {
       const isCurrent = s._id.toString() === session._id.toString();
-      return sum + (isCurrent ? totalDistKm : (s.totalDistance || 0));
+      return sum + (isCurrent ? finalOfficialKm : (s.totalDistance || 0));
     }, 0);
 
     await Attendance.updateOne(
@@ -2921,10 +2932,10 @@ const recalculateSessionFromPoints = async (sessionId, sessionDate, sessionDocId
     const currentState = (await getSessionState(actualSessionId)) || {};
     await saveSessionState(actualSessionId, {
       ...currentState,
-      totalDistance: totalDistKm
+      totalDistance: finalOfficialKm
     });
 
-    return totalDistKm;
+    return finalOfficialKm;
   } catch (err) {
     console.error(`[recalculateSessionFromPoints] Error for ${sessionId}:`, err.message);
     return 0;
@@ -3439,7 +3450,7 @@ exports.reconcileAllActiveSessions = async () => {
 
     const activeToday = await LiveLocation.find(
       { date: today, isActive: true },
-      { _id: 1, sessionId: 1, employee: 1, totalDistance: 1, manualDistanceAdded: 1, lastActivity: 1, coordinates: { $slice: -1 } }
+      { _id: 1, sessionId: 1, employee: 1, organizationId: 1, startTime: 1, createdAt: 1, totalDistance: 1, officialDistance: 1, rawGpsDistance: 1, acceptedDistance: 1, manualDistanceAdded: 1, lastActivity: 1, coordinates: { $slice: -1 } }
     ).lean();
 
     // 2. Coordinate Timestamp Shield: Keep last coordinate timestamp warm (< 15 min old)
@@ -3490,19 +3501,23 @@ exports.reconcileAllActiveSessions = async () => {
             const overlapMs = overlapEnd - overlapStart;
             const minDur = Math.min(t1End - t1Start, t2End - t2Start);
 
-            // True duplicate replay guard: must overlap in BOTH time (>60%) AND space (<1500m)
-            // Never reject return trips (A->B and B->A) or separate journeys at different times
+            // Duplicate replay guard.
+            // - Time duplicate: two real segments of ONE session cannot cover the same time window (>60% overlap).
+            // - Corridor duplicate: same direction A->B (both ends < 1500 m) with similar length (ratio 0.75-1.33)
+            //   is a replayed gap. Return trips (B->A) never match because from/to ends are swapped.
             const isTimeDup = overlapMs > 0 && minDur > 60000 && (overlapMs / minDur) > 0.60;
             const isSpatialDup = l1.fromLat && l2.fromLat && l1.toLat && l2.toLat &&
               haversineMeters(l1.fromLat, l1.fromLng, l2.fromLat, l2.fromLng) < 1500 &&
               haversineMeters(l1.toLat, l1.toLng, l2.toLat, l2.toLng) < 1500;
+            const kmRatio = (Number(l2.distanceKm) || 0) / Math.max(Number(l1.distanceKm) || 0, 0.001);
+            const isCorridorDup = isSpatialDup && kmRatio >= 0.75 && kmRatio <= 1.33;
 
-            const isReconLedger = (l1.fromEventId && l1.fromEventId.startsWith('recon:')) ||
-                                  (l2.fromEventId && l2.fromEventId.startsWith('recon:')) ||
-                                  (l1.reason && l1.reason.includes('RESTORE')) ||
-                                  (l2.reason && l2.reason.includes('RESTORE'));
+            // Reconciliation / anchor ledgers have synthetic wide time windows - never use them for dedup
+            const isSyntheticLedger = (l) => (l.fromEventId && /^(recon|anchor):/.test(l.fromEventId)) ||
+                                             (l.reason && (l.reason.includes('RESTORE') || l.reason.includes('ANCHOR')));
+            const isReconLedger = isSyntheticLedger(l1) || isSyntheticLedger(l2);
 
-            if (!isReconLedger && isTimeDup && isSpatialDup) {
+            if (!isReconLedger && (isTimeDup || isCorridorDup)) {
               console.log(`🛡️ [SENTINEL_DEDUP] Genuine duplicate replay rejected in session ${s.sessionId}: ${l2._id}`);
               await DistanceLedger.updateOne(
                 { _id: l2._id },
@@ -3531,34 +3546,42 @@ exports.reconcileAllActiveSessions = async () => {
       // If authoritative distance exceeds ledger sum (e.g. unledgered commute/corridor travel),
       // anchor the missing delta into DistanceLedger so ledger aggregates permanently match!
       const missingLedgerKm = Math.round((authoritativeKm - manualAdded - ledgerKm) * 100) / 100;
-      if (missingLedgerKm >= 0.10) {
-        const c0 = (s.coordinates && s.coordinates.length > 0) ? s.coordinates[0] : null;
-        const cEnd = (s.coordinates && s.coordinates.length > 1) ? s.coordinates[s.coordinates.length - 1] : c0;
-        const anchorFromLat = c0?.lat || 26.9248;
-        const anchorFromLng = c0?.lng || 80.9250;
-        const anchorToLat = cEnd?.lat || anchorFromLat;
-        const anchorToLng = cEnd?.lng || anchorFromLng;
-
-        await DistanceLedger.create({
-          sessionId: s.sessionId,
-          employee: s.employee,
-          organizationId: s.organizationId,
-          fromEventId: `anchor:${s.sessionId}:start`,
-          toEventId: `anchor:${s.sessionId}:end`,
-          fromLat: anchorFromLat,
-          fromLng: anchorFromLng,
-          toLat: anchorToLat,
-          toLng: anchorToLng,
-          distanceMeters: Math.round(missingLedgerKm * 1000),
-          distanceKm: missingLedgerKm,
-          classification: 'ACCEPTED',
-          reason: 'AGTRIE_X_CORRIDOR_ANCHOR_RESTORE',
-          fromTimestamp: s.startTime || new Date(),
-          toTimestamp: s.lastActivity || new Date(),
-          speedKmh: 25.0,
-          accuracy: 5
-        }).catch(err => console.error('Auto-anchor create error:', err.message));
-        console.log(`🛡️ [AUTO_ANCHOR] Synthesized ${missingLedgerKm} km anchor ledger for session ${s.sessionId}`);
+      // Sanity gate: never cement an impossible distance into the ledger (avg speed must be <= 140 km/h, total <= 600 km)
+      const sessionStartMs = s.startTime ? new Date(s.startTime).getTime() : (s.createdAt ? new Date(s.createdAt).getTime() : now.getTime());
+      const sessionHours = Math.max((now.getTime() - sessionStartMs) / 3600000, 0.25);
+      const anchorPlausible = authoritativeKm <= 600 && (authoritativeKm / sessionHours) <= 140;
+      if (missingLedgerKm >= 0.10 && anchorPlausible) {
+        const lastC = (s.coordinates && s.coordinates.length > 0) ? s.coordinates[s.coordinates.length - 1] : null;
+        const anchorLat = Number(lastC?.lat);
+        const anchorLng = Number(lastC?.lng);
+        if (Number.isFinite(anchorLat) && Number.isFinite(anchorLng)) {
+          const anchorTs = Date.now();
+          try {
+            await DistanceLedger.create({
+              sessionId: s.sessionId,
+              employee: s.employee,
+              organizationId: s.organizationId,
+              // Unique per anchor (unique index on sessionId+fromEventId+toEventId)
+              fromEventId: `anchor:${s.sessionId}:${anchorTs}:from`,
+              toEventId: `anchor:${s.sessionId}:${anchorTs}:to`,
+              fromLat: anchorLat,
+              fromLng: anchorLng,
+              toLat: anchorLat,
+              toLng: anchorLng,
+              distanceMeters: Math.round(missingLedgerKm * 1000),
+              distanceKm: missingLedgerKm,
+              classification: 'ACCEPTED',
+              reason: 'AGTRIE_X_CORRIDOR_ANCHOR_RESTORE',
+              // Zero-width window so the anchor can never time-overlap a real segment
+              fromTimestamp: new Date(anchorTs),
+              toTimestamp: new Date(anchorTs),
+              accuracy: 5
+            });
+            console.log(`🛡️ [AUTO_ANCHOR] Anchored ${missingLedgerKm} km unledgered distance for session ${s.sessionId}`);
+          } catch (anchorErr) {
+            console.error('Auto-anchor create error:', anchorErr.message);
+          }
+        }
       }
 
       const finalPureGps = Math.max(ledgerKm + Math.max(missingLedgerKm, 0), Number(s.rawGpsDistance) || 0, Number(s.acceptedDistance) || 0);
