@@ -1630,41 +1630,15 @@ exports.updateLocation = async (req, res) => {
       Number(dbLiveDoc?.officialDistance) || 0
     );
 
-    // Stale Client Cache & Micro-Drift Guard:
-    // Only accept micro-drift (<= 150m) if the session has established travel.
-    // NEVER accept giant jumps (> 250m) or stale carryover from yesterday (> 1km when server is near 0).
+    // Pure Physical Geodesic Invariant:
+    // DistanceLedger is strictly reserved for verified physical coordinate-to-coordinate steps.
+    // Client-reported screen distance is tracked purely for diagnostic telemetry,
+    // and is NEVER synthesized into fake zero-displacement ledgers.
     const clientScreenKm = Math.max(
       Number(req.body.totalDistance) || 0,
       Number(req.body.clientDistance) || 0,
       ...nonDuplicateCoordinates.map(c => Number(c.screenDistanceKm) || 0)
     );
-    const clientDeltaKm = Number((clientScreenKm - currentTotalDistance).toFixed(4));
-    // Plausibility gate: Client delta must be subtle (between 20m and 150m), session cannot be jump-seeded from 0
-    const isPlausibleClientMicroSync = clientDeltaKm >= 0.02 && clientDeltaKm <= 0.15 && currentTotalDistance > 0.1;
-    if (isPlausibleClientMicroSync) {
-      const syncSegment = {
-        sessionId,
-        employee: req.user._id,
-        organizationId: orgId,
-        fromEventId: `client_sync:${sessionId}:${Date.now() - 1000}`,
-        toEventId: `client_sync:${sessionId}:${Date.now()}`,
-        fromLat: lastValidLat,
-        fromLng: lastValidLng,
-        toLat: lastValidLat,
-        toLng: lastValidLng,
-        distanceMeters: Math.round(clientDeltaKm * 1000),
-        distanceKm: clientDeltaKm,
-        classification: 'ACCEPTED',
-        reason: 'AGTRIE_X_V15_CLIENT_ACCUMULATED_SYNC',
-        fromTimestamp: new Date(Date.now() - 1000),
-        toTimestamp: new Date(),
-        durationSeconds: 1,
-        speedKmh: 0,
-        accuracy: 5,
-      };
-      await DistanceLedger.create(syncSegment).catch(() => {});
-      currentTotalDistance = clientScreenKm;
-    }
 
     // Bulk update TrackingPoint statuses
     if (acceptedEventIds.length > 0) {
@@ -1983,12 +1957,18 @@ exports.stopTracking = async (req, res) => {
     const prevManualKm = Number(session.manualDistanceAdded) || 0;
     const stripManual = (v) => Math.max((Number(v) || 0) - prevManualKm, 0);
 
+    // Client-reported screen distance can only be considered if supported by physical ledger travel
+    // (cannot be an arbitrary jump or stale rollover from yesterday).
+    const sanitizedClientKm = (pureLedgerKm > 0 && clientReportedKm <= Math.max(pureLedgerKm * 1.35, pureLedgerKm + 2.0))
+      ? stripManual(clientReportedKm)
+      : pureLedgerKm;
+
     const baseRawGps = Math.max(
       pureLedgerKm,
       Number(session.acceptedDistance) || 0,
       stripManual(session.totalDistance),
       stripManual(redisTotalDist),
-      stripManual(clientReportedKm)
+      sanitizedClientKm
     );
 
     // Sanity check: verify physical displacement and session duration
