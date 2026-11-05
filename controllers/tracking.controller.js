@@ -1630,36 +1630,39 @@ exports.updateLocation = async (req, res) => {
       Number(dbLiveDoc?.officialDistance) || 0
     );
 
+    // Stale Client Cache & Micro-Drift Guard:
+    // Only accept micro-drift (<= 150m) if the session has established travel.
+    // NEVER accept giant jumps (> 250m) or stale carryover from yesterday (> 1km when server is near 0).
     const clientScreenKm = Math.max(
       Number(req.body.totalDistance) || 0,
       Number(req.body.clientDistance) || 0,
       ...nonDuplicateCoordinates.map(c => Number(c.screenDistanceKm) || 0)
     );
-    if (clientScreenKm > currentTotalDistance && clientScreenKm <= 500) {
-      const clientDeltaKm = Number((clientScreenKm - currentTotalDistance).toFixed(4));
-      if (clientDeltaKm >= 0.02) {
-        const syncSegment = {
-          sessionId,
-          employee: req.user._id,
-          organizationId: orgId,
-          fromEventId: `client_sync:${sessionId}:${Date.now() - 1000}`,
-          toEventId: `client_sync:${sessionId}:${Date.now()}`,
-          fromLat: lastValidLat,
-          fromLng: lastValidLng,
-          toLat: lastValidLat,
-          toLng: lastValidLng,
-          distanceMeters: Math.round(clientDeltaKm * 1000),
-          distanceKm: clientDeltaKm,
-          classification: 'ACCEPTED',
-          reason: 'AGTRIE_X_V15_CLIENT_ACCUMULATED_SYNC',
-          fromTimestamp: new Date(Date.now() - 1000),
-          toTimestamp: new Date(),
-          durationSeconds: 1,
-          speedKmh: 0,
-          accuracy: 5,
-        };
-        await DistanceLedger.create(syncSegment).catch(() => {});
-      }
+    const clientDeltaKm = Number((clientScreenKm - currentTotalDistance).toFixed(4));
+    // Plausibility gate: Client delta must be subtle (between 20m and 150m), session cannot be jump-seeded from 0
+    const isPlausibleClientMicroSync = clientDeltaKm >= 0.02 && clientDeltaKm <= 0.15 && currentTotalDistance > 0.1;
+    if (isPlausibleClientMicroSync) {
+      const syncSegment = {
+        sessionId,
+        employee: req.user._id,
+        organizationId: orgId,
+        fromEventId: `client_sync:${sessionId}:${Date.now() - 1000}`,
+        toEventId: `client_sync:${sessionId}:${Date.now()}`,
+        fromLat: lastValidLat,
+        fromLng: lastValidLng,
+        toLat: lastValidLat,
+        toLng: lastValidLng,
+        distanceMeters: Math.round(clientDeltaKm * 1000),
+        distanceKm: clientDeltaKm,
+        classification: 'ACCEPTED',
+        reason: 'AGTRIE_X_V15_CLIENT_ACCUMULATED_SYNC',
+        fromTimestamp: new Date(Date.now() - 1000),
+        toTimestamp: new Date(),
+        durationSeconds: 1,
+        speedKmh: 0,
+        accuracy: 5,
+      };
+      await DistanceLedger.create(syncSegment).catch(() => {});
       currentTotalDistance = clientScreenKm;
     }
 
