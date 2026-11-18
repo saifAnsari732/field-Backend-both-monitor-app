@@ -128,6 +128,7 @@ const meetingSchema = new mongoose.Schema({
   status: { type: String, enum: ['scheduled', 'completed', 'cancelled', 'follow-up'], default: 'scheduled' },
   dealAmount: { type: Number, default: 0 },
   followUpDate: Date,
+  selfieUrl: { type: String, default: null },
   images: [String],
   location: { lat: Number, lng: Number },
   date: { type: Date, default: Date.now },

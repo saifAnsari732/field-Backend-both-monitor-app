@@ -1190,14 +1190,14 @@ exports.updateLocation = async (req, res) => {
           effectiveDtSecs >= 60 &&
           accuracy <= 220;
 
-        // Direct single-step departure breakout: physical displacement >= 12m with speed >= 2.0 km/h or screen moving flag
-        const isDirectDopplerBreakout = distFromStationaryAnchorM >= 12.0 &&
-          (effectiveSpeedKmh >= 2.0 || coord.screenMoving === true) &&
+        // Direct single-step departure breakout: require real physical displacement >= 30m with Doppler speed >= 3.0 km/h or displacement >= 65m
+        // (Prevents indoor multi-path reflection / spider-web oscillation while guaranteeing zero-loss when vehicle/walking departs)
+        const isDirectDopplerBreakout = ((distFromStationaryAnchorM >= 30.0 && effectiveSpeedKmh >= 3.0) || distFromStationaryAnchorM >= 65.0) &&
           accuracy <= 120;
 
-        // 2-Point Progressive Breakout (captures slow walking or initial start)
+        // 2-Point Progressive Breakout (captures slow walking or initial street departure)
         let isProgressive2PointBreakout = false;
-        if (!isPointAToBHighwayTravel && !isDirectDopplerBreakout && distFromStationaryAnchorM >= 10.0 && accuracy <= 140) {
+        if (!isPointAToBHighwayTravel && !isDirectDopplerBreakout && distFromStationaryAnchorM >= 20.0 && accuracy <= 120) {
           if (departureCandidate && tMs > departureCandidate.tMs && (tMs - departureCandidate.tMs) <= 180000) {
             const stepFromCandM = haversineDistance(
               { lat: departureCandidate.lat, lng: departureCandidate.lng },
@@ -1205,18 +1205,18 @@ exports.updateLocation = async (req, res) => {
             ) * 1000;
 
             if (
-              distFromStationaryAnchorM >= 14.0 &&
-              stepFromCandM >= 4.0 &&
-              distFromStationaryAnchorM >= departureCandidate.distM + 3.0
+              distFromStationaryAnchorM >= 28.0 &&
+              stepFromCandM >= 6.0 &&
+              distFromStationaryAnchorM >= departureCandidate.distM + 4.0
             ) {
               isProgressive2PointBreakout = true;
-            } else if (distFromStationaryAnchorM < 10.0) {
+            } else if (distFromStationaryAnchorM < 15.0) {
               departureCandidate = null;
             }
           } else {
             departureCandidate = { lat, lng, distM: distFromStationaryAnchorM, tMs, eventId };
           }
-        } else if (distFromStationaryAnchorM < 10.0) {
+        } else if (distFromStationaryAnchorM < 15.0) {
           departureCandidate = null;
         }
 
@@ -1460,15 +1460,17 @@ exports.updateLocation = async (req, res) => {
         // Measure physical moving speed:
         const effectiveMovingSpeedKmh = Math.max(reportedSpeedKmh, rawCalcSpeedKmh, stepCalcSpeedKmh);
         // True stopped pause (red light / brief pause): displacement < 3.0m or (< 5.0m with speed < 1.2 km/h)
-        const isStoppedJitter = (stepDistM < 3.0) || (stepDistM < 5.0 && effectiveMovingSpeedKmh < 1.2 && reportedSpeedKmh < 1.2);
+        // Enhanced indoor jitter & stoppage filter:
+        // Filter out stationary indoor wobble (< 6.0m OR < 18.0m with speed < 2.5 km/h)
+        const isStoppedJitter = (stepDistM < 6.0) || (stepDistM < 18.0 && effectiveMovingSpeedKmh < 2.5 && reportedSpeedKmh < 2.5);
 
         if (isStoppedJitter) {
-          // Micro-movement / Stopped at light / brief pause:
-          if (dt < 60) {
-            // Brief traffic stop (< 60 seconds): Hold anchor and state intact so route NEVER breaks, 0 KM added
+          // Micro-movement / Stopped at light / office desk resting:
+          if (dt < 45) {
+            // Brief traffic pause (< 45 seconds): Hold anchor and state intact so route NEVER breaks, 0 KM added
             acceptedEventIds.push(eventId);
           } else {
-            // Stopped for >= 60 seconds: Arrived at destination or prolonged stop!
+            // Stopped for >= 45 seconds: Arrived at office/home/client destination! Re-anchor to STATIONARY!
             currentMotionState = 'STATIONARY';
             centroidLat = lat;
             centroidLng = lng;
@@ -1477,7 +1479,7 @@ exports.updateLocation = async (req, res) => {
             acceptedEventIds.push(eventId);
           }
           continue;
-        } else if (stepDistM >= 3.0 && stepDistM <= 2500 && !isTeleportation) {
+        } else if (stepDistM >= 6.0 && stepDistM <= 2500 && !isTeleportation) {
           // Valid continuous road step — Haversine GPS distance with curvature compensation & 6-decimal precision
           acceptedPoints++;
           acceptedEventIds.push(eventId);
