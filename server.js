@@ -141,7 +141,7 @@ app.use('/api/trips', require('./routes/trip.routes'));
 app.get('/api/app-version', (req, res) => {
   res.json({
     success: true,
-    version: process.env.APP_LATEST_VERSION || '1.0.40',
+    version: process.env.APP_LATEST_VERSION || '1.0.41',
     minRequiredVersion: process.env.APP_MIN_REQUIRED_VERSION || '1.0.30',
     forceUpdate: process.env.APP_FORCE_UPDATE === 'true',
     releaseNotes: process.env.APP_RELEASE_NOTES || 'KisanConnect is updated with new features and performance improvements.',
