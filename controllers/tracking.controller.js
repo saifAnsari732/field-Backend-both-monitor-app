@@ -664,9 +664,23 @@ exports.updateLocation = async (req, res) => {
       }
     }
 
+    // Extracts true GNSS capture timestamp from eventId if client/network or legacy cron mutated timestamp
+    const extractCaptureTime = (c) => {
+      if (c?.eventId && typeof c.eventId === 'string') {
+        const parts = c.eventId.split(':');
+        if (parts.length >= 2 && !isNaN(Number(parts[1])) && Number(parts[1]) > 1700000000000) {
+          return Number(parts[1]);
+        }
+      }
+      return c?.timestamp ? new Date(c.timestamp).getTime() : Date.now();
+    };
+
     let sessionState = await getSessionState(sessionId);
     if (!sessionState) {
       const lastCoordDb = (activeDoc.coordinates && activeDoc.coordinates[activeDoc.coordinates.length - 1]) || {};
+      const trueDbCoordIso = (lastCoordDb.eventId || lastCoordDb.timestamp)
+        ? new Date(extractCaptureTime(lastCoordDb)).toISOString()
+        : new Date().toISOString();
       sessionState = {
         totalDistance: (activeDoc.officialDistance !== undefined && activeDoc.officialDistance !== null)
           ? Number(activeDoc.officialDistance)
@@ -678,7 +692,8 @@ exports.updateLocation = async (req, res) => {
         date: activeDoc.date,
         lastLat: lastCoordDb.lat || 0,
         lastLng: lastCoordDb.lng || 0,
-        lastTs: lastCoordDb.timestamp || new Date().toISOString(),
+        lastTs: trueDbCoordIso,
+        anchorTs: trueDbCoordIso,
         lastEventId: lastCoordDb.eventId || null,
         kfState: null,
         lastVx: 0,
@@ -691,31 +706,18 @@ exports.updateLocation = async (req, res) => {
       if (latestLedger && latestLedger.toTimestamp) {
         const ledgerTs = new Date(latestLedger.toTimestamp).getTime();
         const currentTs = sessionState.lastTs ? new Date(sessionState.lastTs).getTime() : 0;
-        // CRITICAL FIX: Only overwrite sessionState anchor if latestLedger is strictly newer (ledgerTs >= currentTs)!
-        // Previously, overwriting lastLat/lastLng when ledgerTs < currentTs snapped the anchor back to an hours-old
-        // coordinate while keeping the recent timestamp, causing all future points to fail > 180 km/h teleportation!
         if (ledgerTs >= currentTs && Number.isFinite(latestLedger.toLat) && Number.isFinite(latestLedger.toLng)) {
           sessionState.lastLat = latestLedger.toLat;
           sessionState.lastLng = latestLedger.toLng;
           sessionState.lastEventId = latestLedger.toEventId;
           sessionState.lastTs = new Date(latestLedger.toTimestamp).toISOString();
+          sessionState.anchorTs = sessionState.lastTs;
         }
       }
       await saveSessionState(sessionId, sessionState);
     }
 
     // Step 1: Chronological Sorting & Durable Idempotency Gate
-    // Extracts true GNSS capture timestamp from eventId if client/network coalesced request timestamps
-    const extractCaptureTime = (c) => {
-      if (c?.eventId && typeof c.eventId === 'string') {
-        const parts = c.eventId.split(':');
-        if (parts.length >= 2 && !isNaN(Number(parts[1])) && Number(parts[1]) > 1700000000000) {
-          return Number(parts[1]);
-        }
-      }
-      return c?.timestamp ? new Date(c.timestamp).getTime() : Date.now();
-    };
-
     const orderedCoordinates = [...coordinates].sort((a, b) => extractCaptureTime(a) - extractCaptureTime(b));
     
     // Durable Idempotency Gate (drops duplicate retries if already processed by Screen or Background engine)
@@ -803,8 +805,27 @@ exports.updateLocation = async (req, res) => {
     }
 
     let prevTimestamp = sessionState.lastTs ? new Date(sessionState.lastTs).getTime() : 0;
+    const lastDbCoord = (dbLiveDoc?.coordinates && dbLiveDoc.coordinates.length > 0)
+      ? dbLiveDoc.coordinates[dbLiveDoc.coordinates.length - 1]
+      : null;
+    if (lastDbCoord && lastDbCoord.eventId) {
+      const trueDbCoordMs = extractCaptureTime(lastDbCoord);
+      const distFromDbCoordM = (Number.isFinite(filterLat) && Number.isFinite(filterLng) && Number.isFinite(lastDbCoord.lat) && Number.isFinite(lastDbCoord.lng))
+        ? haversineDistance({ lat: filterLat, lng: filterLng }, { lat: lastDbCoord.lat, lng: lastDbCoord.lng }) * 1000
+        : 0;
+      // Self-heal if Redis lastTs was artificially bumped by a legacy stationary heartbeat or cron at the same spot
+      if (trueDbCoordMs > 0 && trueDbCoordMs < prevTimestamp && distFromDbCoordM < 25.0) {
+        prevTimestamp = trueDbCoordMs;
+      }
+    }
     let lastValidTimestamp = prevTimestamp;
     let lastTickMs = sessionState.lastTickTs ? new Date(sessionState.lastTickTs).getTime() : prevTimestamp;
+    const firstCoordMs = dbLiveDoc?.coordinates?.[0] ? extractCaptureTime(dbLiveDoc.coordinates[0]) : 0;
+    const startSessionMs = dbLiveDoc?.startTime ? new Date(dbLiveDoc.startTime).getTime() : (firstCoordMs || 0);
+    let anchorEstablishedMs = Number(sessionState.anchorTs ? new Date(sessionState.anchorTs).getTime() : 0) ||
+      (lastDbCoord ? extractCaptureTime(lastDbCoord) : 0) ||
+      startSessionMs ||
+      prevTimestamp;
     let lastValidLat = filterLat;
     let lastValidLng = filterLng;
     let lastEventId = sessionState.lastEventId || null;
@@ -1041,6 +1062,7 @@ exports.updateLocation = async (req, res) => {
         lastValidLng = lng;
         lastEventId = eventId;
         prevTimestamp = tMs;
+        anchorEstablishedMs = tMs;
         relockCandidate = null;
         departureCandidate = null;
 
@@ -1156,13 +1178,14 @@ exports.updateLocation = async (req, res) => {
         const departureDistKm = distFromStationaryAnchorM / 1000;
 
         // 🚗 POINT A TO POINT B HIGHWAY / POCKET-SLEEP GAP RECOVERY (>= 1.5 KM or >= 120m over >= 60s):
-        const effectiveDtSecs = (dt < 60 && departureDistKm >= 0.25)
-          ? Math.max(dt, (tMs - (prevTimestamp || (dbLiveDoc?.startTime ? new Date(dbLiveDoc.startTime).getTime() : tMs - 3600000))) / 1000)
+        const effectiveDtSecs = (dt < 60 && departureDistKm >= 0.120)
+          ? Math.max(dt, anchorEstablishedMs > 0 ? (tMs - anchorEstablishedMs) / 1000 : dt)
           : dt;
         const stepDtHours = effectiveDtSecs / 3600;
         const stepSpeedKmh = stepDtHours > 0 ? (departureDistKm / stepDtHours) : 0;
+        const minDepartureSpeedKmh = departureDistKm >= 0.250 ? 0.3 : 2.5;
         const isPointAToBHighwayTravel = departureDistKm >= 0.120 &&
-          stepSpeedKmh >= 2.5 &&
+          stepSpeedKmh >= minDepartureSpeedKmh &&
           stepSpeedKmh <= 150.0 &&
           effectiveDtSecs >= 60 &&
           accuracy <= 220;
@@ -1205,11 +1228,15 @@ exports.updateLocation = async (req, res) => {
           acceptedPoints++;
           acceptedEventIds.push(eventId);
           prevTimestamp = tMs;
+          anchorEstablishedMs = tMs;
           relockCandidate = null;
           departureCandidate = null;
 
           const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
           const rawDepartureKm = Math.max(departureDistKm, dRawKm);
+          const effectiveFromMs = isPointAToBHighwayTravel && anchorEstablishedMs > 0
+            ? Math.min(lastTrustedMs, anchorEstablishedMs)
+            : lastTrustedMs;
 
           if (rawDepartureKm >= 0.012) {
             let stepRoadKm = await getRoadDistanceKm(centroidLat, centroidLng, lat, lng, rawDepartureKm, accuracy);
@@ -1220,7 +1247,7 @@ exports.updateLocation = async (req, res) => {
             if (departureDistKm > 1.5) {
               const isDuplicateGap = await isDuplicateGapOverlapping(
                 sessionId,
-                new Date(lastTrustedMs),
+                new Date(effectiveFromMs),
                 timestamp,
                 centroidLat,
                 centroidLng,
@@ -1244,7 +1271,7 @@ exports.updateLocation = async (req, res) => {
                 sessionId,
                 fromEventId: safeFromEventId,
                 toEventId: eventId,
-                fromTimestamp: new Date(lastTrustedMs),
+                fromTimestamp: new Date(effectiveFromMs),
                 toTimestamp: timestamp,
                 fromLat: centroidLat,
                 fromLng: centroidLng,
@@ -1287,6 +1314,118 @@ exports.updateLocation = async (req, res) => {
             timestamp: timestamp.toISOString()
           });
         } else {
+          // 2-Point Destination Consensus Relock in STATIONARY state:
+          // Prevents anchor from freezing at old location if employee relocated after screen lock / stale initial fix
+          if (!isCoarseJump && accuracy <= 240 && distFromStationaryAnchorM >= 250) {
+            if (relockCandidate && tMs > relockCandidate.tMs && (tMs - relockCandidate.tMs) <= 120000) {
+              const dRelockKm = haversineDistance({ lat: relockCandidate.lat, lng: relockCandidate.lng }, { lat, lng });
+              const dtRelockS = Math.max((tMs - relockCandidate.tMs) / 1000, 1);
+              const relockSpeedKmh = (dRelockKm / dtRelockS) * 3600;
+              if (dRelockKm <= 1.5 && relockSpeedKmh <= 140.0) {
+                console.log(`🛡️ [STATIONARY_SATELLITE_RELOCK] Re-anchoring session ${sessionId} to verified destination (${departureDistKm.toFixed(2)} km away, local step ${(dRelockKm * 1000).toFixed(0)}m at ${relockSpeedKmh.toFixed(1)} km/h)`);
+                currentMotionState = 'MOVING';
+                acceptedPoints++;
+                acceptedEventIds.push(eventId);
+
+                const trueFromMs = anchorEstablishedMs > 0 ? Math.min(lastTrustedMs, anchorEstablishedMs) : lastTrustedMs;
+                const trueCorridorSecs = Math.max((tMs - trueFromMs) / 1000, dt);
+                const trueCorridorSpeedKmh = (departureDistKm / (trueCorridorSecs / 3600));
+                const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
+
+                if (trueCorridorSecs >= 60 && trueCorridorSpeedKmh >= 0.3 && trueCorridorSpeedKmh <= 150.0) {
+                  const isDupCorridor = await isDuplicateGapOverlapping(
+                    sessionId,
+                    new Date(trueFromMs),
+                    timestamp,
+                    centroidLat,
+                    centroidLng,
+                    lat,
+                    lng,
+                    departureDistKm,
+                    ledgerSegments
+                  );
+                  if (!isDupCorridor) {
+                    const corridorRoadKm = await getRoadDistanceKm(centroidLat, centroidLng, lat, lng, departureDistKm, accuracy);
+                    if (corridorRoadKm > 0) {
+                      ledgerSegments.push({
+                        organizationId: orgId,
+                        employee: req.user._id,
+                        sessionId,
+                        fromEventId: safeFromEventId,
+                        toEventId: eventId,
+                        fromTimestamp: new Date(trueFromMs),
+                        toTimestamp: timestamp,
+                        fromLat: centroidLat,
+                        fromLng: centroidLng,
+                        toLat: lat,
+                        toLng: lng,
+                        distanceMeters: Math.round(corridorRoadKm * 1000),
+                        distanceKm: corridorRoadKm,
+                        classification: 'ACCEPTED',
+                        reason: 'POINT_A_TO_POINT_B_ROAD_DISTANCE_ACCEPTED',
+                        algorithmVersion: 'AGTRIE-X-v15.0-PURE-GPS'
+                      });
+                    }
+                  }
+                } else if (dRelockKm >= 0.010) {
+                  ledgerSegments.push({
+                    organizationId: orgId,
+                    employee: req.user._id,
+                    sessionId,
+                    fromEventId: relockCandidate.eventId || safeFromEventId,
+                    toEventId: eventId,
+                    fromTimestamp: new Date(relockCandidate.tMs),
+                    toTimestamp: timestamp,
+                    fromLat: relockCandidate.lat,
+                    fromLng: relockCandidate.lng,
+                    toLat: lat,
+                    toLng: lng,
+                    distanceMeters: Math.round(dRelockKm * 1000),
+                    distanceKm: Math.round(dRelockKm * 1000) / 1000,
+                    classification: 'ACCEPTED',
+                    reason: 'AGTRIE_X_SATELLITE_CONSENSUS_RELOCK',
+                    algorithmVersion: 'AGTRIE-X-v15.0-PURE-GPS'
+                  });
+                }
+
+                filterLat = lat;
+                filterLng = lng;
+                filterPLat = R;
+                filterPLng = R;
+                lastValidLat = lat;
+                lastValidLng = lng;
+                centroidLat = lat;
+                centroidLng = lng;
+                lastEventId = eventId;
+                prevTimestamp = tMs;
+                anchorEstablishedMs = tMs;
+                prev2Valid = prevValid;
+                prevValid = {
+                  lat,
+                  lng,
+                  latRaw: lat,
+                  lngRaw: lng,
+                  accuracy,
+                  speedKmh: Math.max(reportedSpeedKmh, relockSpeedKmh, 4.0),
+                  candidateDistM: 0,
+                  timestamp: timestamp.toISOString(),
+                  heading: coord.heading
+                };
+                relockCandidate = null;
+                departureCandidate = null;
+                validCoords.push({
+                  ...coord,
+                  eventId,
+                  lat,
+                  lng,
+                  timestamp: timestamp.toISOString()
+                });
+                continue;
+              }
+            }
+            relockCandidate = { lat, lng, tMs, accuracy, eventId };
+          }
+
           // Still at stationary spot: Softly converge centroid (EMA) only for true indoor jitter (< 12m), strictly 0 KM added
           if (distFromStationaryAnchorM < 12.0) {
             centroidLat = 0.98 * centroidLat + 0.02 * lat;
@@ -1296,12 +1435,14 @@ exports.updateLocation = async (req, res) => {
           filterLng = snap.lng;
           filterPLat = snap.pLat;
           filterPLng = snap.pLng;
-          prevTimestamp = tMs;
+          if (distFromStationaryAnchorM < 45.0) {
+            prevTimestamp = tMs;
+          }
           lastValidTimestamp = Math.max(lastValidTimestamp, tMs);
           acceptedEventIds.push(eventId);
 
           // Update current position in LiveLocation so admin map always shows fresh real-time spot
-          if (validCoords.length === 0 && i === nonDuplicateCoordinates.length - 1) {
+          if (validCoords.length === 0 && i === nonDuplicateCoordinates.length - 1 && distFromStationaryAnchorM < 250) {
             validCoords.push({
               ...coord,
               eventId,
@@ -1310,6 +1451,7 @@ exports.updateLocation = async (req, res) => {
               timestamp: timestamp.toISOString()
             });
           }
+          continue;
         }
       } else {
         // CURRENT STATE: MOVING ON ROAD
@@ -1320,21 +1462,7 @@ exports.updateLocation = async (req, res) => {
         // True stopped pause (red light / brief pause): displacement < 3.0m or (< 5.0m with speed < 1.2 km/h)
         const isStoppedJitter = (stepDistM < 3.0) || (stepDistM < 5.0 && effectiveMovingSpeedKmh < 1.2 && reportedSpeedKmh < 1.2);
 
-        if (isTeleportation) {
-          // Outlier jump > 180 km/h: discard
-          filterLat = snap.lat;
-          filterLng = snap.lng;
-          filterPLat = snap.pLat;
-          filterPLng = snap.pLng;
-          rejectedPoints++;
-          rejectedEventIds.push(eventId);
-          rejectionReasons.push({
-            timestamp,
-            reason: isCoarseJump ? 'LOW_ACCURACY_COARSE_JUMP' : 'TELEPORTATION_OR_STEP_LIMIT_EXCEEDED',
-            lat, lng, accuracy, speed: effectiveSpeedKmh
-          });
-          continue;
-        } else if (isStoppedJitter) {
+        if (isStoppedJitter) {
           // Micro-movement / Stopped at light / brief pause:
           if (dt < 60) {
             // Brief traffic stop (< 60 seconds): Hold anchor and state intact so route NEVER breaks, 0 KM added
@@ -1344,15 +1472,17 @@ exports.updateLocation = async (req, res) => {
             currentMotionState = 'STATIONARY';
             centroidLat = lat;
             centroidLng = lng;
+            anchorEstablishedMs = tMs;
             departureCandidate = null;
             acceptedEventIds.push(eventId);
           }
           continue;
-        } else if (stepDistM >= 3.0 && stepDistM <= 2500) {
+        } else if (stepDistM >= 3.0 && stepDistM <= 2500 && !isTeleportation) {
           // Valid continuous road step — Haversine GPS distance with curvature compensation & 6-decimal precision
           acceptedPoints++;
           acceptedEventIds.push(eventId);
           prevTimestamp = tMs;
+          anchorEstablishedMs = tMs;
           relockCandidate = null;
           departureCandidate = null;
 
@@ -1405,18 +1535,23 @@ exports.updateLocation = async (req, res) => {
             lng,
             timestamp: timestamp.toISOString()
           });
-        } else if (stepDistM > 2500) {
+        } else if (stepDistM > 2500 && !isCoarseJump) {
           // ── HIGHWAY / POCKET SLEEP GAP: PURE GPS DISTANCE ──
           const gapDistKm = dRawKm;
-          const dtHours = dt / 3600;
+          const effectiveGapDtSecs = (dt < 60)
+            ? Math.max(dt, anchorEstablishedMs > 0 ? (tMs - anchorEstablishedMs) / 1000 : dt)
+            : dt;
+          const dtHours = effectiveGapDtSecs / 3600;
           const gapSpeedKmh = dtHours > 0 ? (gapDistKm / dtHours) : 0;
-          const isPlausibleHighwaySpeed = gapSpeedKmh <= 150.0 && gapSpeedKmh >= 2.0 && dt >= 60;
+          const minMovingGapSpeed = gapDistKm >= 0.250 ? 0.3 : 2.0;
+          const isPlausibleHighwaySpeed = gapSpeedKmh <= 150.0 && gapSpeedKmh >= minMovingGapSpeed && effectiveGapDtSecs >= 60;
 
           if (isPlausibleHighwaySpeed && accuracy <= 250) {
             const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
+            const effectiveFromMs = anchorEstablishedMs > 0 ? Math.min(lastTrustedMs, anchorEstablishedMs) : lastTrustedMs;
             const isDuplicateGap = await isDuplicateGapOverlapping(
               sessionId,
-              new Date(lastTrustedMs),
+              new Date(effectiveFromMs),
               timestamp,
               anchorLat,
               anchorLng,
@@ -1429,11 +1564,12 @@ exports.updateLocation = async (req, res) => {
             if (isDuplicateGap) {
               console.log(`⚠️ [GAP_COLLISION_PREVENTED] Duplicate highway gap segment detected for session ${sessionId} at ${timestamp.toISOString()}. Ignored.`);
             } else {
-              const roadKm = await getRoadDistanceKm(anchorCoord.lat, anchorCoord.lng, lat, lng, gapDistKm, accuracy);
+              const roadKm = await getRoadDistanceKm(anchorLat, anchorLng, lat, lng, gapDistKm, accuracy);
 
               acceptedPoints++;
               acceptedEventIds.push(eventId);
               prevTimestamp = tMs;
+              anchorEstablishedMs = tMs;
               relockCandidate = null;
               departureCandidate = null;
 
@@ -1443,7 +1579,7 @@ exports.updateLocation = async (req, res) => {
                 sessionId,
                 fromEventId: safeFromEventId,
                 toEventId: eventId,
-                fromTimestamp: new Date(lastTrustedMs),
+                fromTimestamp: new Date(effectiveFromMs),
                 toTimestamp: timestamp,
                 fromLat: anchorLat,
                 fromLng: anchorLng,
@@ -1484,6 +1620,10 @@ exports.updateLocation = async (req, res) => {
               lng,
               timestamp: timestamp.toISOString()
             });
+          } else {
+            if (!isCoarseJump && accuracy <= 240) {
+              relockCandidate = { lat, lng, tMs, accuracy, eventId };
+            }
           }
         } else {
         // 2-Point Satellite/Network Consensus Relock (supports up to 240m accuracy):
@@ -1503,6 +1643,7 @@ exports.updateLocation = async (req, res) => {
             centroidLng = lng;
             lastEventId = eventId;
             prevTimestamp = tMs;
+            anchorEstablishedMs = tMs;
             if (dRelockKm >= 0.010) {
               acceptedPoints++;
               ledgerSegments.push({
@@ -1695,6 +1836,7 @@ exports.updateLocation = async (req, res) => {
       centroidLat,
       centroidLng,
       lastTs: new Date(prevValid?.timestamp || sessionState.lastTs || Date.now()).toISOString(),
+      anchorTs: new Date(anchorEstablishedMs || prevValid?.timestamp || sessionState.lastTs || Date.now()).toISOString(),
       lastTickTs: new Date(lastTickMs || Date.now()).toISOString(),
       lastEventId,
       pLat: filterPLat,
@@ -1957,6 +2099,49 @@ exports.stopTracking = async (req, res) => {
     const prevManualKm = Number(session.manualDistanceAdded) || 0;
     const stripManual = (v) => Math.max((Number(v) || 0) - prevManualKm, 0);
 
+    // Sanity check: verify physical displacement and session duration
+    let dispKm = 0;
+    const c0 = (session.coordinates && session.coordinates.length >= 2) ? session.coordinates[0] : null;
+    const cEnd = (session.coordinates && session.coordinates.length >= 2) ? session.coordinates[session.coordinates.length - 1] : null;
+    if (c0?.lat && cEnd?.lat) {
+      dispKm = haversineDistance(c0, cEnd);
+    }
+    const sessionStartMs = session.startTime ? new Date(session.startTime).getTime() : (session.createdAt ? new Date(session.createdAt).getTime() : Date.now());
+    const sessionDurationHours = Math.max((Date.now() - sessionStartMs) / (1000 * 3600), 0.05);
+
+    // ── SCREEN-OFF / ZERO-LEDGER CORRIDOR RECOVERY AT PUNCH-OUT ──
+    // If employee traveled from Point A (c0) to Point B (cEnd) with screen locked (dispKm >= 0.25 km)
+    // at a realistic average speed (0.3 to 135 km/h), but ledger missed the gap due to sleep/heartbeat timing,
+    // recover the verified road distance between c0 and cEnd so genuine field travel is NEVER lost!
+    const dispSpeedKmh = dispKm / sessionDurationHours;
+    if (dispKm >= 0.25 && dispSpeedKmh >= 0.3 && dispSpeedKmh <= 135.0 && pureLedgerKm < dispKm * 0.75) {
+      const recoveredRoadKm = await getRoadDistanceKm(c0.lat, c0.lng, cEnd.lat, cEnd.lng, dispKm, 25);
+      if (recoveredRoadKm > pureLedgerKm) {
+        const missingKm = Number((recoveredRoadKm - pureLedgerKm).toFixed(4));
+        const orgId = session.organizationId || req.user.organizationId?._id || req.user.organizationId;
+        await DistanceLedger.create({
+          organizationId: orgId,
+          employee: req.user._id,
+          sessionId: effectiveSessionId,
+          fromEventId: c0.eventId || `${effectiveSessionId}:start`,
+          toEventId: cEnd.eventId || `${effectiveSessionId}:stop_recovery:${Date.now()}`,
+          fromTimestamp: c0.timestamp ? new Date(c0.timestamp) : new Date(sessionStartMs),
+          toTimestamp: cEnd.timestamp ? new Date(cEnd.timestamp) : new Date(),
+          fromLat: c0.lat,
+          fromLng: c0.lng,
+          toLat: cEnd.lat,
+          toLng: cEnd.lng,
+          distanceMeters: Math.round(missingKm * 1000),
+          distanceKm: missingKm,
+          classification: 'ACCEPTED',
+          reason: 'STOP_TRACKING_CORRIDOR_RECOVERY',
+          algorithmVersion: 'AGTRIE-X-v15.0-PURE-GPS'
+        }).catch(err => console.error('StopTracking corridor recovery ledger error:', err.message));
+        pureLedgerKm = Math.round(recoveredRoadKm * 100) / 100;
+        console.log(`🛡️ [STOP_CORRIDOR_RECOVERY] Recovered ${missingKm.toFixed(2)} km road travel (total pure: ${pureLedgerKm} km) for session ${effectiveSessionId}`);
+      }
+    }
+
     // Client-reported screen distance can only be considered if supported by physical ledger travel
     // (cannot be an arbitrary jump or stale rollover from yesterday).
     const sanitizedClientKm = (pureLedgerKm > 0 && clientReportedKm <= Math.max(pureLedgerKm * 1.35, pureLedgerKm + 2.0))
@@ -1971,17 +2156,6 @@ exports.stopTracking = async (req, res) => {
       sanitizedClientKm
     );
 
-    // Sanity check: verify physical displacement and session duration
-    let dispKm = 0;
-    if (session.coordinates && session.coordinates.length >= 2) {
-      const c0 = session.coordinates[0];
-      const cEnd = session.coordinates[session.coordinates.length - 1];
-      if (c0?.lat && cEnd?.lat) {
-        dispKm = haversineDistance(c0, cEnd);
-      }
-    }
-    const sessionStartMs = session.startTime ? new Date(session.startTime).getTime() : (session.createdAt ? new Date(session.createdAt).getTime() : Date.now());
-    const sessionDurationHours = Math.max((Date.now() - sessionStartMs) / (1000 * 3600), 0.05);
     const avgSpeed = baseRawGps / sessionDurationHours;
 
     let finalPureGpsKm = Math.max(pureLedgerKm, (avgSpeed <= 140 && baseRawGps <= 600) ? baseRawGps : pureLedgerKm);
@@ -2299,8 +2473,21 @@ exports.heartbeat = async (req, res) => {
     const finalDist = Number.isFinite(dbDist) && dbDist >= 0
       ? dbDist
       : Math.max(existing.totalDistance || 0, sessionState?.totalDistance || 0);
-    const nextLat = (promotedDistKm > 0 || hasValidCoords) ? hbLat : (sessionState?.lastLat || lastCoordDb.lat || 0);
-    const nextLng = (promotedDistKm > 0 || hasValidCoords) ? hbLng : (sessionState?.lastLng || lastCoordDb.lng || 0);
+    const hasExistingAnchor = Number.isFinite(Number(sessionState?.lastLat || lastCoordDb.lat)) &&
+      Number(sessionState?.lastLat || lastCoordDb.lat) !== 0;
+    const nextLat = (promotedDistKm > 0 || (!hasExistingAnchor && hasValidCoords))
+      ? hbLat
+      : (sessionState?.lastLat || lastCoordDb.lat || 0);
+    const nextLng = (promotedDistKm > 0 || (!hasExistingAnchor && hasValidCoords))
+      ? hbLng
+      : (sessionState?.lastLng || lastCoordDb.lng || 0);
+    const preservedAnchorTs = sessionState?.lastTs ||
+      (lastCoordDb.timestamp ? new Date(lastCoordDb.timestamp).toISOString() : null) ||
+      (existing.startTime ? new Date(existing.startTime).toISOString() : now.toISOString());
+    const nextLastTs = promotedDistKm > 0 ? now.toISOString() : preservedAnchorTs;
+    const nextAnchorTs = promotedDistKm > 0
+      ? now.toISOString()
+      : (sessionState?.anchorTs || preservedAnchorTs);
     const hbMotionState = promotedDistKm > 0 ? (hbSpeed >= 3.5 ? 'VEHICLE' : 'WALKING') : (sessionState?.motionState || 'STATIONARY');
     sessionState = {
       ...(sessionState || {}),
@@ -2309,10 +2496,11 @@ exports.heartbeat = async (req, res) => {
       date: existing.date || today,
       lastLat: nextLat,
       lastLng: nextLng,
-      centroidLat: sessionState?.centroidLat || nextLat,
-      centroidLng: sessionState?.centroidLng || nextLng,
-      lastTs: now.toISOString(),
-      lastTickMs: now.getTime(),
+      centroidLat: promotedDistKm > 0 ? hbLat : (sessionState?.centroidLat || nextLat),
+      centroidLng: promotedDistKm > 0 ? hbLng : (sessionState?.centroidLng || nextLng),
+      lastTs: nextLastTs,
+      anchorTs: nextAnchorTs,
+      lastTickMs: promotedDistKm > 0 ? now.getTime() : (sessionState?.lastTickMs || now.getTime()),
       lastEventId: sessionState?.lastEventId || null,
       lastHeartbeatTs: now.toISOString(),
       motionState: hbMotionState,
@@ -2803,8 +2991,39 @@ const recalculateSessionFromPoints = async (sessionId, sessionDate, sessionDocId
         if (ts2 <= ts1) continue;
         const dt = Math.max((ts2 - ts1) / 1000, 0.5);
 
-        // Gap Re-Anchoring Policy: Time gaps > 30 minutes indicate offline/rest period. Re-anchor.
+        // Skip stationary/stale heartbeat points so they never overwrite prevPoint.timestamp before a real wakeup fix
+        if (pt.provider === 'heartbeat' && (dRawKm * 1000) < 15.0) {
+          continue;
+        }
+
+        // Gap Re-Anchoring & Screen-Off Travel Recovery Policy (Time gaps > 30 minutes)
         if (dt > 1800) {
+          if (dRawKm >= 0.080) {
+            const gapSpeedKmh = dRawKm / (dt / 3600);
+            const minGapSpeed = dRawKm >= 0.250 ? 0.3 : 2.5;
+            if (gapSpeedKmh >= minGapSpeed && gapSpeedKmh <= 135.0 && accuracy <= 550) {
+              const gapRoadKm = await getRoadDistanceKm(prevPoint.lat, prevPoint.lng, lat, lng, dRawKm, accuracy);
+              totalDistKm += gapRoadKm;
+              ledgerSegments.push({
+                organizationId: session.organizationId,
+                employee: session.employee,
+                sessionId: actualSessionId,
+                fromEventId: prevPoint.eventId || `${actualSessionId}:${ts1}`,
+                toEventId: pt.eventId || `${actualSessionId}:${ts2}`,
+                fromTimestamp: new Date(ts1),
+                toTimestamp: new Date(ts2),
+                fromLat: prevPoint.lat,
+                fromLng: prevPoint.lng,
+                toLat: lat,
+                toLng: lng,
+                distanceMeters: Math.round(gapRoadKm * 1000),
+                distanceKm: gapRoadKm,
+                classification: 'ACCEPTED',
+                reason: 'AGTRIE_X_GAP_TRAVEL_RECOVERED',
+                algorithmVersion: 'AGTRIE-X-v15.0-PURE-GPS'
+              });
+            }
+          }
           prevPoint = pt;
           continue;
         }
@@ -2826,9 +3045,8 @@ const recalculateSessionFromPoints = async (sessionId, sessionDate, sessionDocId
           continue;
         }
 
-        //detyd 2. Stationary jitter gate: low speed & displacement < 35m or micro-step < 8m -> keep anchor coordinates, update timestamp
+        // 2. Stationary jitter gate: low speed & displacement < 35m or micro-step < 8m -> keep anchor coordinates AND original timestamp intact
         if (distM < 8.0 || (effectiveSpeed < 3.5 && distM < 35.0)) {
-          prevPoint = { ...prevPoint, timestamp: pt.timestamp };
           continue;
         }
 
@@ -3436,24 +3654,33 @@ exports.reconcileAllActiveSessions = async () => {
       { _id: 1, sessionId: 1, employee: 1, organizationId: 1, startTime: 1, createdAt: 1, totalDistance: 1, officialDistance: 1, rawGpsDistance: 1, acceptedDistance: 1, manualDistanceAdded: 1, lastActivity: 1, coordinates: { $slice: -1 } }
     ).lean();
 
-    // 2. Coordinate Timestamp Shield: Keep last coordinate timestamp warm (< 15 min old)
-    // This permanently prevents any legacy 1-hour inactivity timeout from auto-stopping stationary workers
+    // 2. Session Keepalive & Coordinate Timestamp Self-Heal Shield:
+    // Keep lastActivity warm without mutating historical coordinate capture timestamps, and self-heal any
+    // coordinate whose timestamp was previously mutated away from its immutable eventId capture timestamp!
     for (const s of activeToday) {
       const lastCoord = s.coordinates?.[0];
       if (lastCoord) {
         const lastTs = new Date(lastCoord.timestamp).getTime();
-        if (now.getTime() - lastTs > 15 * 60 * 1000) {
+        let trueEventMs = 0;
+        if (lastCoord.eventId && typeof lastCoord.eventId === 'string') {
+          const parts = lastCoord.eventId.split(':');
+          if (parts.length >= 2 && !isNaN(Number(parts[1])) && Number(parts[1]) > 1700000000000) {
+            trueEventMs = Number(parts[1]);
+          }
+        }
+        const needsTimestampHeal = trueEventMs > 0 && Math.abs(lastTs - trueEventMs) > 5000;
+        if (needsTimestampHeal || (now.getTime() - lastTs > 15 * 60 * 1000)) {
           LiveLocation.updateOne(
             { _id: s._id },
             {
               $set: {
-                'coordinates.$[last].timestamp': now,
+                ...(needsTimestampHeal ? { 'coordinates.$[last].timestamp': new Date(trueEventMs) } : {}),
                 lastActivity: now,
                 isActive: true
               },
               $unset: { endTime: 1 }
             },
-            { arrayFilters: [{ 'last._id': lastCoord._id }] }
+            needsTimestampHeal ? { arrayFilters: [{ 'last._id': lastCoord._id }] } : undefined
           ).catch(() => {});
         }
       }

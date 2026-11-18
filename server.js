@@ -136,6 +136,20 @@ app.use('/api/notifications', require('./routes/notification.routes'));
 app.use('/api/leaves', require('./routes/leave.routes'));
 app.use('/api/tasks', require('./routes/task.routes'));
 app.use('/api/trips', require('./routes/trip.routes'));
+
+// App Version & Update Check Endpoint
+app.get('/api/app-version', (req, res) => {
+  res.json({
+    success: true,
+    version: process.env.APP_LATEST_VERSION || '1.0.39',
+    minRequiredVersion: process.env.APP_MIN_REQUIRED_VERSION || '1.0.30',
+    forceUpdate: process.env.APP_FORCE_UPDATE === 'true',
+    releaseNotes: process.env.APP_RELEASE_NOTES || 'KisanConnect is updated with new features and performance improvements.',
+    storeUrl: 'market://details?id=com.kisanteam.crm',
+    webUrl: 'https://play.google.com/store/apps/details?id=com.kisanteam.crm'
+  });
+});
+
 const { protect } = require('./middleware/auth.middleware');
 const { LiveLocation, Meeting, DistanceLedger } = require('./models');
 const { liveCache, getSessionState } = require('./services/cache.service');
