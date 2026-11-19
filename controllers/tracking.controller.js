@@ -1190,10 +1190,10 @@ exports.updateLocation = async (req, res) => {
           effectiveDtSecs >= 60 &&
           accuracy <= 220;
 
-        // Direct single-step departure breakout: require real physical displacement >= 30m with Doppler speed >= 3.0 km/h or displacement >= 65m
-        // (Prevents indoor multi-path reflection / spider-web oscillation while guaranteeing zero-loss when vehicle/walking departs)
-        const isDirectDopplerBreakout = ((distFromStationaryAnchorM >= 30.0 && effectiveSpeedKmh >= 3.0) || distFromStationaryAnchorM >= 65.0) &&
-          accuracy <= 120;
+        // Direct single-step departure breakout: require real physical displacement >= 30m with hardware Doppler speed >= 3.0 km/h or displacement >= 65m with clean accuracy
+        // (Prevents indoor multi-path reflection / spider-web oscillation where stepCalcSpeedKmh is artificially high while Doppler speed is 0)
+        const isDirectDopplerBreakout = ((distFromStationaryAnchorM >= 30.0 && reportedSpeedKmh >= 3.0) || (distFromStationaryAnchorM >= 65.0 && accuracy <= 50)) &&
+          accuracy <= 115;
 
         // 2-Point Progressive Breakout (captures slow walking or initial street departure)
         let isProgressive2PointBreakout = false;
@@ -1441,13 +1441,15 @@ exports.updateLocation = async (req, res) => {
           lastValidTimestamp = Math.max(lastValidTimestamp, tMs);
           acceptedEventIds.push(eventId);
 
-          // Update current position in LiveLocation so admin map always shows fresh real-time spot
-          if (validCoords.length === 0 && i === nonDuplicateCoordinates.length - 1 && distFromStationaryAnchorM < 250) {
+          // Only append stationary coordinate if no anchor coordinate has ever been stored in the session yet;
+          // NEVER push stationary indoor jitter coordinates into the polyline array!
+          const hasStoredCoords = Array.isArray(dbLiveDoc?.coordinates) && dbLiveDoc.coordinates.length > 0;
+          if (!hasStoredCoords && validCoords.length === 0 && i === nonDuplicateCoordinates.length - 1) {
             validCoords.push({
               ...coord,
               eventId,
-              lat,
-              lng,
+              lat: centroidLat,
+              lng: centroidLng,
               timestamp: timestamp.toISOString()
             });
           }
@@ -1457,20 +1459,19 @@ exports.updateLocation = async (req, res) => {
         // CURRENT STATE: MOVING ON ROAD
         // Measure continuous pure Haversine geodesic step from last valid committed coordinate!
         const stepDistM = distM;
-        // Measure physical moving speed:
-        const effectiveMovingSpeedKmh = Math.max(reportedSpeedKmh, rawCalcSpeedKmh, stepCalcSpeedKmh);
-        // True stopped pause (red light / brief pause): displacement < 3.0m or (< 5.0m with speed < 1.2 km/h)
-        // Enhanced indoor jitter & stoppage filter:
-        // Filter out stationary indoor wobble (< 6.0m OR < 18.0m with speed < 2.5 km/h)
-        const isStoppedJitter = (stepDistM < 6.0) || (stepDistM < 18.0 && effectiveMovingSpeedKmh < 2.5 && reportedSpeedKmh < 2.5);
+        // Measure physical moving speed (include direct step interval speed so resumed travel after red-light pause is never dropped):
+        const directTickSpeedKmh = stepDt > 0 ? Math.min((dRawKm / Math.max(stepDt, 1)) * 3600, 140.0) : 0;
+        const effectiveMovingSpeedKmh = Math.max(reportedSpeedKmh, rawCalcSpeedKmh, stepCalcSpeedKmh, directTickSpeedKmh);
+        // True stopped pause (red light / brief pause): displacement < 6.0m or (< 18.0m with speed < 2.2 km/h)
+        const isStoppedJitter = (stepDistM < 6.0) || (stepDistM < 18.0 && effectiveMovingSpeedKmh < 2.2 && reportedSpeedKmh < 2.2);
 
         if (isStoppedJitter) {
           // Micro-movement / Stopped at light / office desk resting:
-          if (dt < 45) {
-            // Brief traffic pause (< 45 seconds): Hold anchor and state intact so route NEVER breaks, 0 KM added
+          if (dt < 60) {
+            // Brief traffic pause (< 60 seconds): Hold anchor and state intact so route NEVER breaks, 0 KM added
             acceptedEventIds.push(eventId);
           } else {
-            // Stopped for >= 45 seconds: Arrived at office/home/client destination! Re-anchor to STATIONARY!
+            // Stopped for >= 60 seconds: Arrived at office/home/client destination! Re-anchor to STATIONARY!
             currentMotionState = 'STATIONARY';
             centroidLat = lat;
             centroidLng = lng;
@@ -1757,21 +1758,25 @@ exports.updateLocation = async (req, res) => {
 
     // Derive authoritative session total directly from immutable DistanceLedger (ACCEPTED + RECOVERED segments)
     const ledgerAgg = await DistanceLedger.aggregate([
-      { $match: { sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
+      { $match: { sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] }, reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' } } },
       { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
     ]);
     const exactLedgerKm = Number((ledgerAgg[0]?.totalKm || 0).toFixed(5));
     const exactAuthoritativeSessionKm = Number((exactLedgerKm + dbManualAdded).toFixed(5));
     let ledgerKm = Math.round(exactLedgerKm * 100) / 100;
 
-    // Strict Monotonic Distance Anchor: Distance can NEVER decrease
+    // Strict Geodesic Ledger Authority:
+    // If DistanceLedger segments exist for this session, the sum of verified physical segments (+ admin manual adjustments)
+    // is the exact authoritative truth (never latched to stale unverified client inflation).
     const authoritativeSessionKm = Math.round(exactAuthoritativeSessionKm * 100) / 100;
-    currentTotalDistance = Math.max(
-      Number(currentTotalDistance) || 0,
-      authoritativeSessionKm,
-      Number(dbLiveDoc?.totalDistance) || 0,
-      Number(dbLiveDoc?.officialDistance) || 0
-    );
+    currentTotalDistance = exactLedgerKm > 0
+      ? authoritativeSessionKm
+      : Math.max(
+          Number(currentTotalDistance) || 0,
+          authoritativeSessionKm,
+          Number(dbLiveDoc?.totalDistance) || 0,
+          Number(dbLiveDoc?.officialDistance) || 0
+        );
 
     // Pure Physical Geodesic Invariant:
     // DistanceLedger is strictly reserved for verified physical coordinate-to-coordinate steps.
@@ -2146,17 +2151,18 @@ exports.stopTracking = async (req, res) => {
 
     // Client-reported screen distance can only be considered if supported by physical ledger travel
     // (cannot be an arbitrary jump or stale rollover from yesterday).
-    const sanitizedClientKm = (pureLedgerKm > 0 && clientReportedKm <= Math.max(pureLedgerKm * 1.35, pureLedgerKm + 2.0))
+    const sanitizedClientKm = (pureLedgerKm > 0 && clientReportedKm <= Math.max(pureLedgerKm * 1.15, pureLedgerKm + 0.5))
       ? stripManual(clientReportedKm)
       : pureLedgerKm;
 
-    const baseRawGps = Math.max(
-      pureLedgerKm,
-      Number(session.acceptedDistance) || 0,
-      stripManual(session.totalDistance),
-      stripManual(redisTotalDist),
-      sanitizedClientKm
-    );
+    const baseRawGps = pureLedgerKm > 0
+      ? Math.max(pureLedgerKm, sanitizedClientKm)
+      : Math.max(
+          Number(session.acceptedDistance) || 0,
+          stripManual(session.totalDistance),
+          stripManual(redisTotalDist),
+          sanitizedClientKm
+        );
 
     const avgSpeed = baseRawGps / sessionDurationHours;
 
@@ -2375,19 +2381,22 @@ exports.heartbeat = async (req, res) => {
       : '';
 
     // ── DUAL-ENGINE AUTO-PROMOTION: Heartbeat Real-Displacement Promotion ──
-    // If client sends heartbeat with coordinates that displaced >= 15m from last anchor,
-    // promote the heartbeat fix to real road distance so walking/riding distance is NEVER dropped!
+    // If client sends heartbeat with coordinates that displaced >= 35m from last anchor with real movement (speed >= 2.8 km/h or displacement >= 85m with tight accuracy),
+    // promote the heartbeat fix to real road distance so walking/riding distance is NEVER dropped, while indoor stationary drift (15-35m with 0 speed) adds 0 fake KM!
     let promotedDistKm = 0;
+    const hbSpeedKmh = hbSpeed <= 60 ? hbSpeed * 3.6 : hbSpeed;
     if (hasValidCoords && Number.isFinite(anchorLat) && Number.isFinite(anchorLng)) {
       const distFromAnchorM = vincentyDistanceMeters(anchorLat, anchorLng, hbLat, hbLng);
-      if (distFromAnchorM >= 15.0 && hbAcc <= 120) {
+      const isGenuineHbTravel = (distFromAnchorM >= 35.0 && hbSpeedKmh >= 2.8 && hbAcc <= 90) ||
+        (distFromAnchorM >= 85.0 && hbAcc <= 65);
+      if (isGenuineHbTravel) {
         const lastAnchorTimeMs = sessionState?.lastTs
           ? new Date(sessionState.lastTs).getTime()
           : (lastCoordDb.timestamp ? new Date(lastCoordDb.timestamp).getTime() : 0);
         const elapsedSecs = lastAnchorTimeMs > 0 ? Math.max((now.getTime() - lastAnchorTimeMs) / 1000, 1) : 60;
         const speedKmh = ((distFromAnchorM / 1000) / elapsedSecs) * 3600;
 
-        if (speedKmh <= 150.0) {
+        if (speedKmh >= 2.0 && speedKmh <= 150.0) {
           const straightKm = distFromAnchorM / 1000;
           promotedDistKm = await getRoadDistanceKm(anchorLat, anchorLng, hbLat, hbLng, straightKm, hbAcc);
           console.log(`🚀 [HEARTBEAT_PROMOTION] Employee ${req.user._id} moved ${distFromAnchorM.toFixed(1)}m. Promoted heartbeat to +${promotedDistKm.toFixed(3)} km!`);
