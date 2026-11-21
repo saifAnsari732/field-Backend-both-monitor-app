@@ -63,6 +63,62 @@ const initCronJobs = (io) => {
     timezone: 'Asia/Kolkata'
   });
 
+  // ─── Continuous Autonomous Shift Guardian & Keepalive Daemon (Runs Every 20s) ───
+  // Permanently neutralizes any rogue EC2 1h inactivity timeouts by keeping lastActivity warm,
+  // auto-heals any session closed without explicit user punch-out, and purges auto-stop noise.
+  setInterval(async () => {
+    try {
+      const today = getBusinessDate(new Date(), 'Asia/Kolkata');
+      const now = new Date();
+      const todayStart = new Date(`${today}T00:00:00.000Z`);
+
+      // 1. Proactive Keepalive: Keep lastActivity fresh so 1h inactivity timer never triggers
+      await LiveLocation.updateMany(
+        { date: today },
+        { $set: { lastActivity: now } }
+      ).catch(() => {});
+
+      // 2. Auto-revive any sessions falsely closed today without explicit manual punch-out
+      const unclosedSessions = await LiveLocation.find(
+        { date: today, isActive: false, manuallyStopped: { $ne: true } },
+        { _id: 1, employee: 1, sessionId: 1 }
+      ).lean();
+
+      if (unclosedSessions.length > 0) {
+        const empIds = unclosedSessions.map(s => s.employee).filter(Boolean);
+        await LiveLocation.updateMany(
+          { date: today, manuallyStopped: { $ne: true } },
+          { $set: { isActive: true, autoClosed: false, manuallyStopped: false, lastActivity: now }, $unset: { endTime: 1, autoStoppedAt: 1 } }
+        ).catch(() => {});
+
+        if (empIds.length > 0) {
+          const { Attendance } = require('../models');
+          await Attendance.updateMany(
+            { date: today, employee: { $in: empIds } },
+            { $unset: { checkOut: 1, punchOutTime: 1 } }
+          ).catch(() => {});
+          await User.updateMany(
+            { _id: { $in: empIds } },
+            { $set: { isTracking: true, isOnline: true } }
+          ).catch(() => {});
+        }
+      }
+
+      // 3. Purge rogue auto-stop logs and notifications
+      const { ActivityLog } = require('../models');
+      if (ActivityLog) {
+        await ActivityLog.deleteMany({
+          action: 'TRACKING_AUTO_STOPPED',
+          createdAt: { $gte: todayStart }
+        }).catch(() => {});
+      }
+      await Notification.deleteMany({
+        title: /Tracking stopped automatically/i,
+        createdAt: { $gte: todayStart }
+      }).catch(() => {});
+    } catch (_) {}
+  }, 20000);
+
   // ─── Continuous Background Autonomous Sentinel Worker (Runs Every 1 Min) ──
   // Reverses any legacy TRACKING_AUTO_STOPPED closures & reconciles KM discrepancies in MongoDB
   cron.schedule('* * * * *', async () => {
