@@ -1020,7 +1020,25 @@ exports.updateLocation = async (req, res) => {
           console.log(`📍 [STATIONARY_WAKEUP] Accepted +${effectiveGapKm.toFixed(4)} km after ${(dt / 60).toFixed(0)} min stationary gap (speed: ${effectiveResumeSpeed.toFixed(1)} km/h)`);
           }
         } else if (dGapKm >= 0.080) {
-          // Long gap or overnight jump (>2.5h or >65km or unrealistic speed): Re-anchor to new position WITHOUT adding unverified distance
+          // If this is a supersonic teleport jump (> 135 km/h, e.g. multi-device login from another city 276 km away)
+          // and the session already has established field coordinates, block it from hijacking the field employee's anchor!
+          if (gapSpeedKmh > 135.0 && (activeDoc?.coordinates?.length || 0) >= 2) {
+            console.log(`🛑 [SUPERSONIC_HIJACK_BLOCKED] Rejected ${dGapKm.toFixed(1)} km jump (${gapSpeedKmh.toFixed(1)} km/h) for session ${sessionId} — preserving real field anchor.`);
+            filterLat = snap.lat;
+            filterLng = snap.lng;
+            filterPLat = snap.pLat;
+            filterPLng = snap.pLng;
+            rejectedPoints++;
+            rejectedEventIds.push(eventId);
+            rejectionReasons.push({
+              timestamp,
+              reason: 'AGTRIE_X_SUPERSONIC_TELEPORT_REJECTED',
+              lat, lng, accuracy, speed: gapSpeedKmh
+            });
+            continue;
+          }
+
+          // Long gap or overnight jump (>2.5h or >65km or poor accuracy at plausible speed): Re-anchor to new position WITHOUT adding unverified distance
           const safeFromEventId = lastEventId || (prevValid?.timestamp ? `${sessionId}:${new Date(prevValid.timestamp).getTime()}` : `${sessionId}:start`);
           ledgerSegments.push({
             organizationId: orgId,
@@ -1141,9 +1159,10 @@ exports.updateLocation = async (req, res) => {
           const timeSincePrev2Secs = (tMs - new Date(prev2Valid.timestamp).getTime()) / 1000;
 
           const isMacroPingPong = dRawKm >= 1.5 && distFromPrev2Km <= 0.6 && timeSincePrev2Secs <= 600;
-          // If hardware Doppler speed < 3.0 km/h and GPS bounces out (15m-500m) and returns near prev2Valid (< 50% of step or < 18m) within 3 min:
-          const isMicroPingPong = dRawKm >= 0.015 && dRawKm < 1.5 && reportedSpeedKmh < 3.0 &&
-            distFromPrev2M < Math.max(18.0, distM * 0.55) && timeSincePrev2Secs <= 180;
+          // If GPS bounces out (12m-1500m) and returns near prev2Valid (< 50% of step or < max(20m, acc*0.8)) within 3 min:
+          const isMicroPingPong = dRawKm >= 0.012 && dRawKm < 1.5 &&
+            (reportedSpeedKmh < 4.5 || distFromPrev2M < Math.max(15.0, accuracy * 0.75)) &&
+            distFromPrev2M < Math.max(20.0, distM * 0.55) && timeSincePrev2Secs <= 180;
 
           if (isMacroPingPong || isMicroPingPong) {
             rejectedPoints++;
@@ -1176,18 +1195,25 @@ exports.updateLocation = async (req, res) => {
         const stepSpeedKmh = stepDtHours > 0 ? (departureDistKm / stepDtHours) : 0;
         const minDepartureSpeedKmh = departureDistKm >= 0.250 ? 0.3 : 2.5;
         const isPointAToBHighwayTravel = departureDistKm >= 0.120 &&
+          distFromStationaryAnchorM >= Math.max(120, accuracy * 1.2) &&
           stepSpeedKmh >= minDepartureSpeedKmh &&
           stepSpeedKmh <= 150.0 &&
           effectiveDtSecs >= 60 &&
           accuracy <= 220;
 
-        // Direct single-step departure breakout: require real physical displacement >= 15m with speed >= 1.5 km/h, or displacement >= 25m with clean accuracy
-        const isDirectDopplerBreakout = ((distFromStationaryAnchorM >= 15.0 && (reportedSpeedKmh >= 1.5 || stepCalcSpeedKmh >= 1.5)) || (distFromStationaryAnchorM >= 25.0 && accuracy <= 80)) &&
-          accuracy <= 140;
+        // Direct single-step departure breakout: displacement MUST exceed the GPS uncertainty circle (accuracy * 1.15)
+        // with true hardware Doppler speed >= 2.2 km/h, or clean-accuracy displacement >= max(40m, accuracy * 1.4)
+        const minDirectBreakoutM = Math.max(20.0, accuracy * 1.15);
+        const isDirectDopplerBreakout = (
+          (distFromStationaryAnchorM >= minDirectBreakoutM && reportedSpeedKmh >= 2.2) ||
+          (distFromStationaryAnchorM >= Math.max(40.0, accuracy * 1.4) && accuracy <= 65 && stepCalcSpeedKmh >= 2.5)
+        ) && accuracy <= 110;
 
-        // 2-Point Progressive Breakout (captures slow walking or initial street departure)
+        // 2-Point Progressive Breakout (captures walking or street departure even when phone GPS reports speed=0, while blocking single-point indoor spikes)
         let isProgressive2PointBreakout = false;
-        if (!isPointAToBHighwayTravel && !isDirectDopplerBreakout && distFromStationaryAnchorM >= 8.0 && accuracy <= 140) {
+        const minProgCandM = Math.max(10.0, accuracy * 0.75);
+        const minProgConfirmM = Math.max(16.0, accuracy * 1.05);
+        if (!isPointAToBHighwayTravel && !isDirectDopplerBreakout && distFromStationaryAnchorM >= minProgCandM && accuracy <= 125) {
           if (departureCandidate && tMs > departureCandidate.tMs && (tMs - departureCandidate.tMs) <= 180000) {
             const stepFromCandM = haversineDistance(
               { lat: departureCandidate.lat, lng: departureCandidate.lng },
@@ -1195,18 +1221,18 @@ exports.updateLocation = async (req, res) => {
             ) * 1000;
 
             if (
-              distFromStationaryAnchorM >= 14.0 &&
-              stepFromCandM >= 4.0 &&
-              distFromStationaryAnchorM >= departureCandidate.distM + 3.0
+              distFromStationaryAnchorM >= minProgConfirmM &&
+              stepFromCandM >= 5.0 &&
+              distFromStationaryAnchorM >= departureCandidate.distM + 4.0
             ) {
               isProgressive2PointBreakout = true;
-            } else if (distFromStationaryAnchorM < 6.0) {
+            } else if (distFromStationaryAnchorM < 8.0) {
               departureCandidate = null;
             }
           } else {
             departureCandidate = { lat, lng, distM: distFromStationaryAnchorM, tMs, eventId };
           }
-        } else if (distFromStationaryAnchorM < 6.0) {
+        } else if (distFromStationaryAnchorM < 8.0) {
           departureCandidate = null;
         }
 
@@ -1452,16 +1478,23 @@ exports.updateLocation = async (req, res) => {
         // Measure physical moving speed (include direct step interval speed so resumed travel after red-light pause is never dropped):
         const directTickSpeedKmh = stepDt > 0 ? Math.min((dRawKm / Math.max(stepDt, 1)) * 3600, 140.0) : 0;
         const effectiveMovingSpeedKmh = Math.max(reportedSpeedKmh, rawCalcSpeedKmh, stepCalcSpeedKmh, directTickSpeedKmh);
-        // True stopped pause (red light / brief pause): displacement < 3.0m or (< 6.0m with speed < 1.0 km/h)
-        const isStoppedJitter = (stepDistM < 3.0) || (stepDistM < 6.0 && effectiveMovingSpeedKmh < 1.0 && reportedSpeedKmh < 1.0);
+        // Minimum step while moving:
+        // - If hardware Doppler confirms motion (reportedSpeedKmh >= 1.8 km/h): accept steps >= max(3.5m, min(acc * 0.3, 10m))
+        // - If hardware Doppler is 0 / < 1.8 km/h (indoor jitter OR phone without Doppler while walking):
+        //   hold anchor until accumulated displacement from anchor reaches >= max(12.0m, acc * 0.85) so indoor wobble adds 0 KM
+        //   while true walking accumulates cleanly across 2-3 ticks!
+        const minMovingStepM = reportedSpeedKmh >= 1.8
+          ? Math.max(3.5, Math.min(accuracy * 0.3, 10.0))
+          : Math.max(12.0, accuracy * 0.85);
+        const isStoppedJitter = (stepDistM < minMovingStepM) || (stepDistM < 8.0 && effectiveMovingSpeedKmh < 1.2 && reportedSpeedKmh < 1.2);
 
         if (isStoppedJitter) {
           // Micro-movement / Stopped at light / office desk resting:
-          if (dt < 120) {
-            // Brief traffic pause (< 120 seconds): Hold anchor and state intact so route NEVER breaks, 0 KM added
+          if (dt < 90) {
+            // Brief traffic pause (< 90 seconds): Hold anchor and state intact so route NEVER breaks, 0 KM added
             acceptedEventIds.push(eventId);
           } else {
-            // Stopped for >= 120 seconds: Arrived at office/home/client destination! Re-anchor to STATIONARY!
+            // Stopped for >= 90 seconds: Arrived at office/home/client destination! Re-anchor to STATIONARY!
             currentMotionState = 'STATIONARY';
             centroidLat = lat;
             centroidLng = lng;
@@ -1470,7 +1503,7 @@ exports.updateLocation = async (req, res) => {
             acceptedEventIds.push(eventId);
           }
           continue;
-        } else if (stepDistM >= 3.0 && stepDistM <= 2500 && !isTeleportation) {
+        } else if (stepDistM >= minMovingStepM && stepDistM <= 2500 && !isTeleportation) {
           // Valid continuous road step — Haversine GPS distance with curvature compensation & 6-decimal precision
           acceptedPoints++;
           acceptedEventIds.push(eventId);
@@ -1873,6 +1906,10 @@ exports.updateLocation = async (req, res) => {
         isActive: true,
         autoClosed: false,
         manualDistanceAdded: dbManualAdded,
+        totalDistance: currentTotalDistance,
+        officialDistance: currentTotalDistance,
+        acceptedDistance: currentTotalDistance,
+        rawGpsDistance: currentTotalDistance,
         lastActivity: new Date(),
         motionState: currentMotionState,
         averageAccuracy: runningAvgAccuracy,
@@ -1895,10 +1932,6 @@ exports.updateLocation = async (req, res) => {
             rejectedPointCount: rejectedPoints,
           },
           $max: {
-            totalDistance: currentTotalDistance,
-            officialDistance: currentTotalDistance,
-            acceptedDistance: currentTotalDistance,
-            rawGpsDistance: currentTotalDistance,
             worstAccuracy: batchWorstAccuracy,
             maxSpeed: batchMaxSpeed,
           },
@@ -2574,7 +2607,7 @@ exports.getTodaySessions = async (req, res) => {
     const today = getBusinessDate(new Date(), 'Asia/Kolkata');
     const sessions = await LiveLocation.find(
       { employee: req.user._id, date: today },
-      { coordinates: 0 } // Exclude coordinates for list view performance
+      { coordinates: { $slice: -1 } } // Include latest coordinate for anchor recovery & anti-hijack check
     ).sort({ createdAt: -1 });
 
     let totalDistanceToday = 0;
@@ -3753,65 +3786,27 @@ exports.reconcileAllActiveSessions = async () => {
         }
       }
 
+      // Purge any legacy synthetic zero-chord anchor restore inflation rows
+      await DistanceLedger.deleteMany({
+        sessionId: s.sessionId,
+        reason: 'AGTRIE_X_CORRIDOR_ANCHOR_RESTORE'
+      }).catch(() => {});
+
       const ledgerAgg = await DistanceLedger.aggregate([
-        { $match: { sessionId: s.sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] } } },
+        { $match: { sessionId: s.sessionId, classification: { $in: ['ACCEPTED', 'RECOVERED'] }, reason: { $ne: 'AGTRIE_X_SCREEN_TELEMETRY_SYNC' } } },
         { $group: { _id: null, totalKm: { $sum: '$distanceKm' } } }
       ]);
       const ledgerKm = Math.round((ledgerAgg[0]?.totalKm || 0) * 100) / 100;
       const manualAdded = Number(s.manualDistanceAdded) || 0;
-      // Monotonic guarantee: Sentinel distance must never downgrade or drop an employee's already credited distance
+      // Verified physical DistanceLedger segments (+ explicit admin manual adjustment) are the authoritative truth
       const rawAuthoritativeKm = Math.round((ledgerKm + manualAdded) * 100) / 100;
-      const authoritativeKm = Math.max(
-        rawAuthoritativeKm,
-        Number(s.totalDistance) || 0,
-        Number(s.officialDistance) || 0
-      );
+      const authoritativeKm = ledgerKm > 0
+        ? rawAuthoritativeKm
+        : Math.max(rawAuthoritativeKm, Number(s.totalDistance) || 0, Number(s.officialDistance) || 0);
 
-      // Auto-Anchor Conservation Algorithm:
-      // If authoritative distance exceeds ledger sum (e.g. unledgered commute/corridor travel),
-      // anchor the missing delta into DistanceLedger so ledger aggregates permanently match!
-      const missingLedgerKm = Math.round((authoritativeKm - manualAdded - ledgerKm) * 100) / 100;
-      // Sanity gate: never cement an impossible distance into the ledger (avg speed must be <= 140 km/h, total <= 600 km)
-      const sessionStartMs = s.startTime ? new Date(s.startTime).getTime() : (s.createdAt ? new Date(s.createdAt).getTime() : now.getTime());
-      const sessionHours = Math.max((now.getTime() - sessionStartMs) / 3600000, 0.25);
-      const anchorPlausible = authoritativeKm <= 600 && (authoritativeKm / sessionHours) <= 140;
-      if (missingLedgerKm >= 0.10 && anchorPlausible) {
-        const lastC = (s.coordinates && s.coordinates.length > 0) ? s.coordinates[s.coordinates.length - 1] : null;
-        const anchorLat = Number(lastC?.lat);
-        const anchorLng = Number(lastC?.lng);
-        if (Number.isFinite(anchorLat) && Number.isFinite(anchorLng)) {
-          const anchorTs = Date.now();
-          try {
-            await DistanceLedger.create({
-              sessionId: s.sessionId,
-              employee: s.employee,
-              organizationId: s.organizationId,
-              // Unique per anchor (unique index on sessionId+fromEventId+toEventId)
-              fromEventId: `anchor:${s.sessionId}:${anchorTs}:from`,
-              toEventId: `anchor:${s.sessionId}:${anchorTs}:to`,
-              fromLat: anchorLat,
-              fromLng: anchorLng,
-              toLat: anchorLat,
-              toLng: anchorLng,
-              distanceMeters: Math.round(missingLedgerKm * 1000),
-              distanceKm: missingLedgerKm,
-              classification: 'ACCEPTED',
-              reason: 'AGTRIE_X_CORRIDOR_ANCHOR_RESTORE',
-              // Zero-width window so the anchor can never time-overlap a real segment
-              fromTimestamp: new Date(anchorTs),
-              toTimestamp: new Date(anchorTs),
-              accuracy: 5
-            });
-            console.log(`🛡️ [AUTO_ANCHOR] Anchored ${missingLedgerKm} km unledgered distance for session ${s.sessionId}`);
-          } catch (anchorErr) {
-            console.error('Auto-anchor create error:', anchorErr.message);
-          }
-        }
-      }
+      const finalPureGps = ledgerKm > 0 ? ledgerKm : Math.max(Number(s.rawGpsDistance) || 0, Number(s.acceptedDistance) || 0);
 
-      const finalPureGps = Math.max(ledgerKm + Math.max(missingLedgerKm, 0), Number(s.rawGpsDistance) || 0, Number(s.acceptedDistance) || 0);
-
-      if (Math.abs(authoritativeKm - (Number(s.totalDistance) || 0)) > 0.05 || authoritativeKm > (Number(s.totalDistance) || 0)) {
+      if (Math.abs(authoritativeKm - (Number(s.totalDistance) || 0)) > 0.01 || Math.abs(authoritativeKm - (Number(s.officialDistance) || 0)) > 0.01) {
         await LiveLocation.updateOne(
           { _id: s._id },
           {
@@ -3825,15 +3820,15 @@ exports.reconcileAllActiveSessions = async () => {
         ).catch(() => {});
         const st = await getSessionState(s.sessionId);
         if (st) {
-          await saveSessionState(s.sessionId, { ...st, totalDistance: authoritativeKm }).catch(() => {});
+          await saveSessionState(s.sessionId, { ...st, totalDistance: authoritativeKm, officialDistance: authoritativeKm }).catch(() => {});
         }
       }
       // Permanent auto-sync of User.totalDistanceToday & Attendance.totalDistanceTraveled
-      if (s.employee && authoritativeKm > 0) {
-        await User.findByIdAndUpdate(s.employee, { $max: { totalDistanceToday: authoritativeKm } }).catch(() => {});
+      if (s.employee && authoritativeKm >= 0) {
+        await User.findByIdAndUpdate(s.employee, { $set: { totalDistanceToday: authoritativeKm } }).catch(() => {});
         await Attendance.findOneAndUpdate(
           { employee: s.employee, date: today },
-          { $max: { totalDistanceTraveled: authoritativeKm } }
+          { $set: { totalDistanceTraveled: authoritativeKm } }
         ).catch(() => {});
       }
     }
