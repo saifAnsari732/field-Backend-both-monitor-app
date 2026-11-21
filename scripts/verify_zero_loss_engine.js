@@ -30,19 +30,13 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
 function curvatureCompensation(segmentDistKm, avgAccuracy = 15) {
   if (segmentDistKm < 0.003) return segmentDistKm;
   const stepSizeM = segmentDistKm * 1000;
-  let curveFactor;
-  if (stepSizeM <= 35) {
-    curveFactor = 1.07;
-  } else if (stepSizeM <= 150) {
-    curveFactor = 1.10;
-  } else if (stepSizeM <= 500) {
-    curveFactor = 1.16;
-  } else if (stepSizeM <= 2500) {
-    curveFactor = 1.20;
-  } else {
-    curveFactor = 1.22;
+  if (stepSizeM <= 250) {
+    return Number(segmentDistKm.toFixed(6));
   }
-  return Number((segmentDistKm * curveFactor).toFixed(6));
+  if (stepSizeM <= 1000) {
+    return Number((segmentDistKm * 1.03).toFixed(6));
+  }
+  return Number((segmentDistKm * 1.05).toFixed(6));
 }
 
 // ── Client evaluateMovementTransition logic ──
@@ -215,11 +209,15 @@ if (resumeDistM >= 3.0) {
 console.log(`✅ Test 3 Result: Moving state preserved through pause: ${pauseRetainedMovingState}, Post-pause step accepted: ${postPauseStepAccepted}`);
 assert(postPauseStepAccepted, 'Step after red-light pause must be immediately accepted!');
 
-// ── Test 4: City Bike Ride Curvature Compensation ──
-console.log('\n🧪 Test 4: Simulating City Bike Ride with Street Turns (5.0 KM)...');
-const straightDistKm = 5.0;
-const compensatedKm = curvatureCompensation(straightDistKm / 50, 15) * 50;
-console.log(`✅ Test 4 Result: 5.0 KM straight satellite trajectory compensated to: ${compensatedKm.toFixed(2)} KM (+10% city turns)`);
-assert(compensatedKm > straightDistKm, 'City street curvature compensation must match real road turns!');
+// ── Test 4: 16.0 KM Trip Calibration & Zero-Inflation Check ──
+console.log('\n🧪 Test 4: Simulating 16.0 KM Real Vehicle Trip Calibration...');
+const trueTripKm = 16.0;
+// 320 steps of 50m = 16.0 KM
+let recordedTripKm = 0;
+for (let i = 0; i < 320; i++) {
+  recordedTripKm += curvatureCompensation(0.05, 15);
+}
+console.log(`✅ Test 4 Result: 16.0 KM trip recorded as: ${recordedTripKm.toFixed(2)} KM (Zero-Inflation Target: 16.00 KM)`);
+assert(Math.abs(recordedTripKm - trueTripKm) < 0.05, '16.0 KM trip must remain exactly 16.0 KM without artificial inflation!');
 
-console.log('\n🎉 ALL ZERO-LOSS KINEMATIC TESTS PASSED SUCCESSFULLY! 100% VERIFIED!\n');
+console.log('\n🎉 ALL ZERO-LOSS & ZERO-INFLATION KINEMATIC TESTS PASSED SUCCESSFULLY! 100% VERIFIED!\n');

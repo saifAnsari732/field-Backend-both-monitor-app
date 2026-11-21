@@ -33,35 +33,26 @@ function getBusinessDate(date = new Date(), timeZone = 'Asia/Kolkata') {
 // Accuracy also matters: better GPS = less zig-zag = less artificial curve.
 // Realistic Road Curvature & Pocket Gap Tortuosity Compensation Engine
 // Calibrated to align satellite GPS straight chords (Haversine/Vincenty)
-// with real-world Indian road topologies (bypasses, turns, market detours, roundabouts)
-// and vehicle odometers (ARAI standards).
+// with real-world Indian road topologies without artificial double-counting.
+// Continuous dense GPS steps (<= 250m) already follow the road geometry accurately.
 function curvatureCompensation(segmentDistKm, avgAccuracy) {
   if (segmentDistKm < 0.003) return segmentDistKm; // Sub-3m jitter: 0 compensation
   const stepSizeM = segmentDistKm * 1000;
-  let curveFactor;
-  if (stepSizeM <= 35) {
-    // Dense continuous points (3-10s): recovers micro-curve cutting & bike lane weaving
-    curveFactor = 1.07; // +7.0%
-  } else if (stepSizeM <= 150) {
-    // Moderate road steps (35-150m): normal street turns, curves & intersections
-    curveFactor = 1.10; // +10.0%
-  } else if (stepSizeM <= 500) {
-    // Brief pocket/network pause (150-500m): straight chord cuts major village/road bends
-    curveFactor = 1.16; // +16.0%
-  } else if (stepSizeM <= 2500) {
-    // Pocket sleep gaps (500m-2.5km): phone asleep in pocket while riding at 25-60 km/h
-    curveFactor = 1.20; // +20.0%
-  } else {
-    // Large highway / transit gaps (> 2.5 km across multiple minutes):
-    // Straight-line chord between towns cuts across 20-25% of real winding road network
-    curveFactor = 1.22; // +22.0%
+
+  // Dense continuous points (up to 250m) already trace real road curves with < 0.5% chord error.
+  // Consecutive GPS coordinates from mobile phones already follow the road geometry.
+  // Zero artificial inflation for continuous road steps so 16 km stays exactly 16 km!
+  if (stepSizeM <= 250) {
+    return Number(segmentDistKm.toFixed(6));
   }
 
-  // Adjust for GPS accuracy: if accuracy is poor (> 100m), moderate factor slightly
-  if (avgAccuracy > 100) {
-    curveFactor = 1 + (curveFactor - 1) * 0.75;
+  // Pocket sleep gaps (250m - 1000m): mild road curvature factor (+3%) when OSRM is bypassed
+  if (stepSizeM <= 1000) {
+    return Number((segmentDistKm * 1.03).toFixed(6));
   }
-  return Number((segmentDistKm * curveFactor).toFixed(6));
+
+  // Large gaps (> 1km): max +5%
+  return Number((segmentDistKm * 1.05).toFixed(6));
 }
 
 // In-memory throttle for closed session drop logs (max 1 log per 60s per session)
@@ -82,7 +73,7 @@ async function getRoadDistanceKm(fromLat, fromLng, toLat, toLng, straightKm, acc
       const data = await res.json();
       if (data.code === 'Ok' && data.routes && data.routes[0]?.distance > 0) {
         const roadKm = data.routes[0].distance / 1000;
-        if (roadKm >= straightKm * 0.95 && roadKm <= straightKm * 2.5) {
+        if (roadKm >= straightKm * 0.95 && roadKm <= straightKm * 1.4) {
           return Number(roadKm.toFixed(6));
         }
       }
@@ -2168,9 +2159,8 @@ exports.stopTracking = async (req, res) => {
     let finalPureGpsKm = Math.max(pureLedgerKm, (avgSpeed <= 140 && baseRawGps <= 600) ? baseRawGps : pureLedgerKm);
     finalPureGpsKm = Math.round(finalPureGpsKm * 100) / 100;
 
-    // Automatic 10% punch-out road curvature & network compensation
-    // Strictly computed on pure GPS distance without compounding on multiple punch-outs or retries
-    const TOLERANCE_PCT = Number(process.env.PUNCH_OUT_TOLERANCE_PCT ?? 10);
+    // Automatic punch-out road compensation (default 0% to prevent artificial inflation on top of real GPS):
+    const TOLERANCE_PCT = Number(process.env.PUNCH_OUT_TOLERANCE_PCT ?? 0);
     const toleranceKm = (finalPureGpsKm > 0 && TOLERANCE_PCT > 0) ? Math.round(finalPureGpsKm * (TOLERANCE_PCT / 100) * 100) / 100 : 0;
     const totalAddedKm = Math.round((adminManualAdded + toleranceKm) * 100) / 100;
     const finalOfficialKm = Math.round((finalPureGpsKm + totalAddedKm) * 100) / 100;
