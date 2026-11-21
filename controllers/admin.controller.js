@@ -11,14 +11,17 @@ function getBusinessDate(date = new Date(), timeZone = 'Asia/Kolkata') {
 
 // Helper to build manager $or conditions including assignedEmployees array
 function buildManagerOrFilter(user) {
-  const orList = [{ managerId: user._id }, { manager: user._id }, { _id: user._id }];
-  if (Array.isArray(user.assignedEmployees) && user.assignedEmployees.length > 0) {
-    const assignedIds = user.assignedEmployees
-      .map(e => (e && e._id ? e._id : e))
-      .filter(Boolean);
-    if (assignedIds.length > 0) {
-      orList.push({ _id: { $in: assignedIds } });
-    }
+  const assignedIds = Array.isArray(user.assignedEmployees)
+    ? user.assignedEmployees.map(e => (e && e._id ? e._id : e)).filter(Boolean)
+    : [];
+  const orList = [
+    { managerId: user._id },
+    { manager: user._id },
+    { managers: user._id },
+    { _id: user._id }
+  ];
+  if (assignedIds.length > 0) {
+    orList.push({ _id: { $in: assignedIds } });
   }
   return orList;
 }

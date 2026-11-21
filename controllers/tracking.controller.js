@@ -2739,9 +2739,17 @@ exports.getLiveEmployees = async (req, res) => {
 
     const userScope = isSuperAdmin ? {} : { organizationId: orgId };
     if (userRole === 'MANAGER') {
-      const orList = [{ managerId: req.user._id }, { manager: req.user._id }, { _id: req.user._id }];
-      if (Array.isArray(req.user.assignedEmployees) && req.user.assignedEmployees.length > 0) {
-        orList.push({ _id: { $in: req.user.assignedEmployees } });
+      const assignedIds = Array.isArray(req.user.assignedEmployees)
+        ? req.user.assignedEmployees.map(e => (e && e._id ? e._id : e)).filter(Boolean)
+        : [];
+      const orList = [
+        { managerId: req.user._id },
+        { manager: req.user._id },
+        { managers: req.user._id },
+        { _id: req.user._id }
+      ];
+      if (assignedIds.length > 0) {
+        orList.push({ _id: { $in: assignedIds } });
       }
       userScope.$or = orList;
     }
@@ -3161,9 +3169,17 @@ exports.getLiveLocations = async (req, res) => {
     // Scope employee IDs to tenant/manager
     const userScope = isSuperAdmin ? {} : { organizationId: orgId };
     if (userRole === 'MANAGER') {
-      const orList = [{ managerId: req.user._id }, { manager: req.user._id }, { _id: req.user._id }];
-      if (Array.isArray(req.user.assignedEmployees) && req.user.assignedEmployees.length > 0) {
-        orList.push({ _id: { $in: req.user.assignedEmployees } });
+      const assignedIds = Array.isArray(req.user.assignedEmployees)
+        ? req.user.assignedEmployees.map(e => (e && e._id ? e._id : e)).filter(Boolean)
+        : [];
+      const orList = [
+        { managerId: req.user._id },
+        { manager: req.user._id },
+        { managers: req.user._id },
+        { _id: req.user._id }
+      ];
+      if (assignedIds.length > 0) {
+        orList.push({ _id: { $in: assignedIds } });
       }
       userScope.$or = orList;
     }
@@ -3593,54 +3609,53 @@ exports.reconcileAllActiveSessions = async () => {
     // 1. Permanent Shift Guardian (Zero Data Loss Policy):
     // Sessions remain 100% active for the entire workday until employee explicitly taps Punch Out.
     // Auto-heals any session closed by false timeout or rogue process today.
-    const autoClosedToday = await LiveLocation.find(
-      { date: today, isActive: false, manuallyStopped: { $ne: true } },
-      { _id: 1, sessionId: 1, employee: 1, totalDistance: 1, manualDistanceAdded: 1, lastActivity: 1 }
+    const todayStartMs = new Date(`${today}T00:00:00.000Z`);
+    const closedToday = await LiveLocation.find(
+      { date: today, isActive: false },
+      { _id: 1, sessionId: 1, employee: 1, totalDistance: 1, manualDistanceAdded: 1, lastActivity: 1, manuallyStopped: 1 }
     ).lean();
 
-    for (const s of autoClosedToday) {
-      // Strict Manual Punch Out Guard: If employee manually stopped or clocked out, NEVER restore!
-      if (s.manuallyStopped === true) continue;
+    for (const s of closedToday) {
+      if (!s.employee) continue;
 
-      const punchedOutAttendance = await Attendance.exists({
-        employee: s.employee,
-        date: today,
-        checkOut: { $exists: true, $ne: null }
-      });
-      if (punchedOutAttendance) {
-        await LiveLocation.updateOne({ _id: s._id }, { $set: { manuallyStopped: true, isActive: false } }).catch(() => {});
-        continue;
-      }
-
+      // Strict Manual Punch Out Guard: An employee is ONLY considered manually punched out
+      // if an explicit user-initiated manual stop log (TRACKING_STOP or CHECK_OUT) exists today!
       const explicitManualStop = await ActivityLog.exists({
         employee: s.employee,
         action: { $in: ['TRACKING_STOP', 'CHECK_OUT'] },
-        createdAt: { $gte: new Date(`${today}T00:00:00.000Z`) }
+        createdAt: { $gte: todayStartMs }
       });
 
-      if (!explicitManualStop) {
-        await LiveLocation.updateOne(
-          { _id: s._id },
-          {
-            $set: {
-              isActive: true,
-              autoClosed: false,
-              manuallyStopped: false,
-              lastActivity: new Date()
-            },
-            $unset: { endTime: 1, autoStoppedAt: 1 }
-          }
-        ).catch(() => {});
-
-        if (s.employee) {
-          await User.findByIdAndUpdate(s.employee, { isTracking: true, isOnline: true }).catch(() => {});
-          await Attendance.findOneAndUpdate(
-            { employee: s.employee, date: today },
-            { $unset: { checkOut: 1, punchOutTime: 1 } }
-          ).catch(() => {});
+      if (explicitManualStop) {
+        // Genuine manual punch out by employee
+        if (!s.manuallyStopped) {
+          await LiveLocation.updateOne({ _id: s._id }, { $set: { manuallyStopped: true } }).catch(() => {});
         }
-        console.log(`🛡️ [SENTINEL_GUARDIAN] Auto-restored session ${s.sessionId} for employee ${s.employee} (Immortal Shift Policy)`);
+        continue;
       }
+
+      // No manual punch out log found! This was terminated by a rogue auto-stop or false timeout.
+      // Auto-restore it immediately (Immortal Workday Shift Policy)!
+      await LiveLocation.updateOne(
+        { _id: s._id },
+        {
+          $set: {
+            isActive: true,
+            autoClosed: false,
+            manuallyStopped: false,
+            lastActivity: new Date()
+          },
+          $unset: { endTime: 1, autoStoppedAt: 1 }
+        }
+      ).catch(() => {});
+
+      await User.findByIdAndUpdate(s.employee, { isTracking: true, isOnline: true }).catch(() => {});
+      await Attendance.findOneAndUpdate(
+        { employee: s.employee, date: today },
+        { $unset: { checkOut: 1, punchOutTime: 1 } }
+      ).catch(() => {});
+
+      console.log(`🛡️ [SENTINEL_GUARDIAN] Auto-restored session ${s.sessionId} for employee ${s.employee} (Immortal Shift Policy)`);
     }
 
     // Proactive Keepalive: Keep lastActivity fresh on all active shifts today

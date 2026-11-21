@@ -10,17 +10,16 @@ function getBusinessDate(date = new Date(), timeZone = 'Asia/Kolkata') {
 
 // Helper to build the unified team filter for a manager (supports manager, managerId, and assignedEmployees array)
 function getTeamFilter(user) {
+  const assignedIds = Array.isArray(user.assignedEmployees)
+    ? user.assignedEmployees.map(e => (e && e._id ? e._id : e)).filter(Boolean)
+    : [];
   const orConditions = [
     { manager: user._id },
-    { managerId: user._id }
+    { managerId: user._id },
+    { managers: user._id }
   ];
-  if (Array.isArray(user.assignedEmployees) && user.assignedEmployees.length > 0) {
-    const assignedIds = user.assignedEmployees
-      .map(e => (e && e._id ? e._id : e))
-      .filter(Boolean);
-    if (assignedIds.length > 0) {
-      orConditions.push({ _id: { $in: assignedIds } });
-    }
+  if (assignedIds.length > 0) {
+    orConditions.push({ _id: { $in: assignedIds } });
   }
   return { $or: orConditions };
 }
